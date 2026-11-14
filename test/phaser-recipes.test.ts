@@ -12,6 +12,32 @@ import { registerPhaserRecipeTools, numberMatches } from "../src/tools/phaserrec
  */
 const UPDATE = { class: "MessageBox", name: "MsgBox", title: "Update last object?", text: "FeatureGroup 1 'Dimmer'.Preset 9006 'TEST PH'", buttons: [{ text: "OK", enabled: true }, { text: "Cancel", enabled: true }] };
 
+/**
+ * The shapes' value sources as the console reads them (live 2026-11-14): Sine (1) and Linear (2) have one source per
+ * step without an attribute filter; Flyout (19) has 3 per step, Dimmer / Tilt / Pan (Tilt widths 100 / 80, Dimmer trans 10).
+ */
+type FSource = { attribute: string | null; trans: number; width: number };
+const PLAIN: FSource[][] = [[{ attribute: null, trans: 100, width: 100 }], [{ attribute: null, trans: 100, width: 100 }]];
+const FLYOUT: FSource[][] = [
+  [{ attribute: "Dimmer", trans: 10, width: 100 }, { attribute: "Tilt", trans: 100, width: 100 }, { attribute: "Pan", trans: 100, width: 100 }],
+  [{ attribute: "Dimmer", trans: 10, width: 100 }, { attribute: "Tilt", trans: 50, width: 80 }, { attribute: "Pan", trans: 50, width: 80 }],
+];
+const SHAPES: Record<number, FSource[][]> = { 1: PLAIN, 2: PLAIN, 3: PLAIN, 19: FLYOUT, 20: FLYOUT };
+const attrHandle = (a: string | null) => (a ? { class: "Attribute", name: a, addr: `14.9.2.4.${["Dimmer", "Pan", "Tilt"].indexOf(a) + 1}` } : undefined);
+/** The children op on "Shape N.1.1" (steps) and "Shape N.1.1.n" (value sources); undefined for any other ref. */
+function shapeChildren(ref: string) {
+  const list = (items: unknown[]) => ({ total: items.length, offset: 0, count: items.length, items });
+  let m = ref.match(/^Shape (\d+)\.1\.1$/);
+  if (m) {
+    const l = SHAPES[Number(m[1])];
+    if (!l) throw new BridgeReplyError(`no object found for '${ref}'`);
+    return list(l.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1, name: `Step ${n + 1}` })));
+  }
+  m = ref.match(/^Shape (\d+)\.1\.1\.(\d)$/);
+  if (m) return list(SHAPES[Number(m[1])][Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), TRANSX: x.trans, WIDTHX: x.width } })));
+  return undefined;
+}
+
 async function setup(o: { pending?: boolean; programmer?: number; shapeFails?: boolean; slotTaken?: boolean } = {}) {
   const h = await startHarness(registerPhaserRecipeTools);
   const c = { editing: false, pz: [] as Array<{ index: number; class: string; name: string }>, modal: false as false | typeof UPDATE, preset: o.slotTaken === true, lines: 0, values: o.programmer ?? 0, pending: o.pending === true, name: "", speed: "60.00" };
@@ -68,7 +94,7 @@ async function setup(o: { pending?: boolean; programmer?: number; shapeFails?: b
     if (ref === "Preset 1.9010" && c.preset) return { ref, name: c.name, rows: c.lines ? ["1", "2", "3"].map(row) : [], dependencies: [] };
     throw new BridgeReplyError(`no object found for '${ref}'`);
   });
-  h.fake.on("children", () => ({ total: c.lines, offset: 0, count: c.lines, items: c.lines ? [{ class: "PhaserRecipe", index: 1, name: "[9000 'TEST PH'/1 'Sine']", fields: { Selection: { class: "Group", index: 9000 }, MAtricks: { class: "MAtrick", index: 9000 }, FailedCookedPart: "None", Enabled: "Yes" } }] : [] }));
+  h.fake.on("children", (args) => shapeChildren(String(args.ref)) ?? { total: c.lines, offset: 0, count: c.lines, items: c.lines ? [{ class: "PhaserRecipe", index: 1, name: "[9000 'TEST PH'/1 'Sine']", fields: { Selection: { class: "Group", index: 9000 }, MAtricks: { class: "MAtrick", index: 9000 }, FailedCookedPart: "None", Enabled: "Yes" } }] : [] });
   h.fake.on("set", (args) => {
     if (args.property === "Name") c.name = String(args.value);
     if (args.property === "SPEEDX") c.speed = `${Number(args.value).toFixed(2)}`;
@@ -259,7 +285,7 @@ async function multiSetup() {
     return prev(args, req);
   });
   c.lines = 0;
-  h.fake.on("children", () => ({ total: lines.length, offset: 0, count: lines.length, items: lines.map((_, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: 9000 }, MAtricks: { class: "MAtrick", index: 9000 }, FailedCookedPart: "None" } })) }));
+  h.fake.on("children", (args) => shapeChildren(String(args.ref)) ?? { total: lines.length, offset: 0, count: lines.length, items: lines.map((_, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: 9000 }, MAtricks: { class: "MAtrick", index: 9000 }, FailedCookedPart: "None" } })) });
   const speeds = new Map<number, number>();
   h.fake.on("set", (args) => {
     const m = String(args.ref).match(/^Preset 21\.9000\.(\d+)$/);
@@ -386,6 +412,8 @@ async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boole
     const ref = String(args.ref);
     let m: RegExpMatchArray | null;
     const list = (items: unknown[]) => ({ total: items.length, offset: 0, count: items.length, items });
+    const sh = shapeChildren(ref);
+    if (sh) return sh;
     if (ref === P)
       return list(lines.map((l, i) => ({ class: l.cls ?? "PhaserRecipe", index: i + 1, name: `[${l.group}/${l.shape}]`, fields: { Selection: addr("Group", l.group), MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: l.phaseFrom, PHASETOX: l.phaseTo, FailedCookedPart: "None" } })));
     if ((m = ref.match(/^Preset 21\.9005\.(\d+)\.1$/))) return list(lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
@@ -609,6 +637,315 @@ test("edit preview: checks and the plan, nothing sent", async () => {
     assert.equal(result.preview, true);
     assert.deepEqual(result.plan, ["set Preset 21.9005.2 PHASEFROMX=0", "set Preset 21.9005.2 PHASETOX=180", "set Preset 21.9005 Name=X", "Cook Preset 21.9005 /MergeLowPriority"]);
     assert.deepEqual(cmds, []);
+  } finally {
+    await h.close();
+  }
+});
+
+// ---- Several value sources per step (Flyout, shape 19), against a fake console that models the facts verified live
+// on 21.9023 / 21.9024 (2026-11-14): At Shape makes a line with the shape's value sources; At Preset in the mode puts
+// the preset into every source of the step; Assign Preset At <line>.1.<step>.<source> sets one source; set PRESET ""
+// gives the source back its own value; with Link Steps the 2 widths of a source keep their sum; MEASURE cooks x100; a
+// source whose preset holds no value for its attribute does not cook (IntegratedPresetMiss).
+type MSource = { attribute: string | null; preset: string | null; trans: number; width: number };
+type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][] };
+const HOLDS: Record<string, string[]> = { "1.9020": ["Dimmer"], "1.9021": ["Dimmer"], "2.9020": ["Pan", "Tilt", "PanTiltDistance"], "2.9021": ["Pan", "Tilt", "PanTiltDistance"], "2.9022": ["Pan", "Tilt"] };
+const fromShape = (shape: number): MSource[][] => SHAPES[shape].map((st) => st.map((x) => ({ attribute: x.attribute, preset: null, trans: x.trans, width: x.width })));
+
+async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number } = {}) {
+  const h = await startHarness(registerPhaserRecipeTools);
+  const P = "Preset 21.9030";
+  const c = { editing: false, pz: null as null | MLine, preset: initial.length > 0, lines: structuredClone(initial), pending: false, name: "", values: 0 };
+  const cmds: string[] = [];
+  const presetAddr = (p: string) => ({ class: "Preset", index: Number(p.split(".")[1]), addr: `14.14.1.5.${p.split(".")[0]}.${p.split(".")[1]}`, name: p });
+  const lineOf = (ref: string) => {
+    const m = ref.match(/^Preset 21\.9030\.(\d+)(?:\.1\.(\d)\.(\d))?$/);
+    if (!m) return null;
+    const l = c.lines[Number(m[1]) - 1];
+    return { l, src: m[2] ? l?.steps[Number(m[2]) - 1]?.[Number(m[3]) - 1] : undefined, step: m[2] ? Number(m[2]) - 1 : undefined, s: m[3] ? Number(m[3]) - 1 : undefined };
+  };
+  h.fake.on("recipe.editState", () => ({ environment: "Normal", editing: c.editing, partZeroLines: c.pz ? [{ index: 1, class: "PhaserRecipe", name: "[9002/19 'Flyout']" }] : [], modal: false, lastCommand: "OK" }));
+  h.fake.on("recipe.editBegin", () => {
+    c.editing = true;
+    return { queued: true };
+  });
+  h.fake.on("recipe.editEnd", () => {
+    c.editing = false;
+    return { queued: true };
+  });
+  h.fake.on("programmer", () => ({ environment: "Normal", total: c.values, count: 0, coverage: { complete: true }, rows: [] }));
+  h.fake.on("preset.context", () => ({ preferencesReadable: true, preferences: { RecipeStoreMode: "Normal" } }));
+  h.fake.on("objects", (args) => {
+    const known = ["Group 9002", "Group 9003", "Shape 1", "Shape 19", "Shape 20", "MAtricks 9000"].includes(String(args.ref));
+    return { total: known ? 1 : 0, items: known ? [{ name: "x" }] : [], offset: 0, count: known ? 1 : 0 };
+  });
+  let step = 0;
+  h.fake.onCommand((command) => {
+    cmds.push(command);
+    let m: RegExpMatchArray | null;
+    if (command === "Store Preset 21.9030 /NoConfirmation") c.preset = true;
+    else if ((m = command.match(/^Group (\d+)$/))) step = Number(m[1]);
+    else if ((m = command.match(/^At Shape (\d+)$/)) && c.editing) {
+      c.pz = { group: step, shape: Number(m[1]), matricks: null, speedHz: 1, measure: 4, steps: fromShape(Number(m[1])) };
+      c.values = 36;
+      step = 0;
+    } else if ((m = command.match(/^Step (\d)$/))) step = Number(m[1]);
+    else if ((m = command.match(/^At Preset (\d+\.\d+)$/)) && c.pz) for (const x of c.pz.steps[step - 1]) x.preset = m[1]; // every source of the step
+    else if ((m = command.match(/^MAtricks (\d+)$/)) && c.pz) c.pz.matricks = Number(m[1]);
+    else if (command === "Store Preset 21.9030 /Merge /NoConfirmation" && c.pz) {
+      c.lines.push(c.pz);
+      c.pz = null;
+    } else if (command === "ClearAll") {
+      c.values = 0;
+      c.pz = null;
+    } else if ((m = command.match(/^Assign Preset (\d+\.\d+) At (Preset 21\.9030\.\d+\.1\.\d\.\d)$/))) {
+      const x = lineOf(m[2]);
+      if (x?.src && x.s !== o.ignoreSourceAssign) x.src.preset = m[1];
+    } else if ((m = command.match(/^Copy Preset 21\.9030\.1 At Preset 21\.9030\.(\d+) \/NoConfirmation$/))) c.lines.push(structuredClone(c.lines[0]));
+    else if ((m = command.match(/^Assign Group (\d+) At Preset 21\.9030\.(\d+)$/))) c.lines[Number(m[2]) - 1].group = Number(m[1]);
+    else if ((m = command.match(/^Assign Shape (\d+) At Preset 21\.9030\.(\d+)$/))) c.lines[Number(m[2]) - 1].shape = Number(m[1]);
+    else if ((m = command.match(/^Delete Preset 21\.9030\.(\d+) \/NoConfirmation$/))) c.lines.splice(Number(m[1]) - 1, 1);
+    else if (command === "Delete Preset 21.9030 /NoConfirmation") c.preset = false;
+    return "OK";
+  });
+  h.fake.on("set", (args) => {
+    const ref = String(args.ref);
+    const value = String(args.value);
+    if (ref === P && args.property === "Name") return { value: (c.name = value) };
+    const x = lineOf(ref);
+    if (!x?.l) throw new BridgeReplyError(`no object found for '${ref}'`);
+    if (x.src && args.property === "PRESET") {
+      x.src.preset = null;
+      return { value: "", readOk: true };
+    }
+    if (x.src && args.property === "TRANSX") return { value: `${(x.src.trans = Number(value)).toFixed(1)}%` };
+    if (x.src && args.property === "WIDTHX") {
+      const other = x.l.steps[(x.step! + 1) % 2][x.s!];
+      const sum = x.src.width + other.width;
+      x.src.width = Number(value);
+      other.width = sum - x.src.width;
+      return { value: `${x.src.width.toFixed(1)}%` };
+    }
+    if (args.property === "SPEEDX") x.l.speedHz = Number(value) / 60;
+    if (args.property === "MEASURE") x.l.measure = Number(value);
+    return { value: Number(value).toFixed(2) };
+  });
+  const miss = (l: MLine) => l.steps.some((st) => st.some((x) => x.preset && x.attribute && !HOLDS[x.preset]?.includes(x.attribute)));
+  h.fake.on("children", (args) => {
+    const ref = String(args.ref);
+    const list = (items: unknown[]) => ({ total: items.length, offset: 0, count: items.length, items });
+    const sh = shapeChildren(ref);
+    if (sh) return sh;
+    if (ref === P) {
+      if (!c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
+      return list(c.lines.map((l, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: l.group, addr: `14.14.1.6.${l.group}` }, MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: 0, PHASETOX: 0, MEASURE: `<< ${l.measure.toFixed(2)}> 4.00>`, FailedCookedPart: miss(l) ? "IntegratedPresetMiss" : "None" } })));
+    }
+    let m = ref.match(/^Preset 21\.9030\.(\d+)\.1$/);
+    if (m) return list(c.lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
+    m = ref.match(/^Preset 21\.9030\.(\d+)\.1\.(\d)$/);
+    if (m) return list(c.lines[Number(m[1]) - 1].steps[Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), Preset: x.preset ? presetAddr(x.preset) : undefined, TRANSX: x.trans, WIDTHX: x.width, ACCELX: 0, DECELX: 0 } })));
+    throw new BridgeReplyError(`no object found for '${ref}'`);
+  });
+  h.fake.on("preset.read", (args) => {
+    const ref = String(args.ref);
+    const p = ref.replace(/^Preset /, "");
+    if (HOLDS[p]) return { ref, rows: HOLDS[p].map((attribute) => ({ fixture: "101", attribute, value: 0 })), dependencies: [] };
+    if (ref !== P || !c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
+    const out = new Map<string, unknown>();
+    for (const l of c.lines)
+      for (const fixture of l.group === 9003 ? ["201"] : ["101", "102"])
+        l.steps[0].forEach((_, s) => {
+          const srcs = [l.steps[0][s], l.steps[1][s]];
+          const attribute = srcs[0].attribute ?? "Dimmer";
+          if (srcs.some((x) => x.preset && !HOLDS[x.preset]?.includes(attribute))) return; // IntegratedPresetMiss: nothing cooks
+          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: x.width, accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null }));
+          out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: l.measure * 100, steps });
+        });
+    return { ref, name: c.name, referencedBy: 1, rows: [...out.values()], dependencies: [] };
+  });
+  return { h, c, cmds };
+}
+
+const FLY = {
+  action: "create",
+  preset: "21.9030",
+  name: "TEST FLY",
+  selection: 9002,
+  shape: 19,
+  steps: [{ sources: { Dimmer: "1.9020", Tilt: "2.9020" } }, { sources: { Dimmer: "1.9021", Tilt: { preset: "2.9021", width: 70 } }, trans: 40 }],
+  matricks: 9000,
+  speed_bpm: 34,
+  measure: 2,
+  exclusive: true,
+};
+
+test("create, several value sources: no At Preset in the mode, a preset per source after the store, Pan keeps the shape's value; measure, width and trans set and verified", async () => {
+  const { h, c, cmds } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", FLY);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds, [
+      "Store Preset 21.9030 /NoConfirmation",
+      "Group 9002",
+      "At Shape 19",
+      "MAtricks 9000",
+      "Store Preset 21.9030 /Merge /NoConfirmation",
+      "ClearAll",
+      "Assign Preset 1.9020 At Preset 21.9030.1.1.1.1",
+      "Assign Preset 2.9020 At Preset 21.9030.1.1.1.2",
+      "Assign Preset 1.9021 At Preset 21.9030.1.1.2.1",
+      "Assign Preset 2.9021 At Preset 21.9030.1.1.2.2",
+      "Cook Preset 21.9030 /MergeLowPriority",
+    ]);
+    const sets = h.fake.requests.filter((r) => r.op === "set").map((r) => `${r.args?.ref} ${r.args?.property}=${r.args?.value}`);
+    assert.deepEqual(sets, [
+      "Preset 21.9030 Name=TEST FLY",
+      "Preset 21.9030.1 SPEEDX=34",
+      "Preset 21.9030.1 MEASURE=2",
+      "Preset 21.9030.1.1.2.2 WIDTHX=70",
+      "Preset 21.9030.1.1.2.1 TRANSX=40",
+      "Preset 21.9030.1.1.2.2 TRANSX=40",
+      "Preset 21.9030.1.1.2.3 TRANSX=40",
+    ]);
+    const l = c.lines[0];
+    assert.deepEqual(l.steps.map((st) => st.map((x) => x.preset)), [["1.9020", "2.9020", null], ["1.9021", "2.9021", null]]);
+    assert.deepEqual(l.steps.map((st) => st[1].width), [110, 70], "Link Steps: Tilt's widths keep their sum (100 + 80)");
+    assert.match(result.notes.join(" "), /line 1 Pan: step 1 and step 2 keep\(s\) the shape's value/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create, several value sources: refused before anything is sent", async () => {
+  for (const [args, re] of [
+    [{ ...FLY, steps: [{ preset: "1.9020" }, { preset: "1.9021" }] }, /step 1 has 3 value sources \(Dimmer, Tilt, Pan\): give steps\[0\]\.sources/],
+    [{ ...FLY, steps: [{ sources: { Color: "1.9020" } }, { sources: { Dimmer: "1.9021" } }] }, /no value source .{0,2}Color.{0,2} \(its value sources: Dimmer, Tilt, Pan/],
+    [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020", Tilt: "1.9020" } }, { sources: { Dimmer: "1.9021" } }] }, /step 1 Tilt: Preset 1\.9020 holds no Tilt value \(it would not cook: IntegratedPresetMiss\)/],
+    [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020", Tilt: "2.9020" }, width: 90 }, { sources: { Dimmer: "1.9021" }, width: 110 }] }, /width given on both steps/],
+    [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020", Tilt: "4.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9021" } }] }, /not in the show: Preset 4\.9020/],
+    [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020" }, preset: "1.9020" }, { sources: { Dimmer: "1.9021" } }] }, /preset .* or sources .*, not both/],
+    [{ ...FLY, steps: undefined, selection: undefined, lines: [{ selection: 9002, shape: 19, steps: FLY.steps, matricks: 9000 }, { selection: 9002, shape: 1, steps: [{ preset: "2.9022" }, { preset: "2.9020" }], matricks: 9000 }], shape: undefined, matricks: undefined, speed_bpm: undefined, measure: undefined }, /Shape 1's value sources \(source 1\) are not line 1's \(Shape 19: Dimmer, Tilt, Pan\)/],
+    [{ ...FLY, steps: undefined, selection: undefined, lines: [{ selection: 9002, shape: 19, steps: FLY.steps, matricks: 9000 }, { selection: 9003, shape: 19, steps: [{ sources: { Dimmer: "1.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9020" } }], matricks: 9000 }], shape: undefined, matricks: undefined, speed_bpm: undefined, measure: undefined }, /lines 1 and 2 have the same 2 step presets \(Preset 1\.9020 \/ Preset 1\.9021 on Dimmer\)/],
+  ] as const) {
+    const { h, cmds } = await flySetup();
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", args as Record<string, unknown>);
+      assert.equal(isError, true, text);
+      assert.match(text, re as RegExp);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("create, several value sources: a source the console did not take is a mismatch (no cooked Tilt)", async () => {
+  const { h } = await flySetup([], { ignoreSourceAssign: 1 });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...FLY, measure: undefined, steps: [{ sources: { Dimmer: "1.9020", Tilt: "2.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9021" } }] });
+    assert.equal(isError, true);
+    assert.match(result.verification.detail, /no cooked value comes from line 1 Tilt \(Preset 2\.9020 \/ Preset 2\.9021\)/);
+  } finally {
+    await h.close();
+  }
+});
+
+const FLY_LINE = (): MLine => {
+  const steps = fromShape(19);
+  [steps[0][0].preset, steps[0][1].preset, steps[1][0].preset, steps[1][1].preset] = ["1.9020", "2.9020", "1.9021", "2.9021"];
+  return { group: 9002, shape: 19, matricks: 9000, speedHz: 34 / 60, measure: 4, steps };
+};
+
+test("set, several value sources: one source's preset, a cleared source, a width and the measure; the other sources kept", async () => {
+  const start = FLY_LINE();
+  start.steps[0][2].preset = "2.9020";
+  start.steps[1][2].preset = "2.9021";
+  const { h, c, cmds } = await flySetup([start]);
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ sources: { Tilt: "2.9022", Pan: null } }, { sources: { Tilt: { width: 60 } } }], measure: 8 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds, ["Assign Preset 2.9022 At Preset 21.9030.1.1.1.2", "Cook Preset 21.9030 /MergeLowPriority"]);
+    assert.deepEqual(h.fake.requests.filter((r) => r.op === "set").map((r) => `${r.args?.ref} ${r.args?.property}=${r.args?.value}`), ["Preset 21.9030.1.1.1.3 PRESET=", "Preset 21.9030.1.1.2.2 WIDTHX=60", "Preset 21.9030.1 MEASURE=8"]);
+    assert.deepEqual(c.lines[0].steps.map((st) => st.map((x) => x.preset)), [["1.9020", "2.9022", null], ["1.9021", "2.9021", "2.9021"]]);
+    assert.deepEqual(c.lines[0].steps.map((st) => st[1].width), [120, 60]);
+    assert.match(result.notes.join(" "), /step 1 Pan/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("set, several value sources: one preset for a multi-source step, or a shape with other value sources, is refused", async () => {
+  for (const [args, re] of [
+    [{ action: "set", preset: "21.9030", steps: [{ preset: "1.9020" }, {}] }, /step 1 has 3 value sources/],
+    [{ action: "set", preset: "21.9030", shape: 1 }, /Shape 1's value sources \(source 1\) are not line 1's \(Dimmer, Tilt, Pan\)/],
+    [{ action: "set", preset: "21.9030", steps: [{ sources: { Tilt: "1.9021" } }, {}] }, /Preset 1\.9021 holds no Tilt value/],
+  ] as const) {
+    const { h, cmds } = await flySetup([FLY_LINE()]);
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", args as Record<string, unknown>);
+      assert.equal(isError, true, text);
+      assert.match(text, re as RegExp);
+      assert.deepEqual(cmds, []);
+      assert.ok(!h.fake.requests.some((r) => r.op === "set"));
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("set, several value sources: a new shape with the same value sources (Flyout -> Flyout Inverted) keeps the presets", async () => {
+  const { h, c, cmds } = await flySetup([FLY_LINE()]);
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", shape: 20 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds, ["Assign Shape 20 At Preset 21.9030.1", "Cook Preset 21.9030 /MergeLowPriority"]);
+    assert.equal(c.lines[0].shape, 20);
+  } finally {
+    await h.close();
+  }
+});
+
+test("add_line, several value sources: a copy of line 1; a source given nothing loses line 1's preset", async () => {
+  const { h, c } = await flySetup([FLY_LINE()]);
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ sources: { Tilt: "2.9021" } }, { sources: { Tilt: "2.9020", Dimmer: "1.9020" } }] });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(c.lines[1].steps.map((st) => st.map((x) => x.preset)), [[null, "2.9021", null], ["1.9020", "2.9020", null]]);
+    assert.deepEqual(h.fake.requests.filter((r) => r.op === "set").map((r) => `${r.args?.ref} ${r.args?.property}=${r.args?.value}`), ["Preset 21.9030.2.1.1.1 PRESET="]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with lines, several value sources: line 2 is a copy of line 1; its sources given nothing lose line 1's presets", async () => {
+  const { h, c, cmds } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", {
+      action: "create",
+      preset: "21.9030",
+      exclusive: true,
+      lines: [
+        { selection: 9002, shape: 19, steps: [{ sources: { Dimmer: "1.9020", Tilt: "2.9020", Pan: "2.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9021", Pan: "2.9021" } }], matricks: 9000, speed_bpm: 34 },
+        { selection: 9003, shape: 20, steps: [{ sources: { Tilt: "2.9022" } }, { sources: { Tilt: "2.9020" } }], matricks: 9000, speed_bpm: 60, measure: 8 },
+      ],
+    });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds.slice(cmds.indexOf("Copy Preset 21.9030.1 At Preset 21.9030.2 /NoConfirmation")), [
+      "Copy Preset 21.9030.1 At Preset 21.9030.2 /NoConfirmation",
+      "Assign Group 9003 At Preset 21.9030.2",
+      "Assign Shape 20 At Preset 21.9030.2",
+      "Assign Preset 2.9022 At Preset 21.9030.2.1.1.2",
+      "Assign Preset 2.9020 At Preset 21.9030.2.1.2.2",
+      "Cook Preset 21.9030 /MergeLowPriority",
+    ]);
+    assert.deepEqual(c.lines[1].steps.map((st) => st.map((x) => x.preset)), [[null, "2.9022", null], [null, "2.9020", null]]);
+    assert.deepEqual(h.fake.requests.filter((r) => r.op === "set" && r.args?.property === "PRESET").map((r) => r.args?.ref), ["Preset 21.9030.2.1.1.1", "Preset 21.9030.2.1.1.3", "Preset 21.9030.2.1.2.1", "Preset 21.9030.2.1.2.3"]);
+    assert.match(result.notes.join(" "), /line 2 Dimmer: step 1 and step 2 keep\(s\) the shape's value/);
   } finally {
     await h.close();
   }

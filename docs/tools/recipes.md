@@ -6,8 +6,8 @@ Four tools combine groups, presets and MAtricks into programming that adapts to 
 - `gma3_store_recipe_cues` writes the lines of many cue parts in one call (a recipe-driven show build, #101);
 - `gma3_cook_recipes` cooks a preset, a cue part, a cue or a whole sequence with an explicit option, after listing
   every affected target;
-- `gma3_edit_phaser_recipe` builds phaser recipe lines (one family per line, several families in one preset) in a
-  free preset slot, through the programmer's Edit Recipe mode, and edits an existing phaser preset (a line's
+- `gma3_edit_phaser_recipe` builds phaser recipe lines (one family per line, several families in one preset, or a
+  preset per value source on a shape with several, such as Flyout: Dimmer + Tilt in one line) in a free preset slot, through the programmer's Edit Recipe mode, and edits an existing phaser preset (a line's
   settings, add or remove a line) without the programmer (bridge **0.52.1**).
 
 Recipe definitions are read and written with the existing object ops (`children`, `objects`, `set`) and `Assign` /
@@ -200,22 +200,56 @@ line is made in the programmer's Part Zero and stored into the target. This tool
 preset slot** (a cue then calls the preset with a standard line, `gma3_store_recipe_cues`).
 
 `action: "create"`, `preset: "P.N"`, `name?`, `exclusive: true`, and one line's fields at the top level or
-`lines: [...]` (1-8). A line has `selection` (group), `shape` (default 1), `steps: [{preset, curve?}, {preset, curve?}]`
-(exactly 2, from one preset pool: the line's family, whose attributes come from the step presets), `matricks?`,
-`speed_bpm?`, `phase?: {from, to}`. The target may be in **any pool**: the preset's pool does not filter its recipe
+`lines: [...]` (1-8). A line has `selection` (group), `shape` (default 1), `steps` (exactly 2, see below),
+`matricks?`, `speed_bpm?`, `phase?: {from, to}`, `measure?` (beats). A step is `{preset, curve?, trans?, width?}`
+for a shape with one value source per step (Sine, Ramp...: the 2 presets from one preset pool, the line's family,
+whose attributes come from the step presets), or `{sources, curve?, trans?, width?}` for a shape with several (below). The target may be in **any pool**: the preset's pool does not filter its recipe
 lines (verified: a Dimmer + RGBW preset in the Dimmer pool and an RGBW phaser in the Position pool cooked completely).
 One family per line is preferred (a cue reads more clearly). A line whose steps come from an All pool (21-25), whose presets may mix families, is allowed with a warning. `preview: true` runs the checks and returns the plan.
 
-**Several lines.** A step holds one value source: a second `At Preset` on the same step replaces the first, and a
+**Several value sources per step (Flyout).** A step holds one value source per attribute filter of its shape. Sine and
+the other plain shapes have one, without a filter. Flyout (19) and Flyout Inverted (20) have 3 per step: Dimmer
+(absolute 100 / 0, Trans 10 %), Tilt (relative; Flyout −11 on step 1, Flyout Inverted on step 2) and Pan (relative
+0), with Measure 4. `At Preset` in Edit Recipe mode writes its preset into **every** source of the step: a Dimmer
+preset in the Tilt and Pan sources does not cook (`IntegratedPresetMiss`). Such a line is therefore given per source:
+
+```
+steps: [{sources: {Dimmer: "1.9020", Tilt: "2.9020"}},
+        {sources: {Dimmer: "1.9021", Tilt: {preset: "2.9021", width: 80}}, trans: 40}]
+```
+
+A key is the source's attribute (case aside) or its number (`"2"`). A value is a preset, `null` (no preset: the
+source outputs its own value, the shape's), or `{preset?, trans?, width?}`. A source not given keeps the shape's
+value (`create`, `add_line`) or its own (`set`). The tool reads the shape's value sources first
+(`Shape S.1.1.<step>`, ATTRIBUTES) and refuses: one `preset` for a step with several sources, an unknown source, a
+source given twice, a preset that holds no value for its source's attribute (it would not cook), and, in `create`,
+lines 2+ whose shape has other value sources than line 1's (a copy keeps line 1's value sources: Assign Shape does
+not change a line's value sources, a Flyout line re-shaped to Sine keeps its 3). Line 1 is then built in Edit
+Recipe mode **without** `Step` / `At Preset` (Group, At Shape, MAtricks, Store), and each source is set after the
+ClearAll with `Assign Preset X At Preset P.N.L.1.<step>.<source>`. The result names the sources left to the shape's
+value (an absolute Dimmer 100 / 0 of the shape is a fixed value: give it a preset). Verified only for Dimmer, Tilt
+and Pan (the Flyout shapes).
+
+**Trans, width, measure.** `trans` and `width` (percent) are set on the value sources with `set` (TRANSX, WIDTHX),
+widths first, after the curves (an explicit `trans` replaces a Snap's TRANS 0). A step's `trans` / `width` applies to
+every source of the step that does not set its own. With Link Steps (the default) the 2 widths of a source keep their
+sum (Tilt 100 / 80: step 1 set to 90 makes step 2 90; Dimmer 100 / 100: step 1 to 50 makes step 2 150), so a width
+is given on one step only and the other takes the rest; both are refused. `measure` is the line's MEASURE (it reads
+"4.00"; the cooked measure reads x100). The read-back checks them in the cooked steps.
+
+**Several lines.** A step holds one value source per attribute filter: a second `At Preset` on the same step replaces the first, and a
 second `At Shape` on the same group re-shapes the line instead of adding one. Line 1 is therefore built in Edit Recipe
 mode, and lines 2+ are copies of it: `Copy Preset P.N.1 At Preset P.N.k /NoConfirmation`, then `Assign Group / Shape /
-MAtricks n At Preset P.N.k` where they differ and `Assign Preset X At Preset P.N.k.1.<step>.1` for the steps. What a
-copied line does not set (speed, phase, curves) is line 1's. A cue calls the preset with one standard line, and every
+MAtricks n At Preset P.N.k` where they differ and `Assign Preset X At Preset P.N.k.1.<step>.<source>` for the steps.
+A source line k gives no preset loses line 1's (`set PRESET ""`: the source gets back its own value). A copied line
+keeps line 1's speed, phase and measure unless it sets its own (they are written before the copies); line 1's curves,
+trans and widths are written after the copies, so a copy starts from the shape's. A cue calls the preset with one standard line, and every
 line cooks into it at its own speed. A Speed X on that cue line replaces the speed of every line.
 
 **Curves.** `curve` is one of `linear`, `ease_in`, `ease_out`, `ease_in_out`, `swing`, `snap`, or `reset` (back to
 the shape's curve). It is sent from the command line,
-`Set Preset P.N.L.1.<step>.1 Property "Curve" "<Linear|Ease In|Ease Out|Ease In and Out|Swing|Snap|Reset>"`.
+`Set Preset P.N.L.1.<step>.<source> Property "Curve" "<Linear|Ease In|Ease Out|Ease In and Out|Swing|Snap|Reset>"`,
+on every value source of the step.
 The Lua `set` of CURVE is ignored, and CURVE reads back as an opaque id. With Link Steps (the default), a step's curve
 writes its own DECEL and the next step's ACCEL:
 
@@ -228,7 +262,9 @@ writes its own DECEL and the next step's ACCEL:
 | Swing | +100 | +100 |
 | Snap | 0 (and TRANS 0) | 0 |
 
-The read-back checks those values in the cooked steps.
+A named curve also writes the step's TRANS: 0 for Snap, **100 for the others** (verified live: Flyout's Dimmer Trans
+10 % became 100 % with Linear). A `trans` given on the step is written after the curve and stays. The read-back
+checks those values in the cooked steps.
 
 1. Checks, nothing sent otherwise: the slot is free; group, shape, step presets and MAtricks exist; the mode is off,
    Part Zero empty, no dialog open (`recipe.editState`); the programmer read completely and empty; RecipeStoreMode
@@ -240,21 +276,24 @@ The read-back checks those values in the cooked steps.
 3. `recipe.editBegin` queues `EditRecipe Preset P.N` with CmdIndirect: sent with Cmd() from the plugin thread, the
    dialog would stall the bridge. The server polls `recipe.editState` until the mode reads on. If "Update last
    object?" opens anyway, it is answered **Cancel** (never OK) with `dialog.press` and the call stops.
-4. Line 1: `Group`, `At Shape` (the line appears in Part Zero, checked), `Step 1`, `At Preset`, `Step 2`, `At Preset`,
-   `MAtricks`, one command at a time; Part Zero is checked again (exactly one PhaserRecipe line), then
+4. Line 1: `Group`, `At Shape` (the line appears in Part Zero, checked), `Step 1`, `At Preset`, `Step 2`, `At Preset`
+   (only for one preset per step), `MAtricks`, one command at a time; Part Zero is checked again (exactly one PhaserRecipe line), then
    `Store Preset P.N /Merge /NoConfirmation` (Part Zero empties).
 5. `recipe.editEnd` queues the `EditRecipe` toggle (only while the mode reads on); the mode is read back off.
 6. `ClearAll`: after the mode is off the programmer still holds the phaser's values, **output on stage from
    `At Shape` until here**. The programmer and Part Zero are read back empty.
-7. The name; lines 2+ (copy and assigns, the line count checked after each copy); `SPEEDX` / `PHASEFROMX` /
-   `PHASETOX` per line (replies compared as numbers); the curves of every line, **after all the copies** (a copy
-   keeps line 1's custom curves); `Cook Preset P.N /MergeLowPriority`.
+7. The name; line 1's value sources (given per source); lines 2+ (copy and assigns, cleared sources, the line count
+   checked after each copy); `SPEEDX` / `PHASEFROMX` / `PHASETOX` / `MEASURE` per line (replies compared as
+   numbers); the curves of every line, **after all the copies** (a copy keeps line 1's custom curves); `WIDTHX` then
+   `TRANSX` per source; `Cook Preset P.N /MergeLowPriority`.
 8. Read back:
    - the line count, and each line a PhaserRecipe with its group and MAtricks and no failed cook;
-   - every value cooked and integrating, in order, the 2 step presets of one line, each line with at least one value,
-     and nothing uncooked;
-   - the cooked speed of each line's values is its `speed_bpm` / 60 Hz (the phase is spread per fixture by the
-     MAtricks: only its set reply is compared), and each curve's DECEL / ACCEL / TRANS in the cooked steps;
+   - every value cooked and integrating, in order, the 2 step presets of one value source (on that source's
+     attribute; "none" for a source left to the shape's value), each source with a preset has at least one value,
+     the line's cook state is not failed, and nothing is uncooked;
+   - the cooked speed of each line's values is its `speed_bpm` / 60 Hz, its measure x100 is `measure` (the phase is
+     spread per fixture by the MAtricks: only its set reply is compared), each curve's DECEL / ACCEL / TRANS, and the
+     trans and widths asked (the other step's width: the shape's sum minus the one given) in the cooked steps;
    - the mode off, Part Zero and the programmer empty.
 
 A failure before the store switches the mode off, clears the programmer and deletes the preset the call created (its
@@ -275,28 +314,36 @@ the preset. 60 BPM = 1 Hz.
 No programmer and no Edit Recipe mode (no `exclusive`): every change is an `Assign`, `Set`, `Copy` or `Delete` on the
 preset's lines, then `Cook Preset P.N /MergeLowPriority`.
 
-- `set` changes line `line` (default 1): `selection`, `shape`, `matricks`, `speed_bpm`, `phase`, `name`, and
-  `steps: [{preset?, curve?}, {preset?, curve?}]` (`{}` keeps a step). The line must be a PhaserRecipe of 2 steps,
-  each from a preset.
+- `set` changes line `line` (default 1): `selection`, `shape`, `matricks`, `speed_bpm`, `phase`, `measure`, `name`,
+  and `steps: [{preset? | sources?, curve?, trans?, width?}, ...]` (`{}` keeps a step; in `sources` a source not
+  given is kept and `null` clears its preset with `set PRESET ""`, back to the shape's value). A new shape must have
+  the line's value sources (Flyout and Flyout Inverted do). The line must be a PhaserRecipe of 2 steps whose values
+  can be told apart by their value sources' presets (a plain shape: each step from a preset).
 - `add_line` appends a copy of line 1 (`Copy Preset P.N.1 At Preset P.N.k`), retargeted with the given fields:
-  `selection` and both step presets are required; shape, MAtricks, speed and phase are line 1's unless given. Every
-  step is reset to the shape's curve, then given its `curve` if any (a copy keeps line 1's custom curves).
+  `selection` and the steps (a preset or sources each) are required; shape, MAtricks, speed, phase and measure are
+  line 1's unless given. Every step is reset to the shape's curve, then given its `curve` if any (a copy keeps line
+  1's custom curves). A source given no preset loses line 1's.
 - `remove_line` deletes line `line` (`Delete Preset P.N.L /NoConfirmation`). The later lines move up (3 lines,
   delete line 2: line 3 becomes line 2). The only line is never removed: delete the preset instead.
 
 Sent in this order: `Assign Group | Shape | MAtricks n At Preset P.N.L` (only what changes),
-`Assign Preset X At Preset P.N.L.1.<step>.1` (the step keeps its curve), the curves (a step given a curve is reset to
-the shape's first, then the named curve, so a Linear over a Snap gets TRANS 100 back), `SPEEDX` / `PHASEFROMX` /
-`PHASETOX`, the name, then the Cook. **A new shape recomputes the curves of the steps that have no custom curve; a
+`Assign Preset X At Preset P.N.L.1.<step>.<source>` (the step keeps its curve), `set PRESET ""` on a cleared source,
+the curves on every source of the step (a step given a curve is reset to the shape's first, then the named curve, so
+a Linear over a Snap gets TRANS 100 back), `WIDTHX` then `TRANSX`, `SPEEDX` / `PHASEFROMX` / `PHASETOX` / `MEASURE`,
+the name, then the Cook. A failed command stops the edit; a failed setting is reported and the rest is sent. **A new shape recomputes the curves of the steps that have no custom curve; a
 custom curve stays** (`curve: "reset"` takes it back to the shape's).
 
-Checked first, nothing sent otherwise: the preset and the line exist; the 2 steps come from one preset pool and are
-not the preset itself; no other line has the same 2 step presets; group, shape, MAtricks and step presets exist; no
-dialog is open; the Edit Recipe mode is off.
+Checked first, nothing sent otherwise: the preset and the line exist; each value source's 2 presets come from one
+preset pool, hold the source's attribute and are not the preset itself; no other line has the same 2 step presets on
+the same attribute (a source left to the shape's value on two lines is allowed: its values are only checked where
+one line alone can have made them); group, shape, MAtricks and step presets exist; no dialog is open; the Edit Recipe
+mode is off.
 
 Read back:
-- every line as expected: group, MAtricks, shape, speed (SPEEDX raw, in Hz), phase, step presets, and each step's
-  ACCEL / DECEL / TRANS where they are known. After a new shape or a reset they are the shape's and are not compared;
+- every line as expected: group, MAtricks, shape, speed (SPEEDX raw, in Hz), phase, measure, cook state, each value
+  source's preset, and its ACCEL / DECEL / TRANS / WIDTH where they are known. After a new shape or a reset they are
+  the shape's and are not compared; after a width the other step's is the sum minus it, and the trans of that source
+  is not compared unless given;
 - the edited line's cooked values come from its 2 step presets at its speed, and no value is left from its old step
   presets;
 - every other cooked value unchanged, and nothing uncooked added. A fixture and attribute that the edited line
@@ -327,8 +374,10 @@ read-back tells cooked values apart by their step presets.
   not known. Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not.
 - Not covered:
   - the background cook's exact timing (observed: not yet on an immediate read, done after 3 s);
-  - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, steps of
-    different pools in one line, steps with absolute values instead of presets);
+  - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, a value
+    source's 2 steps from different pools, steps with absolute values instead of presets);
+  - value sources on attributes other than Dimmer, Tilt and Pan (shapes other than Flyout 19 / 20 with several
+    sources); per-source curves (a curve applies to every source of its step);
   - filters and worlds;
   - recipe templates;
   - the Edit Recipe mode outside `gma3_edit_phaser_recipe`.
@@ -348,6 +397,24 @@ read-back tells cooked values apart by their step presets.
   - `add_line` twice (Ease In at 90 BPM, Swing at 30 BPM);
   - `remove_line` of a middle line;
   - a duplicate step pair and a missing line, refused.
+- Verified live for several value sources per step (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-14, Group
+  9002 of 12 spots, scratch preset 21.9025, the code run directly against the bridge):
+  - `create` on Flyout (19) with `sources` Dimmer 1.9020 / 1.9021 and Tilt 2.9020 / 2.9021 (relative), Pan left to
+    the shape: built without "Update last object?", 36 / 36 cooked, cook state None, Pan cooked from the shape
+    (relative 0, no preset), 34 BPM and Measure 4 read back;
+  - `set`: Pan given 2.9020 / 2.9021 then cleared with `null` (back to the shape's value), Dimmer step 1 Trans 20
+    then 10, Tilt step 2 Width 70 (step 1 went to 110) then 80, Measure 2, 4 and 1, each read back matched;
+  - `add_line` on Group 9001 (Dimmer 1.9010 / 1.9011, Tilt 2.9000 / 2.9001) and `remove_line`, matched;
+  - `create` with 2 lines in 21.9026: Flyout on Group 9002 with Linear on step 1, Trans 30 on step 2 and Tilt
+    Width 70 on step 2 (step 1 read 110), then a copy on Flyout Inverted for Group 9001: 48 / 48 cooked, matched; the
+    copy kept line 1's Measure 1 and the shape's Trans / Width;
+  - one preset per step on Flyout, refused before anything was sent; the old form (Sine, one preset per step, Snap,
+    Measure 1) still matched (12 / 12);
+  - the output on spot 101 (`Group 9002 At Preset 21.9025` in the programmer, then ClearAll): at 34 BPM and Measure
+    4 a cycle lasts about 7 s (Dimmer 100 for about 3.5 s, then 0; Tilt down then up; Pan still); at Measure 1 the
+    Dimmer rose every 1.76 s on average (one beat at 34 BPM is 1.765 s).
+  - An absolute Tilt preset (2.9000) in the relative Tilt source of Flyout cooked the preset's absolute value plus the
+    shape's relative value (−11 / 0): the Flyout's Tilt source is meant for relative presets.
 
   The cue's own values followed every change. The new order of `create` (curves after the copies) was verified live
   too: 21.9006, a Dimmer line with Snap on step 1 and an RGBW line without a curve, matched; line 2 kept the Sine
