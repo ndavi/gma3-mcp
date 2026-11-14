@@ -59,7 +59,9 @@ export function comparePlain(got: unknown, want: string | number | boolean, prop
   const w = String(want).trim();
   if (typeof want === "number" || /^-?\d+(\.\d+)?$/.test(w)) {
     const n = Number(w);
-    if (typeof raw === "number") return Math.abs(raw - n) < 1e-6 ? "match" : "differs";
+    // The console keeps many numbers as float32: TRANSX 10 reads raw 10.000002384186 ("10.0%"), WIDTHX 80 reads
+    // 80.000001192093 (live 2026-11-14). A few float32 steps of the value are the value.
+    if (typeof raw === "number") return Math.abs(raw - n) <= Math.max(1e-6, Math.abs(n) * 1e-6) ? "match" : "differs";
     // "2.500" for 2.5, "60.00 BPM" for 60.
     const m = a.trim().match(/^(-?\d+(?:\.\d+)?)\s*([a-z%°]*)$/i);
     if (!m) return "reformatted";

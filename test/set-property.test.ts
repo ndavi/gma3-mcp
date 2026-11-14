@@ -254,6 +254,10 @@ test("comparePlain: Yes/No only on a Yes/No property, numbers by raw value or nu
   assert.equal(comparePlain("60.00 BPM", 60), "match");
   assert.equal(comparePlain("1.000000", 60, "SpeedFromX", 60), "match");
   assert.equal(comparePlain("1.000000", 1, "SpeedFromX", 60), "differs");
+  // float32 raw values: TRANSX 10 reads 10.000002384186 ("10.0%"), WIDTHX 80 reads 80.000001192093.
+  assert.equal(comparePlain("10.0%", 10, "TRANSX", 10.000002384186), "match");
+  assert.equal(comparePlain("80.0%", 80, "WIDTHX", 80.000001192093), "match");
+  assert.equal(comparePlain("10.1%", 10, "TRANSX", 10.1), "differs");
   assert.equal(comparePlain("1h00m00.00", 3600), "reformatted");
   assert.equal(comparePlain("5.000", 10), "differs");
   assert.equal(comparePlain("5.00 BPM", 10), "reformatted");
