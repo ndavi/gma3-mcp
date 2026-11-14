@@ -237,6 +237,33 @@ sum (Tilt 100 / 80: step 1 set to 90 makes step 2 90; Dimmer 100 / 100: step 1 t
 is given on one step only and the other takes the rest; both are refused. `measure` is the line's MEASURE (it reads
 "4.00"; the cooked measure reads x100). The read-back checks them in the cooked steps.
 
+**Speed master.** `speed_master: n` (1-16) links the line to speed master 3.n: `set Preset P.N.L
+SPEEDMASTEROVERRIDE n`, always a number (live 2026-11-14: `0` clears the link; `"None"` reads Speed1, i.e. links
+master 1; a name links the wrong master; `""` is ignored), so text is refused before anything is sent; `0` or `null`
+clears. The line reads the master's **name** (read from `ShowData.Masters.Speed`, never hard-coded; two masters with
+one name, or a master without a name, are warned about: then only the cooked values tell them apart), and the cooked
+values carry the master: 0-based in the raw `preset.read` row the tool compares (master 2 reads 1, master 1 reads 0,
+absent without a master; `gma3_preset` shows it 1-based, `speedMaster: 2`). Both are checked.
+The master **multiplies** the line's Speed X: one cycle = Measure x 60 / (Speed X x master / 60) s (Speed X and master
+in BPM), so a line that follows a master has Speed X 60 (one cycle = Measure x 60 / master BPM); a line with a master
+and another Speed X is warned about (not an error). A copy (lines 2+, `add_line`) keeps line 1's link, Assign Group /
+MAtricks keep it, `set` keeps the line's. A cue line's Speed X still replaces the preset's, and the master multiplies it.
+
+**Adaptive Measure / Width (Chase 7).** The Chase shape has `PLAYBACKADAPTIVEMEASURE` and `PLAYBACKADAPTIVEWIDTH` Yes:
+the console sets the measure to the number of phase positions (the fixtures, or the MAtricks positions: 4 fixtures
+read 4, with XWings 2 read 2) and step 1's width to 100 / positions (25 / 75, 50 / 50 with XWings 2), and it ignores
+MEASURE and WIDTHX meanwhile (they read back unchanged). With a phase spread (0 to 360) that lights one position per
+beat, one cycle lasting N beats; without one, all fixtures light together for 1 beat out of N. `adaptive_measure` /
+`adaptive_width` (booleans) set the flags. A `measure` switches Adaptive Measure off first (`PLAYBACKADAPTIVEMEASURE No`
+before `MEASURE`, only when the line has it or it cannot be read), with a warning: the cycle then lasts `measure`
+beats, and the chase keeps its look (one position at a time, from Adaptive Width). A `width` on a line under Adaptive
+Width is refused unless `adaptive_width: false` is given (switching it off changes the look: Chase's own widths are
+100 / 100, two of four fixtures lit at a time); then `PLAYBACKADAPTIVEWIDTH No` goes before `WIDTHX`. `measure` with
+`adaptive_measure: true`, or a width with `adaptive_width: true`, is refused. A flag reads raw as a boolean when the
+line sets it itself and as `"<Yes>"` / `"<No>"` when it comes from the shape; a flag the line set itself stays through
+Assign Shape, the other follows the new shape. Under Adaptive, the measure and widths the console derives after a new
+group, MAtricks or shape, or after a flag changes, are not compared.
+
 **Several lines.** A step holds one value source per attribute filter: a second `At Preset` on the same step replaces the first, and a
 second `At Shape` on the same group re-shapes the line instead of adding one. Line 1 is therefore built in Edit Recipe
 mode, and lines 2+ are copies of it: `Copy Preset P.N.1 At Preset P.N.k /NoConfirmation`, then `Assign Group / Shape /
@@ -284,7 +311,7 @@ checks those values in the cooked steps.
    `At Shape` until here**. The programmer and Part Zero are read back empty.
 7. The name; line 1's value sources (given per source); lines 2+ (copy and assigns, cleared sources, the line count
    checked after each copy); `SPEEDX` / `PHASEFROMX` / `PHASETOX` / `MEASURE` per line (replies compared as
-   numbers); the curves of every line, **after all the copies** (a copy keeps line 1's custom curves); `WIDTHX` then
+   numbers; the adaptive flags before `MEASURE`, `SPEEDMASTEROVERRIDE` last, read back by the master's name); the curves of every line, **after all the copies** (a copy keeps line 1's custom curves); `WIDTHX` then
    `TRANSX` per source; `Cook Preset P.N /MergeLowPriority`.
 8. Read back:
    - the line count, and each line a PhaserRecipe with its group and MAtricks and no failed cook;
@@ -294,6 +321,8 @@ checks those values in the cooked steps.
    - the cooked speed of each line's values is its `speed_bpm` / 60 Hz, its measure x100 is `measure` (the phase is
      spread per fixture by the MAtricks: only its set reply is compared), each curve's DECEL / ACCEL / TRANS, and the
      trans and widths asked (the other step's width: the shape's sum minus the one given) in the cooked steps;
+   - each line's adaptive flags and speed master (by name) as written or copied from line 1, and the cooked
+     `speedMaster` of its values;
    - the mode off, Part Zero and the programmer empty.
 
 A failure before the store switches the mode off, clears the programmer and deletes the preset the call created (its
@@ -314,7 +343,8 @@ the preset. 60 BPM = 1 Hz.
 No programmer and no Edit Recipe mode (no `exclusive`): every change is an `Assign`, `Set`, `Copy` or `Delete` on the
 preset's lines, then `Cook Preset P.N /MergeLowPriority`.
 
-- `set` changes line `line` (default 1): `selection`, `shape`, `matricks`, `speed_bpm`, `phase`, `measure`, `name`,
+- `set` changes line `line` (default 1): `selection`, `shape`, `matricks`, `speed_bpm`, `phase`, `measure`,
+  `speed_master`, `adaptive_measure`, `adaptive_width`, `name`,
   and `steps: [{preset? | sources?, curve?, trans?, width?}, ...]` (`{}` keeps a step; in `sources` a source not
   given is kept and `null` clears its preset with `set PRESET ""`, back to the shape's value). A new shape must have
   the line's value sources (Flyout and Flyout Inverted do). The line must be a PhaserRecipe of 2 steps whose values
@@ -329,7 +359,7 @@ preset's lines, then `Cook Preset P.N /MergeLowPriority`.
 Sent in this order: `Assign Group | Shape | MAtricks n At Preset P.N.L` (only what changes),
 `Assign Preset X At Preset P.N.L.1.<step>.<source>` (the step keeps its curve), `set PRESET ""` on a cleared source,
 the curves on every source of the step (a step given a curve is reset to the shape's first, then the named curve, so
-a Linear over a Snap gets TRANS 100 back), `WIDTHX` then `TRANSX`, `SPEEDX` / `PHASEFROMX` / `PHASETOX` / `MEASURE`,
+a Linear over a Snap gets TRANS 100 back); the adaptive flags are written after the Assigns and before the curves, `WIDTHX` then `TRANSX`, `SPEEDX` / `PHASEFROMX` / `PHASETOX` / `MEASURE` / `SPEEDMASTEROVERRIDE`,
 the name, then the Cook. A failed command stops the edit; a failed setting is reported and the rest is sent. **A new shape recomputes the curves of the steps that have no custom curve; a
 custom curve stays** (`curve: "reset"` takes it back to the shape's).
 
@@ -415,6 +445,22 @@ read-back tells cooked values apart by their step presets.
     Dimmer rose every 1.76 s on average (one beat at 34 BPM is 1.765 s).
   - An absolute Tilt preset (2.9000) in the relative Tilt source of Flyout cooked the preset's absolute value plus the
     shape's relative value (−11 / 0): the Flyout's Tilt source is meant for relative presets.
+
+- Verified live for the speed master and the adaptive flags (onPC 2.5.1.1, bridge 0.52.1, show "Rescue",
+  2026-11-14, Group 9001 of 4 Daytona washes, output read on universe 7, every read back matched):
+  - `create` 21.9030 with 2 Snap lines, Dimmer 1.9010 / 1.9011 on master 2 and Position 2.9000 / 2.9001 on master 3
+    (Speed X 60, Measure 1): lines read "PAN" and "TILT", cooked `speedMaster` 1 and 2. Output on fixture 251 (the
+    preset in the programmer): 3.2 at 15 BPM and 3.3 at 30 BPM gave a Dimmer period of 4.02 s (4.0 expected) and a
+    Tilt period of 2.02 s (2.0); 3.3 to 60 BPM gave Tilt 0.99 s (1.0), the Dimmer unchanged (3.97 s);
+  - `add_line` without `speed_master`: the copy kept line 1's master ("PAN", cooked 1); `set` to master 1 (reads
+    "Speed1", cooked 0), to `null` and to `0` (reads "", nothing cooked), to 2; `"2"`, `"PAN"`, `"None"` and 17 refused
+    before anything was sent; Speed X 34 with a master warned;
+  - `create` 21.9029 on Chase with phase 0 to 360, 15 BPM and Measure 1: Adaptive Measure switched off, Measure 1 read
+    back, warned (it ended `partial` before, with Measure read 12); output: fixture 251 rose every 3.98 s (4.0 s
+    expected), each fixture lit about 1 s in turn;
+  - `set` on Chase lines: `adaptive_measure: true` (measure back to 4), `measure 2` (flag switched off first), a width
+    without `adaptive_width: false` refused, with it 50 / 150, `adaptive_width: true` (25 / 75 again), MAtricks 9000
+    under Adaptive Measure (measure 2, widths 50 / 50, not flagged).
 
   The cue's own values followed every change. The new order of `create` (curves after the copies) was verified live
   too: 21.9006, a Dimmer line with Snap on step 1 and an RGBW line without a curve, matched; line 2 kept the Sine

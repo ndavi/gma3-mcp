@@ -123,6 +123,58 @@ export function numberMatches(sent: number, got: unknown): boolean {
   return Number.isFinite(n) && Math.abs(n - sent) < 0.01;
 }
 
+/**
+ * A Yes/No property as the console reads it: a boolean when the line sets it itself, "<Yes>" / "<No>" when it comes
+ * from the shape (live 2026-11-14: Chase line before and after `set PLAYBACKADAPTIVEMEASURE No`), "Yes" / "No" as text.
+ */
+export function yesNoOf(v: unknown): { value: boolean; own: boolean } | undefined {
+  if (typeof v === "boolean") return { value: v, own: true };
+  if (typeof v !== "string") return undefined;
+  const m = v.trim().match(/^(<)?\s*(yes|no)\s*(>)?$/i);
+  return m ? { value: m[2].toLowerCase() === "yes", own: !(m[1] && m[3]) } : undefined;
+}
+
+/** The adaptive flags of a line or of a shape's recipe (`Shape S.1`). */
+interface Flags {
+  adaptiveMeasure?: boolean;
+  adaptiveWidth?: boolean;
+}
+async function readShapeFlags(bridge: Gma3Bridge, shape: number, t: number): Promise<Flags> {
+  const r = (await bridge.request("objects", { ref: `Shape ${shape}.1`, fields: ["PLAYBACKADAPTIVEMEASURE", "PLAYBACKADAPTIVEWIDTH"], asText: false, limit: 1 }, t)) as { items?: Array<{ fields?: Record<string, unknown> }> };
+  const f = r.items?.[0]?.fields ?? {};
+  return { adaptiveMeasure: yesNoOf(f.PLAYBACKADAPTIVEMEASURE)?.value, adaptiveWidth: yesNoOf(f.PLAYBACKADAPTIVEWIDTH)?.value };
+}
+
+/** The 16 speed masters' names by number (Master 3.n), read from the masters themselves. */
+export async function readMasterNames(bridge: Gma3Bridge, t: number): Promise<Map<number, string>> {
+  const r = (await bridge.request("children", { ref: "ShowData.Masters.Speed", fields: ["Name"], limit: 32 }, t)) as ChildList;
+  const out = new Map<number, string>();
+  for (const it of r.items ?? []) if (typeof it.index === "number") out.set(it.index, String(it.fields?.Name ?? it.name ?? ""));
+  return out;
+}
+
+/** speed_master checks: every master exists; a master whose name another master has (or no name) is read back by its cooked values only. */
+function masterProblems(wanted: number[], names: Map<number, string>): { problems: string[]; warnings: string[] } {
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  for (const n of new Set(wanted)) {
+    const name = names.get(n);
+    if (name === undefined) problems.push(`speed master ${n} (Master 3.${n}) is not in the show`);
+    else if (!name.trim()) warnings.push(`speed master ${n} has no name: the line reads its link by the master's name, so only the cooked values tell it`);
+    else {
+      const same = [...names.entries()].filter(([m, x]) => m !== n && x.trim().toLowerCase() === name.trim().toLowerCase()).map(([m]) => m);
+      if (same.length) warnings.push(`speed master ${n} is named ${JSON.stringify(name)} like master(s) ${same.join(", ")}: the line reads its link by name, so only the cooked values tell them apart`);
+    }
+  }
+  return { problems, warnings };
+}
+
+/** A line that follows a master with a Speed X other than 60: the master multiplies Speed X (live 2026-11-14, §3). */
+const masterSpeedWarning = (label: string, master: string, speedHz: number | undefined) =>
+  speedHz !== undefined && Math.abs(speedHz - 1) > 0.0005
+    ? [`${label} follows speed master ${JSON.stringify(master)} with Speed X ${+(speedHz * 60).toFixed(3)} BPM: the master multiplies Speed X (one cycle = Measure x 60 / (Speed X x master / 60) s), so a line that follows a master normally has Speed X 60 (then one cycle = Measure x 60 / master BPM)`]
+    : [];
+
 // ---- Inputs.
 
 type PresetRef = { pool: number; number: number };
@@ -151,6 +203,11 @@ interface LineSpec {
   speed?: number;
   phase?: { from: number; to: number };
   measure?: number;
+  /** Speed master (1-16) the line follows; null: the line's link cleared (SPEEDMASTEROVERRIDE 0). */
+  speedMaster?: number | null;
+  /** Adaptive Measure / Adaptive Width of the line (PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH). */
+  adaptiveMeasure?: boolean;
+  adaptiveWidth?: boolean;
 }
 
 interface CreateArgs {
@@ -165,11 +222,44 @@ interface CreateArgs {
   speed_bpm?: unknown;
   phase?: unknown;
   measure?: unknown;
+  speed_master?: unknown;
+  adaptive_measure?: unknown;
+  adaptive_width?: unknown;
   exclusive?: unknown;
   preview?: unknown;
 }
 
-const LINE_FIELDS = ["selection", "shape", "steps", "matricks", "speed_bpm", "phase", "measure"] as const;
+const LINE_FIELDS = ["selection", "shape", "steps", "matricks", "speed_bpm", "phase", "measure", "speed_master", "adaptive_measure", "adaptive_width"] as const;
+const MAX_MASTER = 16;
+
+/**
+ * speed_master: a master number, written as a number only (live 2026-11-14: SPEEDMASTEROVERRIDE n links master 3.n and
+ * reads its name; 0 clears; "None" reads Speed1 (links master 1), a name links the wrong master, "" is ignored).
+ * 0 or null clears the link (returned as null); undefined when invalid (reported).
+ */
+export function parseSpeedMaster(v: Validator, raw: unknown, at: string): number | null | undefined {
+  if (raw === null) return null;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0 || raw > MAX_MASTER) {
+    v.fail(`${at} must be a speed master number 1-${MAX_MASTER} (0 or null clears the line's link), got ${JSON.stringify(raw)}; text is refused: the console reads "None" as master 1 and a name as another master`);
+    return undefined;
+  }
+  return raw === 0 ? null : raw;
+}
+
+function parseFlag(v: Validator, raw: unknown, at: string): boolean | undefined {
+  if (typeof raw === "boolean") return raw;
+  v.fail(`${at} must be true or false`);
+  return undefined;
+}
+
+/** Whether a step spec sets a width (on the step or on one of its value sources). */
+const givesWidth = (s: StepSpec) => s.width !== undefined || (s.sources ?? []).some((x) => x.spec.width !== undefined);
+
+/** The line-level conflicts of the adaptive flags: a measure or a width under the matching adaptive flag the console would ignore. */
+function adaptiveConflicts(v: Validator, l: { measure?: number; adaptiveMeasure?: boolean; adaptiveWidth?: boolean; steps?: StepSpec[] }, at: (f: string) => string) {
+  if (l.measure !== undefined && l.adaptiveMeasure === true) v.fail(`${at("measure")} and ${at("adaptive_measure")}: true contradict each other: under Adaptive Measure the console sets the measure itself (the number of fixtures or phase positions) and ignores MEASURE`);
+  if (l.adaptiveWidth === true && (l.steps ?? []).some(givesWidth)) v.fail(`a width and ${at("adaptive_width")}: true contradict each other: under Adaptive Width the console sets the widths itself (100 / phase positions) and ignores WIDTHX`);
+}
 const TRANS_RANGE = { min: 0, max: 100 };
 const WIDTH_RANGE = { min: 0, max: 1000 };
 
@@ -245,13 +335,17 @@ function parseLine(v: Validator, raw: Record<string, unknown>, path: string): Li
   const speed = raw.speed_bpm === undefined ? undefined : v.check(() => finiteNumber(at("speed_bpm"), raw.speed_bpm, { min: 0.01, max: 6000 }));
   const measure = raw.measure === undefined ? undefined : v.check(() => finiteNumber(at("measure"), raw.measure, { min: 0.01, max: 1000 }));
   const phase = raw.phase === undefined ? undefined : parsePhase(v, raw.phase, at("phase"));
+  const speedMaster = raw.speed_master === undefined ? undefined : parseSpeedMaster(v, raw.speed_master, at("speed_master"));
+  const adaptiveMeasure = raw.adaptive_measure === undefined ? undefined : parseFlag(v, raw.adaptive_measure, at("adaptive_measure"));
+  const adaptiveWidth = raw.adaptive_width === undefined ? undefined : parseFlag(v, raw.adaptive_width, at("adaptive_width"));
   const steps: StepSpec[] = [];
   const before = v.errors.length;
   if (!Array.isArray(raw.steps) || raw.steps.length !== 2) v.fail(`${at("steps")} must be exactly 2 items [{preset: "P.X"}, {preset: "P.Y"}] or [{sources: {...}}, {sources: {...}}] (2-step phasers only in this release)`);
   else raw.steps.forEach((s, i) => steps.push(parseStep(v, s, `${at("steps")}[${i}]`, true)));
   if (steps.length === 2 && steps.every((s) => s.pool !== undefined) && steps[0].pool !== steps[1].pool) v.fail(`${at("steps")}: the 2 steps of a line come from one preset pool (one family per line; another family is another line), not pools ${steps[0].pool} and ${steps[1].pool}`);
+  adaptiveConflicts(v, { measure, adaptiveMeasure, adaptiveWidth, steps }, at);
   if (selection === undefined || shape === undefined || steps.length !== 2 || v.errors.length > before) return undefined;
-  return { selection, shape, steps, matricks, speed, phase, measure };
+  return { selection, shape, steps, matricks, speed, phase, measure, ...(raw.speed_master !== undefined ? { speedMaster } : {}), ...(adaptiveMeasure !== undefined ? { adaptiveMeasure } : {}), ...(adaptiveWidth !== undefined ? { adaptiveWidth } : {}) };
 }
 
 // ---- Value sources: the layout of a shape or a line, and what a line's steps ask of each source.
@@ -433,15 +527,27 @@ function sourceProblems(label: string, presets: Array<Array<PresetRef | null | u
 const presetsOf = (res: Resolved[][], base?: Array<Array<PresetRef | null | undefined>>, clearMissing = false) =>
   res.map((st, n) => st.map((r, s) => (r.preset !== undefined ? r.preset : clearMissing || !base ? null : base[n]?.[s])));
 
-type Action = { kind: "cmd"; command: string } | { kind: "set"; ref: string; property: string; value: string; expect: "number" | "empty" };
+type Action =
+  | { kind: "cmd"; command: string }
+  | { kind: "set"; ref: string; property: string; value: string; expect: "number" | "empty" }
+  /** A Yes/No property (the adaptive flags), read back as Yes/No. */
+  | { kind: "set"; ref: string; property: string; value: "Yes" | "No"; expect: "yesno" }
+  /** SPEEDMASTEROVERRIDE: written as a number, read back as the master's name ("" when cleared). */
+  | { kind: "set"; ref: string; property: string; value: string; expect: "text"; text: string };
 const actionText = (a: Action) => (a.kind === "cmd" ? a.command : `set ${a.ref} ${a.property}=${a.value === "" ? '""' : a.value}`);
 
 async function runAction(bridge: Gma3Bridge, name: string, a: Action, t: number): Promise<StepResult> {
   if (a.kind === "cmd") return commandStep(bridge, name, a.command, t);
   try {
     const r = (await bridge.request("set", { ref: a.ref, property: a.property, value: a.value }, t)) as { value?: unknown; readOk?: boolean };
-    const good = a.expect === "empty" ? (r?.value === "" || r?.value === null || r?.value === undefined) && r?.readOk !== false : numberMatches(Number(a.value), r?.value);
-    return { name, status: good ? "succeeded" : "failed", op: "set", detail: { ref: a.ref, property: a.property }, ...(good ? {} : { error: `${a.ref} ${a.property} reads ${JSON.stringify(r?.value)} after writing ${a.value === "" ? '""' : a.value}` }) };
+    const empty = r?.value === "" || r?.value === null || r?.value === undefined;
+    const good =
+      a.expect === "empty" ? empty && r?.readOk !== false
+      : a.expect === "yesno" ? yesNoOf(r?.value)?.value === (a.value === "Yes")
+      : a.expect === "text" ? (a.text === "" ? empty : String(r?.value ?? "").trim() === a.text.trim()) && r?.readOk !== false
+      : numberMatches(Number(a.value), r?.value);
+    const wanted = a.expect === "text" ? ` (${a.text === "" ? "no master" : JSON.stringify(a.text)} expected)` : "";
+    return { name, status: good ? "succeeded" : "failed", op: "set", detail: { ref: a.ref, property: a.property }, ...(good ? {} : { error: `${a.ref} ${a.property} reads ${JSON.stringify(r?.value)} after writing ${a.value === "" ? '""' : a.value}${wanted}` }) };
   } catch (err) {
     return stepFromError(name, err, { op: "set" });
   }
@@ -451,6 +557,50 @@ async function runAction(bridge: Gma3Bridge, name: string, a: Action, t: number)
 function sourceSettings(at: (step: number, source: number) => string, res: Resolved[][]): Action[] {
   const set = (prop: "WIDTHX" | "TRANSX", key: "width" | "trans") => res.flatMap((st, n) => st.flatMap((r, s): Action[] => (r[key] !== undefined ? [{ kind: "set", ref: at(n + 1, s + 1), property: prop, value: String(r[key]), expect: "number" }] : [])));
   return [...set("WIDTHX", "width"), ...set("TRANSX", "trans")];
+}
+
+/** The adaptive flags a line's own settings write: a measure switches Adaptive Measure off (the console ignores MEASURE under it). */
+const explicitFlags = (l: LineSpec): Flags => ({ adaptiveMeasure: l.measure !== undefined ? false : l.adaptiveMeasure, adaptiveWidth: l.adaptiveWidth });
+
+/**
+ * create: the adaptive flags line i has before its own settings. Line 1 has its shape's; a line 2+ is a copy of line 1
+ * after line 1's settings: a flag line 1 set itself is kept through Assign Shape, another one follows the line's shape.
+ */
+function predictFlags(specs: LineSpec[], i: number, shapes: Map<number, Flags>): Flags {
+  const first = specs[0];
+  const s1 = shapes.get(first.shape) ?? {};
+  if (i === 0) return s1;
+  const e1 = explicitFlags(first);
+  const own = specs[i].shape === first.shape ? s1 : (shapes.get(specs[i].shape) ?? {});
+  return { adaptiveMeasure: e1.adaptiveMeasure ?? own.adaptiveMeasure, adaptiveWidth: e1.adaptiveWidth ?? own.adaptiveWidth };
+}
+
+/** create: the flags and master line i must read after the build (undefined: not compared). */
+function expectedLine(specs: LineSpec[], i: number): { flags: Flags; master: number | null | undefined } {
+  const e = explicitFlags(specs[i]);
+  const e1 = explicitFlags(specs[0]);
+  return {
+    flags: { adaptiveMeasure: e.adaptiveMeasure ?? (i > 0 ? e1.adaptiveMeasure : undefined), adaptiveWidth: e.adaptiveWidth ?? (i > 0 ? e1.adaptiveWidth : undefined) },
+    master: specs[i].speedMaster !== undefined ? specs[i].speedMaster : i > 0 ? specs[0].speedMaster : undefined,
+  };
+}
+
+/**
+ * A line's settings in order: SPEEDX, PHASEFROMX / PHASETOX, the adaptive flags (before MEASURE, and before the widths
+ * which are set later), MEASURE, SPEEDMASTEROVERRIDE (a number; read back as the master's name). Adaptive Measure is
+ * switched off for a measure when the line has it on (or it is not known).
+ */
+function lineSettings(ref: string, l: Pick<LineSpec, "speed" | "phase" | "measure" | "speedMaster" | "adaptiveMeasure" | "adaptiveWidth">, names: Map<number, string>, before: Flags): Action[] {
+  const num = (property: string, value: number): Action => ({ kind: "set", ref, property, value: String(value), expect: "number" });
+  const flag = (property: string, on: boolean): Action => ({ kind: "set", ref, property, value: on ? "Yes" : "No", expect: "yesno" });
+  const out: Action[] = [];
+  if (l.speed !== undefined) out.push(num("SPEEDX", l.speed));
+  if (l.phase) out.push(num("PHASEFROMX", l.phase.from), num("PHASETOX", l.phase.to));
+  if (l.measure !== undefined ? before.adaptiveMeasure !== false : l.adaptiveMeasure !== undefined) out.push(flag("PLAYBACKADAPTIVEMEASURE", l.measure !== undefined ? false : l.adaptiveMeasure!));
+  if (l.adaptiveWidth !== undefined) out.push(flag("PLAYBACKADAPTIVEWIDTH", l.adaptiveWidth));
+  if (l.measure !== undefined) out.push(num("MEASURE", l.measure));
+  if (l.speedMaster !== undefined) out.push({ kind: "set", ref, property: "SPEEDMASTEROVERRIDE", value: String(l.speedMaster ?? 0), expect: "text", text: l.speedMaster === null ? "" : (names.get(l.speedMaster) ?? "") });
+  return out;
 }
 
 const pair = (l: LineSpec) => (l.steps.every((s) => s.pool !== undefined) ? l.steps.map((s) => `${s.pool}.${s.number}`).join("/") : null);
@@ -517,11 +667,11 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       }),
     ),
   ];
-  const settingsOf = (l: LineSpec) => [
-    ...(l.speed !== undefined ? [{ property: "SPEEDX", value: l.speed }] : []),
-    ...(l.phase ? [{ property: "PHASEFROMX", value: l.phase.from }, { property: "PHASETOX", value: l.phase.to }] : []),
-    ...(l.measure !== undefined ? [{ property: "MEASURE", value: l.measure }] : []),
-  ];
+  // Filled by the checks: the masters' names (the line reads its link by name) and the shapes' adaptive flags.
+  let masterNames = new Map<number, string>();
+  const shapeFlags = new Map<number, Flags>();
+  /** The line's own settings, in order: the adaptive flags before MEASURE (under Adaptive Measure the console ignores MEASURE, live 2026-11-14 on Chase) and before the widths (set later); the master last. */
+  const settingsOf = (k: number, l: LineSpec): Action[] => lineSettings(lineAt(k), l, masterNames, predictFlags(specs, k - 1, shapeFlags));
   const curveCommands = (k: number, l: LineSpec) => l.steps.flatMap((s, i) => (s.curve ? (layouts[k - 1]?.[i] ?? [null]).map((_, src) => `Set ${sourceAt(k, i + 1, src + 1)} Property "Curve" "${curveConsole(s.curve!)}"`) : []));
   const sourceActions = (k: number) => sourceSettings((step, source) => sourceAt(k, step, source), resolved[k - 1] ?? []);
   let plan: string[] = [];
@@ -534,7 +684,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     "ClearAll",
     ...(name !== undefined ? [`set ${ref} Name=${name}`] : []),
     ...line1Assigns().map(actionText),
-    ...specs.flatMap((l, i) => [...(i > 0 ? copyActions(i + 1, l).map(actionText) : []), ...settingsOf(l).map((s) => `set ${lineAt(i + 1)} ${s.property}=${s.value}`)]),
+    ...specs.flatMap((l, i) => [...(i > 0 ? copyActions(i + 1, l).map(actionText) : []), ...settingsOf(i + 1, l).map(actionText)]),
     // After every copy: a copy keeps its source's custom curves (live 2026-11-14), so line 1's must not be set yet.
     ...specs.flatMap((l, i) => curveCommands(i + 1, l)),
     ...specs.flatMap((_, i) => sourceActions(i + 1).map(actionText)),
@@ -558,6 +708,8 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     // ---- Checks: nothing is sent unless all pass.
     const presetRows = new Map<string, Row[]>();
     let sourcesChecked = false;
+    const adaptiveNotes: string[] = [];
+    const masterWarnings: string[] = [];
     const ok =
       (await read("read_target", async () => ((await readPreset(bridge, ref, tm)) ? `${ref} exists: the phaser is built in a free preset slot (EditRecipe would reload an existing preset's lines, and an empty Store into it would wipe them)` : null), "preset.read")) &&
       (await read("check_references", async () => {
@@ -605,6 +757,26 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         sourcesChecked = true;
         return null;
       }, "children")) &&
+      (await read("check_adaptive_and_masters", async () => {
+        for (const sh of new Set(specs.map((l) => l.shape))) shapeFlags.set(sh, await readShapeFlags(bridge, sh, tm));
+        const problems: string[] = [];
+        specs.forEach((l, i) => {
+          const before_ = predictFlags(specs, i, shapeFlags);
+          const label = specs.length > 1 ? `line ${i + 1}` : "the line";
+          if (l.steps.some(givesWidth) && before_.adaptiveWidth === true && l.adaptiveWidth !== false)
+            problems.push(`${label}: Shape ${l.shape} has Adaptive Width (the console sets each width to 100 / phase positions and ignores WIDTHX): give adaptive_width: false to set a width (it changes the look: under Adaptive Width a chase lights one position at a time)`);
+          if (l.measure !== undefined && before_.adaptiveMeasure === true)
+            adaptiveNotes.push(`${label}: Shape ${l.shape} has Adaptive Measure (the console sets the measure to the number of phase positions: fixtures, or MAtricks positions); measure ${l.measure} switches it off on the line (PLAYBACKADAPTIVEMEASURE No before MEASURE), so one cycle lasts ${l.measure} beat(s) instead of one beat per position`);
+        });
+        const wanted = specs.flatMap((l) => (typeof l.speedMaster === "number" ? [l.speedMaster] : []));
+        if (wanted.length) {
+          masterNames = await readMasterNames(bridge, tm);
+          const m = masterProblems(wanted, masterNames);
+          problems.push(...m.problems);
+          masterWarnings.push(...m.warnings);
+        }
+        return problems.length ? problems.join("; ") : null;
+      }, "objects")) &&
       (await read("read_edit_state", async () => {
         const s = await readEditState(bridge, tm);
         if (s.modalError) return `whether a dialog is open cannot be read (${s.modalError})`;
@@ -624,14 +796,15 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         const m = String(c.preferences?.RecipeStoreMode ?? "");
         return m === "Normal" ? null : `the store preference RecipeStoreMode is ${JSON.stringify(m)}, not Normal`;
       }, "preset.context"));
-    if (sourcesChecked) plan = makePlan();
+    if (sourcesChecked && shapeFlags.size) plan = makePlan();
     if (!ok) return fail(`${op} was not performed; nothing was sent: ${steps_.find((s) => s.status !== "succeeded")?.error ?? "a check failed"}`);
     // A source left to the shape's value outputs that value (an absolute Dimmer 100 / 0, a relative Pan 0): named, so it is a choice.
     const shapeValued = resolved.flatMap((r, i) =>
       sigsOf(i + 1, presetsOf(r), layouts[i]).flatMap((g) => (g.pair.includes("-") ? [`line ${i + 1} ${g.attribute ?? `source ${g.source + 1}`}: ${g.pair.split("/").map((p, n) => (p === "-" ? `step ${n + 1}` : null)).filter(Boolean).join(" and ")} keep(s) the shape's value`] : [])),
     );
     const notes = shapeValued.length ? [`value sources without a preset output the shape's own value: ${shapeValued.join("; ")}`] : [];
-    if (preview) return buildResult({ operation: op, target: tgt, steps: steps_, summary: "Preview only; nothing was sent.", ...(advice.length ? { warnings: advice } : {}), extra: { plan, preview: true, ...(notes.length ? { notes } : {}) } });
+    const previewWarnings = [...advice, ...adaptiveNotes, ...masterWarnings];
+    if (preview) return buildResult({ operation: op, target: tgt, steps: steps_, summary: "Preview only; nothing was sent.", ...(previewWarnings.length ? { warnings: previewWarnings } : {}), extra: { plan, preview: true, ...(notes.length ? { notes } : {}) } });
 
     // ---- Line 1 in Edit Recipe mode.
     let created = false;
@@ -793,7 +966,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         }
         linesMade = k;
       }
-      for (const s of settingsOf(l)) if (!(await act(`line${k}_set_${s.property.toLowerCase()}`, { kind: "set", ref: lineAt(k), property: s.property, value: String(s.value), expect: "number" }))) notDone.push(`line ${k} ${s.property}`);
+      for (const a of settingsOf(k, l)) if (a.kind === "set" && !(await act(`line${k}_set_${a.property.toLowerCase()}`, a))) notDone.push(`line ${k} ${a.property}`);
     }
     // Curves after every copy: a copied line keeps line 1's custom curves. Then trans / width (over a curve's TRANS).
     for (const [i, l] of specs.slice(0, linesMade).entries())
@@ -805,10 +978,12 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     let verification: Verification = notRequested();
     let lines: unknown = null;
     let coverage: unknown = null;
+    const createdWarnings: string[] = [];
     try {
       const ls = (await readLines(bridge, { kind: "preset", pool: target.pool, number: target.number }, tm)) ?? [];
       const data = await readPreset(bridge, ref, tm);
       const s = await readEditState(bridge, tm);
+      const details = (await readLineDetails(bridge, ref, tm)) ?? [];
       lines = ls;
       const problems: string[] = [];
       if (ls.length !== specs.length) problems.push(`${ref} has ${ls.length} recipe line(s), ${specs.length} expected`);
@@ -830,6 +1005,11 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         if (got.selection?.group !== l.selection) problems.push(`line ${k} selection reads ${got.selection ? `Group ${got.selection.group}` : "none"}`);
         if (l.matricks !== undefined && got.matricks?.no !== l.matricks) problems.push(`line ${k} MAtricks reads ${got.matricks?.no ?? "none"}`);
         if (got.status.failedCookedPart && got.status.failedCookedPart !== "None") problems.push(`line ${k} failed to cook (${got.status.failedCookedPart})`);
+        // The adaptive flags and the speed master the line must read (what it set, or line 1's for a copy).
+        const exp = expectedLine(specs, i);
+        const det = details[i];
+        problems.push(...flagMasterDiff(`line ${k}`, det, { ...exp.flags, ...(exp.master !== undefined ? { speedMaster: exp.master === null ? "" : (masterNames.get(exp.master) ?? "") } : {}) }));
+        if (det?.speedMaster) createdWarnings.push(...masterSpeedWarning(`line ${k}`, det.speedMaster, det.speedHz));
         const sourceOf = (r: Row) => sigs[i].find((g) => rowMatches(r, g));
         // A value of a source without a preset that another line could have made too is not this line's to check.
         const mine = rows.filter((r) => sourceOf(r) !== undefined && (hasPreset(sourceOf(r)!) || !sigs.some((gs, j) => j !== i && gs.some((g) => rowMatches(r, g)))));
@@ -845,6 +1025,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
           const off = mine.filter((r) => typeof r.measure !== "number" || Math.abs(r.measure / 100 - l.measure!) > 0.01);
           if (off.length) problems.push(`line ${k}: ${off.length} value(s) do not have Measure ${l.measure} (first: fixture ${off[0].fixture} ${off[0].attribute} reads ${typeof off[0].measure === "number" ? off[0].measure / 100 : "none"})`);
         }
+        if (exp.master !== undefined) problems.push(...cookedMasterDiff(`line ${k}`, mine, exp.master));
         const res = resolved[i];
         l.steps.forEach((st, n) => {
           if (!st.curve || st.curve === "reset") return;
@@ -887,7 +1068,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     } catch (err) {
       steps_.push(asRead(stepFromError("read_back", err, { op: "preset.read" })));
     }
-    const warnings = [...advice, "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
+    const warnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...createdWarnings, "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (the preset and its lines are kept)`);
     return buildResult({ operation: op, target: tgt, steps: steps_, verification, warnings, extra: { plan, lines, linesMade, coverage, ...(notes.length ? { notes } : {}) } });
   };
@@ -926,6 +1107,13 @@ export interface LineDetail {
   phaseFrom?: number;
   phaseTo?: number;
   measure?: number;
+  /** PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH (own: set on the line itself, otherwise the shape's). */
+  adaptiveMeasure?: boolean;
+  adaptiveMeasureOwn?: boolean;
+  adaptiveWidth?: boolean;
+  adaptiveWidthOwn?: boolean;
+  /** SPEEDMASTEROVERRIDE as the console reads it: the master's name, "" for none. */
+  speedMaster?: string;
   failedCookedPart?: string;
   steps: StepDetail[];
 }
@@ -934,7 +1122,7 @@ export interface LineDetail {
 export async function readLineDetails(bridge: Gma3Bridge, ref: string, t: number): Promise<LineDetail[] | null> {
   let top: ChildList;
   try {
-    top = await childList(bridge, ref, ["SPEEDX", "PHASEFROMX", "PHASETOX", "MEASURE", "SHAPE", "MAtricks", "Selection", "FailedCookedPart"], t);
+    top = await childList(bridge, ref, ["SPEEDX", "PHASEFROMX", "PHASETOX", "MEASURE", "SHAPE", "MAtricks", "Selection", "FailedCookedPart", "PLAYBACKADAPTIVEMEASURE", "PLAYBACKADAPTIVEWIDTH", "SPEEDMASTEROVERRIDE"], t);
   } catch (err) {
     if (notFound(err)) return null;
     throw err;
@@ -951,6 +1139,12 @@ export async function readLineDetails(bridge: Gma3Bridge, ref: string, t: number
       d.phaseFrom = rawNumber(f.PHASEFROMX);
       d.phaseTo = rawNumber(f.PHASETOX);
       d.measure = measureOf(f.MEASURE);
+      const am = yesNoOf(f.PLAYBACKADAPTIVEMEASURE);
+      const aw = yesNoOf(f.PLAYBACKADAPTIVEWIDTH);
+      if (am) Object.assign(d, { adaptiveMeasure: am.value, adaptiveMeasureOwn: am.own });
+      if (aw) Object.assign(d, { adaptiveWidth: aw.value, adaptiveWidthOwn: aw.own });
+      if (typeof f.SPEEDMASTEROVERRIDE === "string") d.speedMaster = f.SPEEDMASTEROVERRIDE.trim();
+      else if (f.SPEEDMASTEROVERRIDE === null) d.speedMaster = "";
       for (const sources of (await readLayout(bridge, `${ref}.${line}`, t)) ?? []) {
         const s1 = sources[0];
         d.steps.push({ preset: s1?.preset ?? null, accel: s1?.accel, decel: s1?.decel, trans: s1?.trans, width: s1?.width, sources });
@@ -980,10 +1174,34 @@ interface LineExpect {
   phaseFrom?: number;
   phaseTo?: number;
   measure?: number;
+  adaptiveMeasure?: boolean;
+  adaptiveWidth?: boolean;
+  /** The master's name, "" for none. */
+  speedMaster?: string;
   steps: Array<{ sources: SourceExpect[] }>;
 }
 const layoutOf = (d: { steps: Array<{ sources: Array<{ attribute: string | null }> }> }): Layout => d.steps.map((st) => st.sources.map((x) => ({ attribute: x.attribute, preset: null })));
 const presetsIn = (d: { steps: Array<{ sources: Array<{ preset?: PresetRef | null }> }> }) => d.steps.map((st) => st.sources.map((x) => x.preset));
+
+/** The adaptive flags and the speed master (by name, "" for none) a line must read; an undefined field is not compared. */
+function flagMasterDiff(label: string, got: LineDetail | undefined, want: { adaptiveMeasure?: boolean; adaptiveWidth?: boolean; speedMaster?: string }): string[] {
+  if (!got) return [];
+  const p: string[] = [];
+  const yn = (b: boolean | undefined) => (b === undefined ? "unreadable" : b ? "Yes" : "No");
+  if (want.adaptiveMeasure !== undefined && got.adaptiveMeasure !== want.adaptiveMeasure) p.push(`${label} Adaptive Measure reads ${yn(got.adaptiveMeasure)}, ${yn(want.adaptiveMeasure)} expected`);
+  if (want.adaptiveWidth !== undefined && got.adaptiveWidth !== want.adaptiveWidth) p.push(`${label} Adaptive Width reads ${yn(got.adaptiveWidth)}, ${yn(want.adaptiveWidth)} expected`);
+  if (want.speedMaster !== undefined && (got.speedMaster ?? "").toLowerCase() !== want.speedMaster.toLowerCase())
+    p.push(`${label} speed master reads ${got.speedMaster ? JSON.stringify(got.speedMaster) : got.speedMaster === "" ? "none" : "unreadable"}, ${want.speedMaster ? JSON.stringify(want.speedMaster) : "none"} expected`);
+  return p;
+}
+
+/** The cooked values of a line follow master n (the cooked speedMaster is 0-based: master 1 reads 0) or none (null). */
+function cookedMasterDiff(label: string, rows: Row[], master: number | null): string[] {
+  const off = rows.filter((r) => (master === null ? r.speedMaster !== undefined && r.speedMaster !== null : r.speedMaster !== master - 1));
+  if (!off.length) return [];
+  const read = (r: Row) => (typeof r.speedMaster === "number" ? `master ${r.speedMaster + 1}` : "no master");
+  return [`${label}: ${off.length} cooked value(s) do not follow ${master === null ? "no speed master" : `speed master ${master}`} (first: fixture ${off[0].fixture} ${off[0].attribute} reads ${read(off[0])})`];
+}
 
 function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect): string[] {
   if (!got) return [`${label} is missing`];
@@ -995,6 +1213,7 @@ function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect):
   if (!near(got.speedHz, want.speedHz, 0.001)) p.push(`${label} speed reads ${got.speedHz === undefined ? "none" : `${+(got.speedHz * 60).toFixed(3)} BPM`}, ${+(want.speedHz! * 60).toFixed(3)} BPM expected`);
   if (!near(got.phaseFrom, want.phaseFrom, 0.01) || !near(got.phaseTo, want.phaseTo, 0.01)) p.push(`${label} phase reads ${got.phaseFrom} to ${got.phaseTo}, ${want.phaseFrom ?? "(unchanged)"} to ${want.phaseTo ?? "(unchanged)"} expected`);
   if (!near(got.measure, want.measure, 0.01)) p.push(`${label} measure reads ${got.measure ?? "none"}, ${want.measure} expected`);
+  p.push(...flagMasterDiff(label, got, want));
   if (got.failedCookedPart && got.failedCookedPart !== "None") p.push(`${label} failed to cook (${got.failedCookedPart})`);
   if (got.steps.length !== want.steps.length) p.push(`${label} has ${got.steps.length} step(s), ${want.steps.length} expected`);
   want.steps.forEach((w, n) => {
@@ -1011,7 +1230,7 @@ function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect):
   });
   return p;
 }
-const expectOf = (d: LineDetail): LineExpect => ({ class: d.class, group: d.group, matricks: d.matricks, shape: d.shape, speedHz: d.speedHz, phaseFrom: d.phaseFrom, phaseTo: d.phaseTo, measure: d.measure, steps: d.steps.map((st) => ({ sources: st.sources.map((x) => ({ ...x })) })) });
+const expectOf = (d: LineDetail): LineExpect => ({ class: d.class, group: d.group, matricks: d.matricks, shape: d.shape, speedHz: d.speedHz, phaseFrom: d.phaseFrom, phaseTo: d.phaseTo, measure: d.measure, adaptiveMeasure: d.adaptiveMeasure, adaptiveWidth: d.adaptiveWidth, speedMaster: d.speedMaster, steps: d.steps.map((st) => ({ sources: st.sources.map((x) => ({ ...x })) })) });
 
 /** Why a line cannot be edited by this release (its values must be told apart by their value sources' presets), or null. */
 function lineProblem(l: LineDetail, label: string): string | null {
@@ -1055,10 +1274,14 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     if (raw.speed_bpm !== undefined) change.speed = v.check(() => finiteNumber("speed_bpm", raw.speed_bpm, { min: 0.01, max: 6000 }));
     if (raw.measure !== undefined) change.measure = v.check(() => finiteNumber("measure", raw.measure, { min: 0.01, max: 1000 }));
     if (raw.phase !== undefined) change.phase = parsePhase(v, raw.phase, "phase");
+    if (raw.speed_master !== undefined) change.speedMaster = parseSpeedMaster(v, raw.speed_master, "speed_master");
+    if (raw.adaptive_measure !== undefined) change.adaptiveMeasure = parseFlag(v, raw.adaptive_measure, "adaptive_measure");
+    if (raw.adaptive_width !== undefined) change.adaptiveWidth = parseFlag(v, raw.adaptive_width, "adaptive_width");
     if (raw.steps !== undefined) {
       if (!Array.isArray(raw.steps) || raw.steps.length !== 2) v.fail('steps must be exactly 2 items, each {preset? | sources?, curve?, trans?, width?} ({} keeps that step)');
       else change.steps = raw.steps.map((s, i) => parseStep(v, s, `steps[${i}]`, false));
     }
+    adaptiveConflicts(v, change, (f) => f);
   } else if (action === "add_line") {
     addSpec = parseLine(v, raw as Record<string, unknown>, "");
   }
@@ -1098,6 +1321,9 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     let want: LineExpect | undefined; // the edited or added line after the edit
     let res: Resolved[][] = []; // what each value source of the edited or added line is given
     let clears: Array<[number, number]> = []; // value sources whose preset is cleared (back to their own value)
+    let flagsBefore: Flags = {}; // the line's adaptive flags when its settings are written (after a new shape)
+    let masterNames = new Map<number, string>();
+    const editNotes: string[] = [];
     const lineAt = (n: number) => `${ref}.${n}`;
     const sourceAt = (n: number, step: number, source = 1) => `${ref}.${n}.1.${step}.${source}`;
     const ok =
@@ -1133,10 +1359,25 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         const newShape = action === "set" ? s.shape !== undefined : raw.shape !== undefined;
         const shapeChanged = action === "set" ? newShape && s.shape !== base.shape : true;
         const layout = layoutOf(base);
+        flagsBefore = { adaptiveMeasure: base.adaptiveMeasure, adaptiveWidth: base.adaptiveWidth };
         if (newShape && s.shape !== base.shape) {
           const sl = await readLayout(bridge, `Shape ${s.shape}.1`, tm);
           if (!sl) return `Shape ${s.shape} is not in the show (or has no phaser recipe)`;
           if (!sameLayout(sl, layout)) return `Shape ${s.shape}'s value sources (${layoutText(sl)}) are not ${action === "set" ? `line ${k}'s` : "line 1's"} (${layoutText(layout)}): Assign Shape keeps a line's value sources, so the shape must have the same ones (another layout is a line of its own, made with create)`;
+          // A flag the line set itself stays through Assign Shape; one it took from its shape follows the new shape.
+          const sf = await readShapeFlags(bridge, s.shape!, tm);
+          flagsBefore = { adaptiveMeasure: base.adaptiveMeasureOwn ? base.adaptiveMeasure : sf.adaptiveMeasure, adaptiveWidth: base.adaptiveWidthOwn ? base.adaptiveWidth : sf.adaptiveWidth };
+        }
+        const stepsGiven: StepSpec[] = s.steps ?? [];
+        if (stepsGiven.some(givesWidth) && flagsBefore.adaptiveWidth === true && s.adaptiveWidth !== false)
+          return `line ${k} has Adaptive Width (the console sets each width to 100 / phase positions and ignores WIDTHX): give adaptive_width: false to set a width (it changes the look: under Adaptive Width a chase lights one position at a time)`;
+        if (s.measure !== undefined && flagsBefore.adaptiveMeasure === true)
+          editNotes.push(`line ${k} had Adaptive Measure (the console sets the measure to the number of phase positions: fixtures, or MAtricks positions); measure ${s.measure} switches it off (PLAYBACKADAPTIVEMEASURE No before MEASURE), so one cycle lasts ${s.measure} beat(s) instead of one beat per position`);
+        if (typeof s.speedMaster === "number") {
+          masterNames = await readMasterNames(bridge, tm);
+          const m = masterProblems([s.speedMaster], masterNames);
+          if (m.problems.length) return m.problems.join("; ");
+          editNotes.push(...m.warnings);
         }
         if (s.selection !== undefined) w.group = s.selection;
         if (newShape) w.shape = s.shape!;
@@ -1191,13 +1432,27 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
             const a = base.steps[n].sources[s_].width;
             const b = base.steps[o].sources[s_].width;
             w.steps[n].sources[s_].width = x.width;
-            w.steps[o].sources[s_].width = !shapeChanged && a !== undefined && b !== undefined ? a + b - x.width : undefined;
+            const awChanged = (s.adaptiveWidth ?? flagsBefore.adaptiveWidth) !== base.adaptiveWidth;
+            w.steps[o].sources[s_].width = !shapeChanged && !awChanged && a !== undefined && b !== undefined ? a + b - x.width : undefined;
             w.steps[n].sources[s_].trans = undefined;
             w.steps[o].sources[s_].trans = undefined;
           }),
         );
         res.forEach((st, n) => st.forEach((x, s_) => x.trans !== undefined && (w.steps[n].sources[s_].trans = x.trans)));
+        // Adaptive flags after the edit: written, else as before (a new shape: its own, unless the line set them itself).
+        w.adaptiveMeasure = s.measure !== undefined ? false : (s.adaptiveMeasure ?? flagsBefore.adaptiveMeasure);
+        w.adaptiveWidth = s.adaptiveWidth ?? flagsBefore.adaptiveWidth;
+        // Under Adaptive Measure / Width the console derives the measure and the widths from the phase positions: a new
+        // group or MAtricks moves them, and so does switching a flag (Chase, live 2026-11-14: measure 4 = 4 fixtures, 2
+        // with XWings 2; widths 25 / 75, 100 / 100 once Adaptive Width is off). Those are not compared.
+        const positionsMoved = s.selection !== undefined || s.matricks !== undefined || shapeChanged;
+        const amToggled = w.adaptiveMeasure !== base.adaptiveMeasure;
+        const awToggled = w.adaptiveWidth !== base.adaptiveWidth;
+        if ((w.adaptiveMeasure !== false && positionsMoved) || amToggled) w.measure = undefined;
+        if ((w.adaptiveWidth !== false && positionsMoved) || awToggled)
+          w.steps.forEach((st, n) => st.sources.forEach((x, s_) => res[n]?.[s_]?.width === undefined && Object.assign(x, { width: undefined })));
         if (s.measure !== undefined) w.measure = s.measure;
+        if (s.speedMaster !== undefined) w.speedMaster = s.speedMaster === null ? "" : (masterNames.get(s.speedMaster) ?? "");
         want = w;
         return null;
       })) &&
@@ -1248,16 +1503,17 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
       if (want.matricks !== base.matricks) actions.push(cmdA(`Assign MAtricks ${want.matricks} At ${lineAt(k)}`));
       res.forEach((st, n) => st.forEach((x, s_) => x.preset && actions.push(cmdA(`Assign Preset ${pkey(x.preset)} At ${sourceAt(k, n + 1, s_ + 1)}`))));
       for (const [n, s_] of clears) actions.push({ kind: "set", ref: sourceAt(k, n + 1, s_ + 1), property: "PRESET", value: "", expect: "empty" });
+      // The line's settings: the adaptive flags now (before the widths), the rest (speed, phase, measure, master) last.
+      const settings = lineSettings(lineAt(k), s, masterNames, flagsBefore);
+      const isFlag = (a: Action) => a.kind === "set" && a.property.startsWith("PLAYBACKADAPTIVE");
+      actions.push(...settings.filter(isFlag));
       const reqSteps: StepSpec[] = s.steps ?? [{}, {}];
       const cp = curvePlan(reqSteps);
       const count = base.steps[0]?.sources.length ?? 1;
       for (const n of cp.resets) for (let x = 1; x <= count; x++) actions.push(cmdA(`Set ${sourceAt(k, n + 1, x)} Property "Curve" "Reset"`));
       for (const [n, c] of cp.named) for (let x = 1; x <= count; x++) actions.push(cmdA(`Set ${sourceAt(k, n + 1, x)} Property "Curve" "${curveConsole(c)}"`));
       actions.push(...sourceSettings((step, source) => sourceAt(k, step, source), res));
-      const line = (property: string, value: number): Action => ({ kind: "set", ref: lineAt(k), property, value: String(value), expect: "number" });
-      if (s.speed !== undefined) actions.push(line("SPEEDX", s.speed));
-      if (s.phase) actions.push(line("PHASEFROMX", s.phase.from), line("PHASETOX", s.phase.to));
-      if (s.measure !== undefined) actions.push(line("MEASURE", s.measure));
+      actions.push(...settings.filter((a) => !isFlag(a)));
     }
     plan = [...actions.map(actionText), ...(name !== undefined ? [`set ${ref} Name=${name}`] : []), `Cook ${ref} /MergeLowPriority`];
     if (!ok) return fail(`${op} was not performed; nothing was sent: ${steps_.find((s) => s.status !== "succeeded")?.error ?? "a check failed"}`);
@@ -1363,6 +1619,8 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
             const off = got.filter((r) => typeof r.measure !== "number" || Math.abs(r.measure / 100 - m) > 0.01);
             if (off.length) problems.push(`line ${k}: ${off.length} cooked value(s) do not have Measure ${m}`);
           }
+          const sm = action === "set" ? change.speedMaster : addSpec?.speedMaster;
+          if (sm !== undefined) problems.push(...cookedMasterDiff(`line ${k}`, got, sm));
         }
       }
       if (s.modal) problems.push(`a dialog is open (${s.modal.title ?? "untitled"})`);
@@ -1372,8 +1630,10 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     } catch (err) {
       steps_.push(asRead(stepFromError("read_back", err, { op: "children" })));
     }
-    const warnings: string[] = [];
+    const warnings: string[] = [...editNotes];
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (nothing was undone)`);
+    const edited = action !== "remove_line" ? after?.[k - 1] : undefined;
+    if (edited?.speedMaster) warnings.push(...masterSpeedWarning(`line ${k}`, edited.speedMaster, edited.speedHz));
     if (want && action === "set" && change.shape !== undefined) warnings.push("a new shape recomputes the curves of steps without a custom curve; a custom curve stays (give curve: reset to go back to the shape's)");
     const notes = [`cues that call ${ref} with a standard line follow the change without being re-cooked${referencedBy ? ` (${referencedBy} object(s) reference it)` : ""}; a cue line with its own Speed X keeps that speed`];
     if (clears.length && want) notes.push(`value sources given no preset now output the shape's own value: ${clears.map(([n, s_]) => `step ${n + 1} ${want!.steps[n].sources[s_].attribute ?? `source ${s_ + 1}`}`).join(", ")}`);
@@ -1408,7 +1668,17 @@ const lineShape = {
   matricks: z.number().optional().describe("MAtricks pool number (wings, blocks... spread the phase)."),
   speed_bpm: z.number().optional().describe("Speed X in BPM (60 BPM = 1 Hz); the console default otherwise (lines 2+ otherwise keep line 1's)."),
   phase: z.object({ from: z.number(), to: z.number() }).optional().describe("Phase X from/to in degrees (e.g. 0 to 360)."),
-  measure: z.number().optional().describe("Measure in beats (the line's MEASURE; Flyout reads 4); the shape's otherwise (lines 2+ otherwise keep line 1's)."),
+  measure: z.number().optional().describe("Measure in beats (the line's MEASURE; Flyout reads 4); the shape's otherwise (lines 2+ otherwise keep line 1's). On a line with Adaptive Measure (Chase 7) it switches Adaptive Measure off first: the console ignores MEASURE under it."),
+  speed_master: z
+    .number()
+    .int()
+    .min(0)
+    .max(MAX_MASTER)
+    .nullable()
+    .optional()
+    .describe("Speed master 1-16 the line follows (SPEEDMASTEROVERRIDE, always written as a number; read back by the master's name and in the cooked values). 0 or null clears the link; text is refused (None would link master 1, a name another master). The master multiplies Speed X: a line that follows a master has Speed X 60 (one cycle = Measure x 60 / master BPM); another Speed X is warned about. Lines 2+ and add_line otherwise keep line 1's; set keeps the line's."),
+  adaptive_measure: z.boolean().optional().describe("Adaptive Measure of the line (PLAYBACKADAPTIVEMEASURE; Chase 7 has it: measure = the number of phase positions, i.e. fixtures or MAtricks positions, one beat each). Default: the shape's; a measure switches it off."),
+  adaptive_width: z.boolean().optional().describe("Adaptive Width of the line (PLAYBACKADAPTIVEWIDTH; Chase 7 has it: step 1 width = 100 / positions, one position lit at a time). Default: the shape's. A width on a line under Adaptive Width is refused unless adaptive_width is false (the console ignores WIDTHX under it, and switching it off changes the look)."),
 };
 
 export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
@@ -1431,6 +1701,7 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         "Checked first: the preset and line exist, the line is a PhaserRecipe of 2 steps whose values are told apart by their value sources' presets, each source's presets from one pool and holding its attribute, no other line with the same source presets, the references exist, no dialog, the Edit Recipe mode off. " +
         "Sent: Assign Group / Shape / MAtricks At the line, Assign Preset At each value source, set PRESET \"\" on a cleared source, the curves after the shape, WIDTHX / TRANSX, SPEEDX / PHASEFROMX / PHASETOX / MEASURE, Cook /MergeLowPriority. " +
         "Read back: the edited line as asked (presets, trans, width per source, curves, measure, cook state), every other line and its cooked values unchanged, the edited line's values cooked at its speed and measure, the old presets' values gone. Cues calling the preset follow it without a re-cook (a cue line's own Speed X still replaces the speed). " +
+        "Per line: speed_master n (1-16, a number only; 0 / null clears) links the line to speed master 3.n (SPEEDMASTEROVERRIDE), read back by the master's name (read from the master) and in the cooked values; the master multiplies Speed X, so a line with a master and a Speed X other than 60 is warned about. adaptive_measure / adaptive_width set PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH; a measure switches Adaptive Measure off first (warned when the line had it); a width under Adaptive Width needs adaptive_width: false. Under Adaptive the measure / widths the console derives (a new group or MAtricks) are not compared. " +
         "preview: true runs the checks and returns the plan. Needs bridge 0.52.1.",
       inputSchema: {
         action: z.enum(["create", "set", "add_line", "remove_line"]),
@@ -1445,6 +1716,9 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         speed_bpm: lineShape.speed_bpm,
         phase: lineShape.phase,
         measure: lineShape.measure,
+        speed_master: lineShape.speed_master,
+        adaptive_measure: lineShape.adaptive_measure,
+        adaptive_width: lineShape.adaptive_width,
         exclusive: z.boolean().optional().describe("create: required (true) unless preview: nobody else uses the programmer or the Edit Recipe mode meanwhile. Not used by the edit actions."),
         preview: z.boolean().optional(),
       },

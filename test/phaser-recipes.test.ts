@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness } from "./helpers/tool-harness.js";
 import { BridgeReplyError } from "./helpers/fake-bridge.js";
-import { registerPhaserRecipeTools, numberMatches } from "../src/tools/phaserrecipes.js";
+import { registerPhaserRecipeTools, numberMatches, parseSpeedMaster, yesNoOf } from "../src/tools/phaserrecipes.js";
+import { Validator } from "../src/validate.js";
 
 /**
  * gma3_edit_phaser_recipe against a fake console that models the Edit Recipe facts of onPC 2.5.1 (THK migration
@@ -22,7 +23,11 @@ const FLYOUT: FSource[][] = [
   [{ attribute: "Dimmer", trans: 10, width: 100 }, { attribute: "Tilt", trans: 100, width: 100 }, { attribute: "Pan", trans: 100, width: 100 }],
   [{ attribute: "Dimmer", trans: 10, width: 100 }, { attribute: "Tilt", trans: 50, width: 80 }, { attribute: "Pan", trans: 50, width: 80 }],
 ];
-const SHAPES: Record<number, FSource[][]> = { 1: PLAIN, 2: PLAIN, 3: PLAIN, 19: FLYOUT, 20: FLYOUT };
+/** Chase (7): one source per step, trans 0, and Adaptive Measure / Width on (live 2026-11-14). */
+const CHASE: FSource[][] = [[{ attribute: null, trans: 0, width: 100 }], [{ attribute: null, trans: 0, width: 100 }]];
+const SHAPES: Record<number, FSource[][]> = { 1: PLAIN, 2: PLAIN, 3: PLAIN, 7: CHASE, 19: FLYOUT, 20: FLYOUT };
+const ADAPTIVE_SHAPES = new Set([7]);
+const MASTER_NAMES = ["Speed1", "PAN", "TILT", ...Array.from({ length: 13 }, (_, i) => `Speed ${i + 4}`)];
 const attrHandle = (a: string | null) => (a ? { class: "Attribute", name: a, addr: `14.9.2.4.${["Dimmer", "Pan", "Tilt"].indexOf(a) + 1}` } : undefined);
 /** The children op on "Shape N.1.1" (steps) and "Shape N.1.1.n" (value sources); undefined for any other ref. */
 function shapeChildren(ref: string) {
@@ -648,7 +653,8 @@ test("edit preview: checks and the plan, nothing sent", async () => {
 // gives the source back its own value; with Link Steps the 2 widths of a source keep their sum; MEASURE cooks x100; a
 // source whose preset holds no value for its attribute does not cook (IntegratedPresetMiss).
 type MSource = { attribute: string | null; preset: string | null; trans: number; width: number };
-type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][] };
+type Flag = { value: boolean; own: boolean };
+type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][]; am?: Flag; aw?: Flag; master?: number | null };
 const HOLDS: Record<string, string[]> = { "1.9020": ["Dimmer"], "1.9021": ["Dimmer"], "2.9020": ["Pan", "Tilt", "PanTiltDistance"], "2.9021": ["Pan", "Tilt", "PanTiltDistance"], "2.9022": ["Pan", "Tilt"] };
 const fromShape = (shape: number): MSource[][] => SHAPES[shape].map((st) => st.map((x) => ({ attribute: x.attribute, preset: null, trans: x.trans, width: x.width })));
 
@@ -676,9 +682,24 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
   h.fake.on("programmer", () => ({ environment: "Normal", total: c.values, count: 0, coverage: { complete: true }, rows: [] }));
   h.fake.on("preset.context", () => ({ preferencesReadable: true, preferences: { RecipeStoreMode: "Normal" } }));
   h.fake.on("objects", (args) => {
-    const known = ["Group 9002", "Group 9003", "Shape 1", "Shape 19", "Shape 20", "MAtricks 9000"].includes(String(args.ref));
+    const ref = String(args.ref);
+    const sm = ref.match(/^Shape (\d+)\.1$/);
+    if (sm && SHAPES[Number(sm[1])]) {
+      const yes = ADAPTIVE_SHAPES.has(Number(sm[1])) ? "<Yes>" : "<No>";
+      return { total: 1, count: 1, offset: 0, items: [{ name: "PhaserRecipe 1", fields: { PLAYBACKADAPTIVEMEASURE: yes, PLAYBACKADAPTIVEWIDTH: yes } }] };
+    }
+    const known = ["Group 9002", "Group 9003", "Shape 1", "Shape 7", "Shape 19", "Shape 20", "MAtricks 9000"].includes(ref);
     return { total: known ? 1 : 0, items: known ? [{ name: "x" }] : [], offset: 0, count: known ? 1 : 0 };
   });
+  // Adaptive Measure / Width: the console sets the measure to the number of fixtures and step 1's width to 100 / n
+  // (the rest to step 2), and ignores MEASURE / WIDTHX meanwhile; a flag the line did not set follows its shape.
+  const fixturesOf = (group: number) => (group === 9003 ? ["201"] : ["101", "102"]);
+  const shapeFlag = (shape: number): Flag => ({ value: ADAPTIVE_SHAPES.has(shape), own: false });
+  const am = (l: MLine) => (l.am ?? shapeFlag(l.shape)).value;
+  const aw = (l: MLine) => (l.aw ?? shapeFlag(l.shape)).value;
+  const measureOf = (l: MLine) => (am(l) ? fixturesOf(l.group).length : l.measure);
+  const widthOf = (l: MLine, step: number, s: number) => (aw(l) ? (step === 0 ? 100 / fixturesOf(l.group).length : 100 - 100 / fixturesOf(l.group).length) : l.steps[step][s].width);
+  const flagRead = (f: Flag | undefined, shape: number) => (f?.own ? f.value : `<${shapeFlag(shape).value ? "Yes" : "No"}>`);
   let step = 0;
   h.fake.onCommand((command) => {
     cmds.push(command);
@@ -703,7 +724,12 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       if (x?.src && x.s !== o.ignoreSourceAssign) x.src.preset = m[1];
     } else if ((m = command.match(/^Copy Preset 21\.9030\.1 At Preset 21\.9030\.(\d+) \/NoConfirmation$/))) c.lines.push(structuredClone(c.lines[0]));
     else if ((m = command.match(/^Assign Group (\d+) At Preset 21\.9030\.(\d+)$/))) c.lines[Number(m[2]) - 1].group = Number(m[1]);
-    else if ((m = command.match(/^Assign Shape (\d+) At Preset 21\.9030\.(\d+)$/))) c.lines[Number(m[2]) - 1].shape = Number(m[1]);
+    else if ((m = command.match(/^Assign Shape (\d+) At Preset 21\.9030\.(\d+)$/))) {
+      const l = c.lines[Number(m[2]) - 1];
+      l.shape = Number(m[1]);
+      if (!l.am?.own) l.am = undefined;
+      if (!l.aw?.own) l.aw = undefined;
+    }
     else if ((m = command.match(/^Delete Preset 21\.9030\.(\d+) \/NoConfirmation$/))) c.lines.splice(Number(m[1]) - 1, 1);
     else if (command === "Delete Preset 21.9030 /NoConfirmation") c.preset = false;
     return "OK";
@@ -719,6 +745,7 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       return { value: "", readOk: true };
     }
     if (x.src && args.property === "TRANSX") return { value: `${(x.src.trans = Number(value)).toFixed(1)}%` };
+    if (x.src && args.property === "WIDTHX" && aw(x.l)) return { value: `${widthOf(x.l, x.step!, x.s!).toFixed(1)}%` };
     if (x.src && args.property === "WIDTHX") {
       const other = x.l.steps[(x.step! + 1) % 2][x.s!];
       const sum = x.src.width + other.width;
@@ -727,7 +754,20 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       return { value: `${x.src.width.toFixed(1)}%` };
     }
     if (args.property === "SPEEDX") x.l.speedHz = Number(value) / 60;
-    if (args.property === "MEASURE") x.l.measure = Number(value);
+    if (args.property === "PLAYBACKADAPTIVEMEASURE" || args.property === "PLAYBACKADAPTIVEWIDTH") {
+      x.l[args.property === "PLAYBACKADAPTIVEMEASURE" ? "am" : "aw"] = { value: value === "Yes", own: true };
+      return { value };
+    }
+    if (args.property === "SPEEDMASTEROVERRIDE") {
+      // A number links master n (0 clears); "None" reads Speed1 (live 2026-11-14).
+      const n = value === "None" ? 1 : Number(value);
+      if (Number.isInteger(n)) x.l.master = n > 0 ? n : null;
+      return { value: x.l.master ? MASTER_NAMES[x.l.master - 1] : "" };
+    }
+    if (args.property === "MEASURE") {
+      if (!am(x.l)) x.l.measure = Number(value);
+      return { value: measureOf(x.l).toFixed(2) };
+    }
     return { value: Number(value).toFixed(2) };
   });
   const miss = (l: MLine) => l.steps.some((st) => st.some((x) => x.preset && x.attribute && !HOLDS[x.preset]?.includes(x.attribute)));
@@ -736,14 +776,15 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
     const list = (items: unknown[]) => ({ total: items.length, offset: 0, count: items.length, items });
     const sh = shapeChildren(ref);
     if (sh) return sh;
+    if (ref === "ShowData.Masters.Speed") return list(MASTER_NAMES.map((name, i) => ({ class: "MasterSpeed", index: i + 1, name, fields: { Name: name } })));
     if (ref === P) {
       if (!c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
-      return list(c.lines.map((l, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: l.group, addr: `14.14.1.6.${l.group}` }, MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: 0, PHASETOX: 0, MEASURE: `<< ${l.measure.toFixed(2)}> 4.00>`, FailedCookedPart: miss(l) ? "IntegratedPresetMiss" : "None" } })));
+      return list(c.lines.map((l, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: l.group, addr: `14.14.1.6.${l.group}` }, MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: 0, PHASETOX: 0, MEASURE: `<< ${measureOf(l).toFixed(2)}> 4.00>`, PLAYBACKADAPTIVEMEASURE: flagRead(l.am, l.shape), PLAYBACKADAPTIVEWIDTH: flagRead(l.aw, l.shape), SPEEDMASTEROVERRIDE: l.master ? MASTER_NAMES[l.master - 1] : "", FailedCookedPart: miss(l) ? "IntegratedPresetMiss" : "None" } })));
     }
     let m = ref.match(/^Preset 21\.9030\.(\d+)\.1$/);
     if (m) return list(c.lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
     m = ref.match(/^Preset 21\.9030\.(\d+)\.1\.(\d)$/);
-    if (m) return list(c.lines[Number(m[1]) - 1].steps[Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), Preset: x.preset ? presetAddr(x.preset) : undefined, TRANSX: x.trans, WIDTHX: x.width, ACCELX: 0, DECELX: 0 } })));
+    if (m) return list(c.lines[Number(m[1]) - 1].steps[Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), Preset: x.preset ? presetAddr(x.preset) : undefined, TRANSX: x.trans, WIDTHX: widthOf(c.lines[Number(m![1]) - 1], Number(m![2]) - 1, i), ACCELX: 0, DECELX: 0 } })));
     throw new BridgeReplyError(`no object found for '${ref}'`);
   });
   h.fake.on("preset.read", (args) => {
@@ -753,13 +794,14 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
     if (ref !== P || !c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
     const out = new Map<string, unknown>();
     for (const l of c.lines)
-      for (const fixture of l.group === 9003 ? ["201"] : ["101", "102"])
+      for (const fixture of fixturesOf(l.group))
         l.steps[0].forEach((_, s) => {
           const srcs = [l.steps[0][s], l.steps[1][s]];
           const attribute = srcs[0].attribute ?? "Dimmer";
           if (srcs.some((x) => x.preset && !HOLDS[x.preset]?.includes(attribute))) return; // IntegratedPresetMiss: nothing cooks
-          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: x.width, accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null }));
-          out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: l.measure * 100, steps });
+          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null }));
+          // The cooked speed master is 0-based (master 2 reads 1); absent without one.
+          out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: measureOf(l) * 100, ...(l.master ? { speedMaster: l.master - 1 } : {}), steps });
         });
     return { ref, name: c.name, referencedBy: 1, rows: [...out.values()], dependencies: [] };
   });
@@ -946,6 +988,250 @@ test("create with lines, several value sources: line 2 is a copy of line 1; its 
     assert.deepEqual(c.lines[1].steps.map((st) => st.map((x) => x.preset)), [[null, "2.9022", null], [null, "2.9020", null]]);
     assert.deepEqual(h.fake.requests.filter((r) => r.op === "set" && r.args?.property === "PRESET").map((r) => r.args?.ref), ["Preset 21.9030.2.1.1.1", "Preset 21.9030.2.1.1.3", "Preset 21.9030.2.1.2.1", "Preset 21.9030.2.1.2.3"]);
     assert.match(result.notes.join(" "), /line 2 Dimmer: step 1 and step 2 keep\(s\) the shape's value/);
+  } finally {
+    await h.close();
+  }
+});
+
+// ---- Speed master per line and the adaptive flags (Chase), against flySetup's console: SPEEDMASTEROVERRIDE n links
+// master 3.n and reads its name (0 clears), the cooked speedMaster is 0-based; under Adaptive Measure / Width the
+// console sets the measure / widths itself and ignores MEASURE / WIDTHX (live 2026-11-14, Chase on Group 9001).
+const setsOf = (h: { fake: { requests: Array<{ op: string; args?: Record<string, unknown> }> } }) => h.fake.requests.filter((r) => r.op === "set").map((r) => `${r.args?.ref} ${r.args?.property}=${r.args?.value}`);
+const CHASE_ARGS = { action: "create", preset: "21.9030", name: "TEST CHASE", selection: 9002, shape: 7, steps: [{ preset: "1.9020" }, { preset: "1.9021" }], speed_bpm: 60, exclusive: true };
+const CHASE_LINE = (o: Partial<MLine> = {}): MLine => {
+  const steps = fromShape(7);
+  [steps[0][0].preset, steps[1][0].preset] = ["1.9020", "1.9021"];
+  return { group: 9002, shape: 7, matricks: null, speedHz: 1, measure: 1, steps, ...o };
+};
+
+test("parseSpeedMaster: a master number 1-16; 0 and null clear; text and other numbers are refused", () => {
+  for (const [raw, want] of [[2, 2], [16, 16], [1, 1], [0, null], [null, null]] as const) {
+    const v = new Validator();
+    assert.equal(parseSpeedMaster(v, raw, "speed_master"), want);
+    assert.equal(v.ok, true);
+  }
+  for (const raw of ["2", "PAN", "None", "", 17, -1, 1.5, true]) {
+    const v = new Validator();
+    assert.equal(parseSpeedMaster(v, raw, "speed_master"), undefined);
+    assert.match(v.errors.join(" "), /speed master number 1-16 .*text is refused/);
+  }
+});
+
+test("yesNoOf: own booleans, inherited <Yes> / <No>, text", () => {
+  assert.deepEqual(yesNoOf(true), { value: true, own: true });
+  assert.deepEqual(yesNoOf(false), { value: false, own: true });
+  assert.deepEqual(yesNoOf("<Yes>"), { value: true, own: false });
+  assert.deepEqual(yesNoOf("<No>"), { value: false, own: false });
+  assert.deepEqual(yesNoOf("No"), { value: false, own: true });
+  assert.equal(yesNoOf(""), undefined);
+  assert.equal(yesNoOf(1), undefined);
+});
+
+test("create on Chase with measure 1: Adaptive Measure switched off before MEASURE, measure verified, warned", async () => {
+  const { h, c } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...CHASE_ARGS, measure: 1 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(setsOf(h), ["Preset 21.9030 Name=TEST CHASE", "Preset 21.9030.1 SPEEDX=60", "Preset 21.9030.1 PLAYBACKADAPTIVEMEASURE=No", "Preset 21.9030.1 MEASURE=1"]);
+    assert.deepEqual(c.lines[0].am, { value: false, own: true });
+    assert.equal(c.lines[0].aw, undefined, "Adaptive Width is left to the shape (one position at a time)");
+    assert.match(result.warnings.join(" "), /Shape 7 has Adaptive Measure .* measure 1 switches it off/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create on Chase without measure: the adaptive flags are left to the shape (measure = fixtures)", async () => {
+  const { h, c } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", CHASE_ARGS);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(!setsOf(h).some((x) => /ADAPTIVE|MEASURE/.test(x)));
+    assert.equal(c.lines[0].am, undefined);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create on Chase: a width needs adaptive_width false (refused otherwise); with it, Adaptive Width goes off before WIDTHX", async () => {
+  {
+    const { h, cmds } = await flySetup();
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", { ...CHASE_ARGS, steps: [{ preset: "1.9020", width: 50 }, { preset: "1.9021" }] });
+      assert.equal(isError, true, text);
+      assert.match(text, /Shape 7 has Adaptive Width .* give adaptive_width: false/);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    const { h, cmds } = await flySetup();
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", { ...CHASE_ARGS, adaptive_width: true, steps: [{ preset: "1.9020", width: 50 }, { preset: "1.9021" }] });
+      assert.equal(isError, true, text);
+      assert.match(text, /a width and adaptive_width: true contradict/);
+      const r2 = await h.callJson("gma3_edit_phaser_recipe", { ...CHASE_ARGS, measure: 1, adaptive_measure: true });
+      assert.match(r2.text, /measure and adaptive_measure: true contradict/);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+  const { h, c } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...CHASE_ARGS, adaptive_width: false, steps: [{ preset: "1.9020", width: 50 }, { preset: "1.9021" }] });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    const sets = setsOf(h);
+    assert.ok(sets.indexOf("Preset 21.9030.1 PLAYBACKADAPTIVEWIDTH=No") < sets.indexOf("Preset 21.9030.1.1.1.1 WIDTHX=50"), sets.join("\n"));
+    assert.deepEqual(c.lines[0].steps.map((st) => st[0].width), [50, 150], "Link Steps: the shape's 100 / 100 keep their sum");
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with speed_master: written as a number, read back by the master's name and in the cooked values (0-based)", async () => {
+  const { h, c } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...FLY, speed_master: 2 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(setsOf(h).includes("Preset 21.9030.1 SPEEDMASTEROVERRIDE=2"));
+    assert.equal(c.lines[0].master, 2);
+    assert.match(result.warnings.join(" "), /line 1 follows speed master "PAN" with Speed X 34 BPM: the master multiplies Speed X/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with lines on two masters: each line its master; a line 2 without speed_master keeps line 1's (a copy)", async () => {
+  const lines = (m2: unknown) => [
+    { selection: 9002, steps: [{ preset: "1.9020" }, { preset: "1.9021" }], speed_bpm: 60, speed_master: 2 },
+    { selection: 9003, steps: [{ preset: "1.9021" }, { preset: "1.9020" }], speed_bpm: 60, ...(m2 === undefined ? {} : { speed_master: m2 }) },
+  ];
+  for (const [m2, want] of [[3, 3], [undefined, 2], [null, null]] as const) {
+    const { h, c } = await flySetup();
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "create", preset: "21.9030", exclusive: true, lines: lines(m2) });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.equal(c.lines[0].master, 2);
+      assert.equal(c.lines[1].master ?? null, want);
+      assert.ok(!(result.warnings ?? []).some((w: string) => /multiplies/.test(w)), "Speed X 60: no warning");
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("set speed_master: a new master, master 1 (cooked 0), cleared with 0 or null; a master the console did not take is a mismatch", async () => {
+  for (const [sm, sent, want] of [[3, "3", 3], [1, "1", 1], [0, "0", null], [null, "0", null]] as const) {
+    const { h, c } = await flySetup([{ ...FLY_LINE(), speedHz: 1, master: 2 }]);
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_master: sm });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.deepEqual(setsOf(h), [`Preset 21.9030.1 SPEEDMASTEROVERRIDE=${sent}`]);
+      assert.equal(c.lines[0].master ?? null, want);
+    } finally {
+      await h.close();
+    }
+  }
+  const { h } = await flySetup([{ ...FLY_LINE(), speedHz: 1, master: 2 }]);
+  try {
+    h.fake.on("set", () => ({ value: "PAN" })); // the console keeps master 2
+    const { result } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_master: 3 });
+    assert.equal(result.verification.status, "mismatched");
+    assert.match(result.verification.detail, /speed master reads "PAN", "TILT" expected/);
+    assert.match(result.verification.detail, /do not follow speed master 3 \(first: fixture 101 Dimmer reads master 2\)/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("set and add_line keep a line's master: speed only, add_line copies line 1's link; text is refused before anything is sent", async () => {
+  {
+    const { h, c } = await flySetup([{ ...FLY_LINE(), speedHz: 1, master: 2 }]);
+    try {
+      const { result } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_bpm: 120 });
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.equal(c.lines[0].master, 2);
+      assert.match(result.warnings.join(" "), /follows speed master "PAN" with Speed X 120 BPM/);
+      const add = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ sources: { Dimmer: "1.9021" } }, { sources: { Dimmer: "1.9020" } }] });
+      assert.equal(add.result.verification.status, "matched", JSON.stringify(add.result.verification));
+      assert.equal(c.lines[1].master, 2);
+    } finally {
+      await h.close();
+    }
+  }
+  for (const sm of ["2", "PAN", "None"]) {
+    const { h } = await flySetup([FLY_LINE()]);
+    try {
+      const { isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_master: sm });
+      assert.equal(isError, true);
+      assert.ok(!h.fake.requests.some((r) => r.op === "set" || r.op === "cmd"));
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("set on a Chase line: measure switches Adaptive Measure off first; under Adaptive a new group's measure and widths are not compared", async () => {
+  {
+    const { h, c } = await flySetup([CHASE_LINE()]);
+    try {
+      const { result } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", measure: 1 });
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.deepEqual(setsOf(h), ["Preset 21.9030.1 PLAYBACKADAPTIVEMEASURE=No", "Preset 21.9030.1 MEASURE=1"]);
+      assert.equal(c.lines[0].am?.value, false);
+      assert.match(result.warnings.join(" "), /line 1 had Adaptive Measure .* measure 1 switches it off/);
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    const { h, c } = await flySetup([CHASE_LINE()]);
+    try {
+      const { result } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", selection: 9003 });
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.equal(c.lines[0].group, 9003);
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    const { h } = await flySetup([CHASE_LINE()]);
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ width: 50 }, {}] });
+      assert.equal(isError, true);
+      assert.match(text, /line 1 has Adaptive Width .* give adaptive_width: false/);
+      assert.ok(!h.fake.requests.some((r) => r.op === "set" || r.op === "cmd"));
+    } finally {
+      await h.close();
+    }
+  }
+  const { h, c } = await flySetup([CHASE_LINE()]);
+  try {
+    const { result } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", adaptive_width: false, steps: [{ width: 50 }, {}] });
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(setsOf(h), ["Preset 21.9030.1 PLAYBACKADAPTIVEWIDTH=No", "Preset 21.9030.1.1.1.1 WIDTHX=50"]);
+    assert.deepEqual(c.lines[0].steps.map((st) => st[0].width), [50, 150]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("add_line with its own speed_master: the copy of line 1 is relinked, line 1 keeps its master", async () => {
+  const { h, c } = await flySetup([{ ...FLY_LINE(), speedHz: 1, master: 2 }]);
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ sources: { Dimmer: "1.9021" } }, { sources: { Dimmer: "1.9020" } }], speed_master: 3 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(setsOf(h).includes("Preset 21.9030.2 SPEEDMASTEROVERRIDE=3"));
+    assert.deepEqual([c.lines[0].master, c.lines[1].master], [2, 3]);
   } finally {
     await h.close();
   }
