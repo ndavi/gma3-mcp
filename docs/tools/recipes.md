@@ -69,7 +69,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | A line's filter (`filter`: a Filter pool number) | written by `gma3_edit_recipe` (add, set; `null` clears) and `gma3_store_recipe_cues`, read back by number; coverage predicted on the filter's attributes for the filter shape described [below](#filters-on-a-line), otherwise not predicted (named) |
 | A preset line's generator (`generator`: a Generator pool number, in place of the values) | written by `gma3_edit_recipe` (add, set; `null` clears) on preset lines only, read back by number; coverage predicted on the generator's channel attributes ([below](#generators-on-a-preset-line)); not written by `gma3_store_recipe_cues` |
 | Standard lines with a world, SelectionFromValue | read and kept; not edited; coverage not predicted (named in the result; a merge treats what they reach as possibly replaced) |
-| Phaser recipe lines (PhaserRecipe), shapes | created in a free preset slot and edited (line settings, add or remove a line) by [`gma3_edit_phaser_recipe`](#gma3_edit_phaser_recipe), which reads its own lines back; read and kept by the other tools, never written by them; coverage not predicted by them (likewise) |
+| Phaser recipe lines (PhaserRecipe), shapes | created in a free preset slot and edited (line settings, add or remove a line) by [`gma3_edit_phaser_recipe`](#gma3_edit_phaser_recipe), which reads its own lines back; read and kept by the other tools, not created or changed by them (`gma3_edit_recipe` can move or remove one); coverage not predicted by them (likewise) |
 | Targets | presets and cue parts (edit, read); a preset, cue part, cue or whole sequence (cook) |
 | Nested recipe presets (a line's preset embeds others) | noted; their own recipes are not re-cooked by this cook |
 
@@ -615,8 +615,8 @@ the name, then the Cook. A failed command stops the edit; a failed setting is re
 custom curve stays** (`curve: "reset"` takes it back to the shape's).
 
 Checked first, nothing sent otherwise: the preset and the line exist; each value source's 2 presets come from one
-preset pool, hold the source's attribute and are not the preset itself; no other line has the same 2 step presets on
-the same attribute (a source left to the shape's value on two lines is allowed: its values are only checked where
+preset pool, hold the source's attribute and are not the preset itself; no other line has the same 2 step presets
+(or hard values) on the same attribute (a source left to the shape's value on two lines is allowed: its values are only checked where
 one line alone can have made them); group, shape, MAtricks and step presets exist; no dialog is open; the Edit Recipe
 mode is off.
 
@@ -625,8 +625,8 @@ Read back:
   source's preset, and its ACCEL / DECEL / TRANS / WIDTH where they are known. After a new shape or a reset they are
   the shape's and are not compared; after a width the other step's is the sum minus it, and the trans of that source
   is not compared unless given;
-- the edited line's cooked values come from its 2 step presets at its speed, and no value is left from its old step
-  presets;
+- the edited line's cooked values come from its 2 step presets (or hard values) at its speed, and no value is left
+  from its old step presets;
 - every other cooked value unchanged, and nothing uncooked added. A fixture and attribute that the edited line
   outputs, before or after, is left out of that comparison: where two lines act on the same attribute of the same
   fixture, the later line's value wins, so another line's value may rightly appear or go.
@@ -701,7 +701,7 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   26440–39096 of 65535 over 4 s) while 252 and 254 stayed at Dimmer 0 and Pan 32768. XWings with a count that is not
   a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and grids with shared columns were not run with a select (cue 13, a 4 × 3 grid, cooked 1 and 5 for X 1: not
   modelled).
-- The line's own MAtricks columns and individual timing, from the THK migration bench (2026-11-15, 2nd series,
+- A standard line's own MAtricks columns and individual timing, from the THK migration bench (2026-11-15, 2nd series,
   Sequence 9019, Group 9005 of 12 dimmers; the bench wrote the columns with `gma3_store_recipe_cues`, cooked them and
   saw them in the output). Read again here (2026-11-15, `preset.read` on the cue parts, read only), every value
   `cooked`:
@@ -709,7 +709,8 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     1.2, 1.8, 2.4 up to 3 on 6 and 7 (outer edges to the centre);
   - Cue 4, own `FADEFROMX 2` / `FADETOX 2`, `DELAYFROMX 0` / `DELAYTOX 0.5` on 1.9032 (Dimmer 0): delay 0 on fixture 1
     rising by 0.045 to 0.5 on 12, fade 2 on all;
-  - Cue 11, the same as cue 3 through MAtricks 9003 ("TEST B2 XWINGS2 FADE"): the same fades.
+  - Cue 11, the same as cue 3 through MAtricks 9003 ("TEST B2 XWINGS2 FADE": XWINGS 2, FADEFROMX 0 / FADETOX 3, read
+    the same day): the same fades.
 
   So the cook bakes a line's fade and delay per fixture into the cue part (a cue stored from the programmer with a
   recalled MAtricks does not: [SB-02](../probes/sb-02-groups-macos-2.5.1.md)). Not verified by the tools: they write
@@ -895,15 +896,16 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     generator line with a filter or MAtricks, a generator whose settings change while a cue plays it (whether the cue
     follows without a re-cook), the speed master multiplying the speed at another BPM than 60 (the bench notes say it does),
     `edit` appending a channel (fake bridge only), channels beyond 2, generator types other than Random.
-- Relative layers, from the THK migration bench (2026-11-15; not run through this repo's code, read again here with
+- Relative layers, from the THK migration bench (2026-11-15; not re-run here, the bench objects read again with
   `preset.read` and `gma3_recipes`, read only):
   - a "relative only" preset: 2.9044 "TEST B4 PAN REL 0" (4th series) was stored with `gma3_store_preset` (`layers:
     [relative]`, `attributes: [Pan]`) after `Attribute "Pan" At Relative 0` and `Off Attribute "Tilt"` in the
     programmer. It holds 4 rows, Pan on 251-254, each `hasAbsolute: false`, `hasRelative: true`, `relative: 0`. A line
-    calling such a preset stops a relative phaser on its attributes (1st series, preset 2.9040; 2nd series, Sequence
-    9022), where neither the base preset, another absolute preset nor a RELEASE does. Not verified by the tools: a relative of 0 counts as no
-    layer in `gma3_store_preset`'s checks (`layers` is not needed for it), its read-back does not compare it, and
-    `gma3_preset` shows those rows without a value ([presets](presets.md#what-is-and-is-not-verified));
+    calling such a preset stops a relative phaser on its attributes (Pan + Tilt relative 0 preset 2.9040, 1st series,
+    and 2nd series in Sequence 9022: Cue 3 = Group 9001 + 2.9030 + 2.9040), where neither the base preset, another
+    absolute preset nor a RELEASE does. Not verified by the tools: `gma3_store_preset` treats a relative of 0 as no
+    relative layer in its checks and its read-back does not compare it (from the code, not run), and `gma3_preset`
+    shows those rows without a value (seen on 2.9044) ([presets](presets.md#what-is-and-is-not-verified));
   - a new relative phaser takes over an attribute's relative layer: Sequence 9025 Cue 1 = Group 9001 + 2.9032 (base)
     and Group 9001 + 21.9054 (relative Pan + Tilt phaser A); Cue 2 = Group 9001 + 2.9044 (Pan relative 0) and Group
     9001 + 21.9060 (relative Tilt phaser B). In Cue 2 the bench saw Pan held on the base and Tilt follow B alone

@@ -185,9 +185,9 @@ is a separate change.
     [phasers](phasers.md));
     relative embedding is verified by the unit tests, not on the console (the live test embeds absolute values);
   - a relative value of 0 (a "relative only" preset such as Pan at relative 0, the THK migration's RELEASE PHASER
-    presets; bench preset 2.9044, 2026-11-15) counts as no relative layer: the `layers` check does not need
-    `relative` for it, the read-back does not compare it, and `gma3_preset` lists such a row without a value (the raw
-    read has `hasRelative: true`, `relative: 0`, `hasAbsolute: false`);
+    presets; bench preset 2.9044, 2026-11-15) counts as no relative layer in the `layers` check, and the read-back does not compare it (from the code, not run on
+    a console); `gma3_preset` lists such a row without a value (seen on 2.9044, whose raw read has `hasRelative: true`,
+    `relative: 0`, `hasAbsolute: false`);
   - MAgic presets and recipe content are not modelled;
   - a pool's own input filter (a filter or world assigned to the pool) is not predicted; only the read-back catches it.
 - The embedded preset's update is asynchronous; a read in the same frame as the source's change shows the old values.
