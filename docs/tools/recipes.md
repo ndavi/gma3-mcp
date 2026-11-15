@@ -230,6 +230,31 @@ ClearAll with `Assign Preset X At Preset P.N.L.1.<step>.<source>`. The result na
 value (an absolute Dimmer 100 / 0 of the shape is a fixed value: give it a preset). Verified only for Dimmer, Tilt
 and Pan (the Flyout shapes).
 
+**Hard values instead of presets.** A step of a plain shape is `{attribute, absolute? | relative?}`, a value source
+`{attribute?, absolute?, relative?, trans?, width?}` (keyed as above). `absolute` is VALUEABSOLUTE in percent (0-100);
+`relative` is VALUERELATIVE in **percent of the attribute's whole range** (-100 to 100), not degrees: 20 on a 180°
+Tilt is 36°. Verified live (onPC 2.5.1, Rescue, 2026-11-15, 21.9070-21.9072):
+
+- A value source has **one attribute for both steps**: `Assign Attribute "<Attr>" At <line>.1.1.<source>` sets step 2's
+  too. The tool sends it once (a command-line `Set` of the attribute is refused; the Lua `set ATTRIBUTES ""` clears it). A source
+  the shape filters (Flyout's Dimmer, Tilt, Pan) keeps its filter: another attribute is refused. The attribute must be
+  in the show (`ShowData.LivePatch.AttributeDefinitions.Attributes`; an unknown one answers "Illegal object"). On a
+  plain shape, an attribute given with a preset filters the preset to that attribute.
+- The values are written **from the command line**, `Set <source> Property "ValueAbsolute" "<v>"` (or
+  `"ValueRelative"`): the Lua `set` of VALUEABSOLUTE / VALUERELATIVE writes 0. A source keeps its other layer, so the
+  layer not given is set to None (`"RawValueAbs" "None"` / `"RawValueRel" "None"`). A preset on the source is cleared
+  first (`set PRESET ""`); `Assign Preset` replaces the hard values.
+- Without an attribute or a preset the line does not cook: hard values without an attribute are refused. A step may
+  give only the attribute: it keeps the shape's value.
+- Own values read raw as numbers; a value inherited from the shape reads as text (`<<100.00>100.00>`), one from a
+  preset as the preset's name. No command takes a hard value back to the shape's (`RawValueAbs "Default"` reads
+  Default; `""` is an illegal value), so `null` on a hard source is refused, and a copy (lines 2+, `add_line`) of a
+  line 1 with hard values must give those sources a preset or values. A copy of a hard line 1 given presets gets its
+  attribute cleared (back to the shape's filter). `Assign Shape` keeps a line's attribute and its own values.
+- The read-back tells cooked values apart by their hard values (cooked as each step's `absolute` / `relative`, as
+  float32: -20 reads -19.999998807907; compared to 0.01), checks that the layer not given is absent, and reads each
+  source's attribute and values back.
+
 **Trans, width, measure.** `trans` and `width` (percent) are set on the value sources with `set` (TRANSX, WIDTHX),
 widths first, after the curves (an explicit `trans` replaces a Snap's TRANS 0). A step's `trans` / `width` applies to
 every source of the step that does not set its own. With Link Steps (the default) the 2 widths of a source keep their
@@ -405,7 +430,8 @@ read-back tells cooked values apart by their step presets.
 - Not covered:
   - the background cook's exact timing (observed: not yet on an immediate read, done after 3 s);
   - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, a value
-    source's 2 steps from different pools, steps with absolute values instead of presets);
+    source's 2 steps from different pools); a step from a preset and the other from hard values on one source (allowed,
+    not run on a console);
   - value sources on attributes other than Dimmer, Tilt and Pan (shapes other than Flyout 19 / 20 with several
     sources); per-source curves (a curve applies to every source of its step);
   - filters and worlds;
@@ -465,6 +491,17 @@ read-back tells cooked values apart by their step presets.
   The cue's own values followed every change. The new order of `create` (curves after the copies) was verified live
   too: 21.9006, a Dimmer line with Snap on step 1 and an RGBW line without a curve, matched; line 2 kept the Sine
   curve (TRANS 100) instead of line 1's Snap. A copy keeps line 1's Snap, and `Assign Preset` keeps it too.
+
+- Verified live for hard values (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-15, Group 9001 of 4 Daytona,
+  the code run directly against the bridge), each read back matched:
+  - `create` 21.9071: Sine, Tilt relative -20 / 20 at 30 BPM, built without At Preset in the mode (4 / 4 cooked);
+  - `create` 21.9072 with 2 lines: Dimmer 1.9010 / 1.9011, then a copy turned into Pan absolute 30 / 70 (8 / 8);
+  - `set`: Tilt relative to -30 / 30 and 40 BPM; Pan absolute to relative -10 / 10; the Dimmer preset line to Dimmer
+    absolute 10 / 90; `add_line` of a preset line behind the hard Tilt line (attribute cleared);
+  - refused before anything was sent: no attribute, an unknown attribute, another attribute on a Flyout source,
+    `null` on a hard source;
+  - Sequence 9028 Cue 1 calling 21.9072 with one standard line, cooked merge low priority: `ownNonCookedDataPresent:
+    false`, 8 / 8 cooked; output on fixture 251: Dimmer 10.3 % to 89.9 %, Pan 50 % ±10.0 % (10 % of the whole range).
 
 ## Live test
 

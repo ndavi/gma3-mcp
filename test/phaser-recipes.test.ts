@@ -652,13 +652,14 @@ test("edit preview: checks and the plan, nothing sent", async () => {
 // the preset into every source of the step; Assign Preset At <line>.1.<step>.<source> sets one source; set PRESET ""
 // gives the source back its own value; with Link Steps the 2 widths of a source keep their sum; MEASURE cooks x100; a
 // source whose preset holds no value for its attribute does not cook (IntegratedPresetMiss).
-type MSource = { attribute: string | null; preset: string | null; trans: number; width: number };
+/** abs / rel: the source's own hard values (a number, "None" for a layer set to None, undefined for the shape's or the preset's). */
+type MSource = { attribute: string | null; preset: string | null; trans: number; width: number; abs?: number | "None"; rel?: number | "None" };
 type Flag = { value: boolean; own: boolean };
 type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][]; am?: Flag; aw?: Flag; master?: number | null };
 const HOLDS: Record<string, string[]> = { "1.9020": ["Dimmer"], "1.9021": ["Dimmer"], "2.9020": ["Pan", "Tilt", "PanTiltDistance"], "2.9021": ["Pan", "Tilt", "PanTiltDistance"], "2.9022": ["Pan", "Tilt"] };
 const fromShape = (shape: number): MSource[][] => SHAPES[shape].map((st) => st.map((x) => ({ attribute: x.attribute, preset: null, trans: x.trans, width: x.width })));
 
-async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number } = {}) {
+async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number; ignoreValues?: boolean } = {}) {
   const h = await startHarness(registerPhaserRecipeTools);
   const P = "Preset 21.9030";
   const c = { editing: false, pz: null as null | MLine, preset: initial.length > 0, lines: structuredClone(initial), pending: false, name: "", values: 0 };
@@ -688,7 +689,8 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       const yes = ADAPTIVE_SHAPES.has(Number(sm[1])) ? "<Yes>" : "<No>";
       return { total: 1, count: 1, offset: 0, items: [{ name: "PhaserRecipe 1", fields: { PLAYBACKADAPTIVEMEASURE: yes, PLAYBACKADAPTIVEWIDTH: yes } }] };
     }
-    const known = ["Group 9002", "Group 9003", "Shape 1", "Shape 7", "Shape 19", "Shape 20", "MAtricks 9000"].includes(ref);
+    const attr = ref.match(/^ShowData\.LivePatch\.AttributeDefinitions\.Attributes\.(\w+)$/);
+    const known = ["Group 9002", "Group 9003", "Shape 1", "Shape 7", "Shape 19", "Shape 20", "MAtricks 9000"].includes(ref) || (!!attr && ["Dimmer", "Pan", "Tilt"].includes(attr[1]));
     return { total: known ? 1 : 0, items: known ? [{ name: "x" }] : [], offset: 0, count: known ? 1 : 0 };
   });
   // Adaptive Measure / Width: the console sets the measure to the number of fixtures and step 1's width to 100 / n
@@ -721,7 +723,16 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       c.pz = null;
     } else if ((m = command.match(/^Assign Preset (\d+\.\d+) At (Preset 21\.9030\.\d+\.1\.\d\.\d)$/))) {
       const x = lineOf(m[2]);
-      if (x?.src && x.s !== o.ignoreSourceAssign) x.src.preset = m[1];
+      if (x?.src && x.s !== o.ignoreSourceAssign) Object.assign(x.src, { preset: m[1], abs: undefined, rel: undefined }); // the preset replaces hard values
+    } else if ((m = command.match(/^Assign Attribute "(\w+)" At (Preset 21\.9030\.\d+\.1\.\d\.\d)$/))) {
+      // One attribute per value source: Assign Attribute on one step sets both (live 2026-11-15).
+      const x = lineOf(m[2]);
+      if (!x?.src || !["Dimmer", "Pan", "Tilt"].includes(m[1])) return "Illegal object";
+      for (const st of x.l.steps) st[x.s!].attribute = m[1];
+    } else if ((m = command.match(/^Set (Preset 21\.9030\.\d+\.1\.\d\.\d) Property "(ValueAbsolute|ValueRelative|RawValueAbs|RawValueRel)" "(.*)"$/))) {
+      const x = lineOf(m[1]);
+      if (!x?.src) return "Illegal object";
+      if (!o.ignoreValues) x.src[m[2].endsWith("Abs") || m[2] === "ValueAbsolute" ? "abs" : "rel"] = m[3] === "None" ? "None" : Number(m[3]);
     } else if ((m = command.match(/^Copy Preset 21\.9030\.1 At Preset 21\.9030\.(\d+) \/NoConfirmation$/))) c.lines.push(structuredClone(c.lines[0]));
     else if ((m = command.match(/^Assign Group (\d+) At Preset 21\.9030\.(\d+)$/))) c.lines[Number(m[2]) - 1].group = Number(m[1]);
     else if ((m = command.match(/^Assign Shape (\d+) At Preset 21\.9030\.(\d+)$/))) {
@@ -744,6 +755,11 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
       x.src.preset = null;
       return { value: "", readOk: true };
     }
+    if (x.src && args.property === "ATTRIBUTES") {
+      for (const st of x.l.steps) st[x.s!].attribute = null;
+      return { value: "", readOk: true };
+    }
+    if (x.src && (args.property === "VALUEABSOLUTE" || args.property === "VALUERELATIVE")) return { value: "0.00", readOk: true }; // the Lua set writes 0 (live 2026-11-15)
     if (x.src && args.property === "TRANSX") return { value: `${(x.src.trans = Number(value)).toFixed(1)}%` };
     if (x.src && args.property === "WIDTHX" && aw(x.l)) return { value: `${widthOf(x.l, x.step!, x.s!).toFixed(1)}%` };
     if (x.src && args.property === "WIDTHX") {
@@ -784,7 +800,7 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
     let m = ref.match(/^Preset 21\.9030\.(\d+)\.1$/);
     if (m) return list(c.lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
     m = ref.match(/^Preset 21\.9030\.(\d+)\.1\.(\d)$/);
-    if (m) return list(c.lines[Number(m[1]) - 1].steps[Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), Preset: x.preset ? presetAddr(x.preset) : undefined, TRANSX: x.trans, WIDTHX: widthOf(c.lines[Number(m![1]) - 1], Number(m![2]) - 1, i), ACCELX: 0, DECELX: 0 } })));
+    if (m) return list(c.lines[Number(m[1]) - 1].steps[Number(m[2]) - 1].map((x, i) => ({ class: "PhaserRecipeValueSource", index: i + 1, fields: { ATTRIBUTES: attrHandle(x.attribute), Preset: x.preset ? presetAddr(x.preset) : undefined, TRANSX: x.trans, WIDTHX: widthOf(c.lines[Number(m![1]) - 1], Number(m![2]) - 1, i), ACCELX: 0, DECELX: 0, VALUEABSOLUTE: x.preset ? `${x.preset} ${x.preset}` : (x.abs ?? "<<0.00>0.00>"), VALUERELATIVE: x.preset ? "" : (x.rel ?? "") } })));
     throw new BridgeReplyError(`no object found for '${ref}'`);
   });
   h.fake.on("preset.read", (args) => {
@@ -799,7 +815,9 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number 
           const srcs = [l.steps[0][s], l.steps[1][s]];
           const attribute = srcs[0].attribute ?? "Dimmer";
           if (srcs.some((x) => x.preset && !HOLDS[x.preset]?.includes(attribute))) return; // IntegratedPresetMiss: nothing cooks
-          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null }));
+          // A hard value cooks as the step's absolute / relative, a little off as float32 (-20 reads -19.999998807907).
+          const f32 = (v: number | "None" | undefined) => (typeof v === "number" ? Math.fround(v) : undefined);
+          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null, ...(x.preset ? {} : { absolute: f32(x.abs), relative: f32(x.rel) }) }));
           // The cooked speed master is 0-based (master 2 reads 1); absent without one.
           out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: measureOf(l) * 100, ...(l.master ? { speedMaster: l.master - 1 } : {}), steps });
         });
@@ -1232,6 +1250,154 @@ test("add_line with its own speed_master: the copy of line 1 is relinked, line 1
     assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
     assert.ok(setsOf(h).includes("Preset 21.9030.2 SPEEDMASTEROVERRIDE=3"));
     assert.deepEqual([c.lines[0].master, c.lines[1].master], [2, 3]);
+  } finally {
+    await h.close();
+  }
+});
+
+// ---- Hard values in the steps (live 2026-11-15, Rescue 21.9070-21.9072): Assign Attribute once per source (both steps
+// share it), PRESET "" on a source that had a preset, then the values from the command line (the Lua set writes 0),
+// the layer not given set to None. Relative values are percent of the attribute's whole range.
+const HV = { action: "create", preset: "21.9030", name: "TEST HV", selection: 9002, steps: [{ attribute: "Tilt", relative: -20 }, { relative: 20 }], speed_bpm: 30, exclusive: true };
+const cmdsAfterClear = (cmds: string[]) => cmds.slice(cmds.indexOf("ClearAll") + 1);
+
+test("create, hard values: no At Preset, Assign Attribute once, the values from the command line with the other layer None, verified", async () => {
+  const { h, c, cmds } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", HV);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds.slice(0, 5), ["Store Preset 21.9030 /NoConfirmation", "Group 9002", "At Shape 1", "Store Preset 21.9030 /Merge /NoConfirmation", "ClearAll"]);
+    assert.deepEqual(cmdsAfterClear(cmds), [
+      'Assign Attribute "Tilt" At Preset 21.9030.1.1.1.1',
+      'Set Preset 21.9030.1.1.1.1 Property "RawValueAbs" "None"',
+      'Set Preset 21.9030.1.1.1.1 Property "ValueRelative" "-20"',
+      'Set Preset 21.9030.1.1.2.1 Property "RawValueAbs" "None"',
+      'Set Preset 21.9030.1.1.2.1 Property "ValueRelative" "20"',
+      "Cook Preset 21.9030 /MergeLowPriority",
+    ]);
+    assert.ok(!setsOf(h).some((x) => /VALUE(ABSOLUTE|RELATIVE)/.test(x)), "values are never written with the Lua set (it writes 0)");
+    assert.deepEqual(c.lines[0].steps.map((st) => [st[0].attribute, st[0].abs, st[0].rel]), [["Tilt", "None", -20], ["Tilt", "None", 20]]);
+    assert.equal(result.coverage.cooked, 2);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create, hard values: a value the console did not take is a mismatch", async () => {
+  const { h } = await flySetup([], { ignoreValues: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", HV);
+    assert.equal(isError, true);
+    assert.match(result.verification.detail, /no cooked value comes from line 1 \(relative -20\.00 \/ relative 20\.00\)/);
+    assert.match(result.verification.detail, /line 1 step 1 Tilt relative reads none, -20 expected/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with lines, hard values: line 2 is a copy of a preset line 1, its attribute assigned, its presets cleared, then its values", async () => {
+  const { h, c, cmds } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", {
+      action: "create",
+      preset: "21.9030",
+      exclusive: true,
+      lines: [
+        { selection: 9002, steps: [{ preset: "1.9020" }, { preset: "1.9021" }], speed_bpm: 30 },
+        { selection: 9003, steps: [{ attribute: "Pan", absolute: 30 }, { absolute: 70 }], speed_bpm: 20 },
+      ],
+    });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(cmds.slice(cmds.indexOf("Copy Preset 21.9030.1 At Preset 21.9030.2 /NoConfirmation")), [
+      "Copy Preset 21.9030.1 At Preset 21.9030.2 /NoConfirmation",
+      "Assign Group 9003 At Preset 21.9030.2",
+      'Assign Attribute "Pan" At Preset 21.9030.2.1.1.1',
+      'Set Preset 21.9030.2.1.1.1 Property "ValueAbsolute" "30"',
+      'Set Preset 21.9030.2.1.1.1 Property "RawValueRel" "None"',
+      'Set Preset 21.9030.2.1.2.1 Property "ValueAbsolute" "70"',
+      'Set Preset 21.9030.2.1.2.1 Property "RawValueRel" "None"',
+      "Cook Preset 21.9030 /MergeLowPriority",
+    ]);
+    assert.deepEqual(setsOf(h).filter((x) => x.includes("PRESET")), ["Preset 21.9030.2.1.1.1 PRESET=", "Preset 21.9030.2.1.2.1 PRESET="]);
+    assert.deepEqual(c.lines[1].steps.map((st) => [st[0].attribute, st[0].preset, st[0].abs]), [["Pan", null, 30], ["Pan", null, 70]]);
+    assert.deepEqual(c.lines[0].steps.map((st) => [st[0].attribute, st[0].preset]), [[null, "1.9020"], [null, "1.9021"]]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create, hard values: refused before anything is sent", async () => {
+  for (const [args, re] of [
+    [{ ...HV, steps: [{ absolute: 10 }, { absolute: 90 }] }, /has hard values but no attribute: give its attribute .* without an attribute or a preset the line does not cook/],
+    [{ ...HV, steps: [{ attribute: "NoSuch", absolute: 10 }, { absolute: 90 }] }, /not in the show: attribute .{0,2}NoSuch/],
+    [{ ...HV, steps: [{ preset: "1.9020", absolute: 10 }, { absolute: 90 }] }, /give a preset or hard values .*, not both/],
+    [{ ...HV, steps: [{ attribute: "Tilt", absolute: 10 }, { attribute: "Pan", absolute: 90 }] }, /attribute .{0,2}Tilt.{0,2} on step 1 and .{0,2}Pan.{0,2} on step 2; a value source has one attribute for both steps/],
+    [{ ...HV, steps: [{ attribute: "Tilt", absolute: 120 }, { absolute: 90 }] }, /absolute/],
+    [{ ...HV, steps: [{ attribute: null, absolute: 10 }, { absolute: 90 }] }, /attribute null clears a source's attribute with action set/],
+    [{ ...HV, shape: 19, steps: [{ sources: { Tilt: { attribute: "Pan", relative: 5 } } }, { sources: { Dimmer: "1.9020" } }] }, /value source 2 is filtered on Tilt by its shape: it cannot take attribute Pan/],
+    [{ ...HV, steps: undefined, selection: undefined, speed_bpm: undefined, lines: [{ selection: 9002, steps: HV.steps }, { selection: 9003, steps: [{ preset: "1.9020" }, {}] }] }, /preset|step 2 source 1: line 1 gives it hard values/],
+    [{ ...HV, steps: undefined, selection: undefined, speed_bpm: undefined, lines: [{ selection: 9002, steps: HV.steps }, { selection: 9003, steps: HV.steps }] }, /lines 1 and 2 have the same 2 step values \(relative -20\.00 \/ relative 20\.00 on Tilt\)/],
+  ] as const) {
+    const { h, cmds } = await flySetup();
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", args as Record<string, unknown>);
+      assert.equal(isError, true, text);
+      assert.match(text, re as RegExp);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+const HV_LINE = (): MLine => {
+  const steps = fromShape(1);
+  Object.assign(steps[0][0], { attribute: "Tilt", abs: "None", rel: -20 });
+  Object.assign(steps[1][0], { attribute: "Tilt", abs: "None", rel: 20 });
+  return { group: 9002, shape: 1, matricks: null, speedHz: 0.5, measure: 1, steps };
+};
+const PRESET_LINE = (): MLine => {
+  const steps = fromShape(1);
+  steps[0][0].preset = "1.9020";
+  steps[1][0].preset = "1.9021";
+  return { group: 9003, shape: 1, matricks: null, speedHz: 0.5, measure: 1, steps };
+};
+
+test("set, hard values: new values; a preset line to hard values (attribute, PRESET cleared, values); the other line unchanged", async () => {
+  const { h, c, cmds } = await flySetup([HV_LINE(), PRESET_LINE()]);
+  try {
+    let r = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ absolute: 40 }, { absolute: 60 }] });
+    assert.equal(r.isError, false, JSON.stringify(r.result, null, 1));
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.deepEqual(c.lines[0].steps.map((st) => [st[0].abs, st[0].rel]), [[40, "None"], [60, "None"]]);
+    cmds.length = 0;
+    r = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", line: 2, steps: [{ attribute: "Dimmer", absolute: 10 }, { absolute: 90 }] });
+    assert.equal(r.isError, false, JSON.stringify(r.result, null, 1));
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.equal(cmds[0], 'Assign Attribute "Dimmer" At Preset 21.9030.2.1.1.1');
+    assert.deepEqual(c.lines[1].steps.map((st) => [st[0].attribute, st[0].preset, st[0].abs]), [["Dimmer", null, 10], ["Dimmer", null, 90]]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("set / add_line, hard values: back to the shape's value is refused; a preset line added behind a hard line 1 clears the attribute", async () => {
+  const { h, c, cmds } = await flySetup([HV_LINE()]);
+  try {
+    const refused = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ sources: { 1: null } }, {}] });
+    assert.equal(refused.isError, true);
+    assert.match(refused.text, /line 1 step 1 Tilt holds hard values: no command takes them back to the shape's value/);
+    assert.deepEqual(cmds, []);
+    const r = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ preset: "1.9020" }, { preset: "1.9021" }] });
+    assert.equal(r.isError, false, JSON.stringify(r.result, null, 1));
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.ok(setsOf(h).includes("Preset 21.9030.2.1.1.1 ATTRIBUTES="), setsOf(h).join("; "));
+    assert.deepEqual(c.lines[1].steps.map((st) => [st[0].attribute, st[0].preset, st[0].rel]), [[null, "1.9020", undefined], [null, "1.9021", undefined]]);
+    const noValues = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ attribute: "Tilt" }, { attribute: "Tilt" }] });
+    assert.equal(noValues.isError, true);
+    assert.match(noValues.text, /holds hard values on line 1 \(the copy keeps them\)/);
   } finally {
     await h.close();
   }

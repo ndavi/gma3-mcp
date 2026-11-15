@@ -42,9 +42,16 @@
  *     -100/-100, Swing +100/+100, Snap 0/0; Snap sets TRANS 0, the others TRANS 100 (Flyout's Dimmer Trans 10 % becomes
  *     100 % with Linear: give trans after a curve to keep another). The cooked steps carry these values.
  *
+ *   - Hard values (live 2026-11-15, 21.9070): `Assign Attribute "<Attr>" At <line>.1.1.<s>` sets the source's attribute
+ *     for both steps (the Lua `set ATTRIBUTES ""` clears it); `Set <source> Property "ValueAbsolute" | "ValueRelative"
+ *     "<v>"` from the command line (the Lua set writes 0), the other layer kept unless set to "None" (RawValueAbs /
+ *     RawValueRel). Relative is percent of the attribute's whole range. Own values read raw as numbers, inherited ones
+ *     as text ("<<100.00>100.00>"); nothing takes a hard value back to the shape's. Without attribute or preset a line
+ *     does not cook.
+ *
  * Release: create builds in a free preset slot in any pool, 1 to 8 lines of exactly 2 steps each. A step is one
- * preset (a shape with one value source) or a preset per value source (`sources`, by attribute or number); a source
- * without a preset keeps the shape's value. set / add_line / remove_line edit an existing phaser preset (below). The
+ * preset (a shape with one value source), a preset per value source (`sources`, by attribute or number), or hard
+ * values on an attribute (absolute / relative); a source without a preset or values keeps the shape's value. set / add_line / remove_line edit an existing phaser preset (below). The
  * cue calls the preset with a standard line.
  */
 import { z } from "zod";
@@ -178,16 +185,31 @@ const masterSpeedWarning = (label: string, master: string, speedHz: number | und
 // ---- Inputs.
 
 type PresetRef = { pool: number; number: number };
-/** One value source of a step as asked: preset (null: back to the source's own value, the shape's), trans, width. */
-interface SourceSpec {
+/**
+ * Hard values of a value source on one step, instead of a preset (live 2026-11-15, Rescue 21.9070): `absolute`
+ * (VALUEABSOLUTE, percent) and / or `relative` (VALUERELATIVE, percent of the attribute's whole range, not degrees).
+ */
+interface Hard {
+  absolute?: number;
+  relative?: number;
+}
+/**
+ * One value source of a step as asked: preset (null: back to the source's own value, the shape's), or hard values on
+ * an attribute; trans, width. `attribute` is the source's attribute filter (one per source: it is shared by both
+ * steps); null clears it (set only).
+ */
+interface SourceSpec extends Hard {
   preset?: PresetRef | null;
+  attribute?: string | null;
   trans?: number;
   width?: number;
 }
-interface StepSpec {
+interface StepSpec extends Hard {
   /** One preset for the step (pool + number): a shape with one value source. */
   pool?: number;
   number?: number;
+  /** A shape with one value source: its attribute (with absolute / relative: hard values instead of a preset). */
+  attribute?: string | null;
   /** A preset (and trans / width) per value source, keyed by the source's attribute ("Dimmer") or number ("2"). */
   sources?: Array<{ key: string; spec: SourceSpec }>;
   curve?: CurveChoice;
@@ -262,6 +284,23 @@ function adaptiveConflicts(v: Validator, l: { measure?: number; adaptiveMeasure?
 }
 const TRANS_RANGE = { min: 0, max: 100 };
 const WIDTH_RANGE = { min: 0, max: 1000 };
+const ABSOLUTE_RANGE = { min: 0, max: 100 };
+const RELATIVE_RANGE = { min: -100, max: 100 };
+const ATTRIBUTE_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+
+/** attribute, absolute and relative of a value source (or of a one-source step); reported on `v`. */
+function parseHard(v: Validator, o: Record<string, unknown>, where: string, out: SourceSpec | StepSpec) {
+  if (o.attribute === null) out.attribute = null;
+  else if (o.attribute !== undefined) {
+    if (typeof o.attribute === "string" && ATTRIBUTE_NAME.test(o.attribute.trim())) out.attribute = o.attribute.trim();
+    else v.fail(`${where}.attribute must be an attribute name such as "Tilt", "Dimmer" or "ColorRGB_B" (null clears the source's attribute in set)`);
+  }
+  if (o.absolute !== undefined) out.absolute = v.check(() => finiteNumber(`${where}.absolute`, o.absolute, ABSOLUTE_RANGE));
+  if (o.relative !== undefined) out.relative = v.check(() => finiteNumber(`${where}.relative`, o.relative, RELATIVE_RANGE));
+  const preset = "preset" in out ? out.preset : (out as StepSpec).pool;
+  if ((out.absolute !== undefined || out.relative !== undefined) && preset !== undefined && preset !== null)
+    v.fail(`${where}: give a preset or hard values (absolute / relative), not both: Assign Preset replaces the source's values`);
+}
 
 function parsePhase(v: Validator, raw: unknown, at: string): LineSpec["phase"] {
   const p = raw as Record<string, unknown> | null;
@@ -292,13 +331,14 @@ function parseSources(v: Validator, raw: unknown, at: string): StepSpec["sources
     else if (val === null) spec.preset = null;
     else if (typeof val === "object" && !Array.isArray(val)) {
       const o = val as Record<string, unknown>;
-      for (const f of Object.keys(o)) if (!["preset", "trans", "width"].includes(f)) v.fail(`${where}.${f} is not a value source field (preset, trans, width)`);
+      for (const f of Object.keys(o)) if (!["preset", "attribute", "absolute", "relative", "trans", "width"].includes(f)) v.fail(`${where}.${f} is not a value source field (preset, attribute, absolute, relative, trans, width)`);
       if (o.preset === null) spec.preset = null;
       else if (o.preset !== undefined) spec.preset = v.check(() => presetId(`${where}.preset`, o.preset));
+      parseHard(v, o, where, spec);
       if (o.trans !== undefined) spec.trans = v.check(() => finiteNumber(`${where}.trans`, o.trans, TRANS_RANGE));
       if (o.width !== undefined) spec.width = v.check(() => finiteNumber(`${where}.width`, o.width, WIDTH_RANGE));
     } else {
-      v.fail(`${where} must be a preset "P.X", null (the shape's value) or {preset?, trans?, width?}`);
+      v.fail(`${where} must be a preset "P.X", null (the shape's value) or {preset? | attribute? + absolute? / relative?, trans?, width?}`);
       continue;
     }
     if (spec.preset === undefined && "preset" in spec) delete spec.preset; // an invalid preset was reported
@@ -315,9 +355,13 @@ function parseStep(v: Validator, s: unknown, at: string, required: boolean): Ste
     return out;
   }
   const r = (s ?? {}) as Record<string, unknown>;
+  const hardGiven = r.attribute !== undefined || r.absolute !== undefined || r.relative !== undefined;
   if (r.preset !== undefined && r.sources !== undefined) v.fail(`${at}: give preset (a shape with one value source) or sources (a preset per value source), not both`);
-  else if (r.sources !== undefined) out.sources = parseSources(v, r.sources, `${at}.sources`);
-  else if (r.preset !== undefined || required) Object.assign(out, v.check(() => presetId(`${at}.preset`, r.preset)) ?? {});
+  else if (r.sources !== undefined) {
+    out.sources = parseSources(v, r.sources, `${at}.sources`);
+    if (hardGiven) v.fail(`${at}: with sources, give attribute / absolute / relative inside each value source`);
+  } else if (r.preset !== undefined || (required && !hardGiven)) Object.assign(out, v.check(() => presetId(`${at}.preset`, r.preset)) ?? {});
+  if (r.sources === undefined) parseHard(v, r, at, out);
   if (r.curve !== undefined) {
     if (isCurve(r.curve)) out.curve = r.curve;
     else v.fail(`${at}.curve must be one of ${CURVE_CHOICES.join(", ")}`);
@@ -342,6 +386,7 @@ function parseLine(v: Validator, raw: Record<string, unknown>, path: string): Li
   const before = v.errors.length;
   if (!Array.isArray(raw.steps) || raw.steps.length !== 2) v.fail(`${at("steps")} must be exactly 2 items [{preset: "P.X"}, {preset: "P.Y"}] or [{sources: {...}}, {sources: {...}}] (2-step phasers only in this release)`);
   else raw.steps.forEach((s, i) => steps.push(parseStep(v, s, `${at("steps")}[${i}]`, true)));
+  if (steps.some((s) => s.attribute === null || (s.sources ?? []).some((x) => x.spec.attribute === null))) v.fail(`${at("steps")}: attribute null clears a source's attribute with action set; here leave it out (the source then keeps its shape's filter)`);
   if (steps.length === 2 && steps.every((s) => s.pool !== undefined) && steps[0].pool !== steps[1].pool) v.fail(`${at("steps")}: the 2 steps of a line come from one preset pool (one family per line; another family is another line), not pools ${steps[0].pool} and ${steps[1].pool}`);
   adaptiveConflicts(v, { measure, adaptiveMeasure, adaptiveWidth, steps }, at);
   if (selection === undefined || shape === undefined || steps.length !== 2 || v.errors.length > before) return undefined;
@@ -350,8 +395,12 @@ function parseLine(v: Validator, raw: Record<string, unknown>, path: string): Li
 
 // ---- Value sources: the layout of a shape or a line, and what a line's steps ask of each source.
 
-/** One value source as the console reads it (raw: TRANSX / WIDTHX in percent). */
-export interface SourceDetail {
+/**
+ * One value source as the console reads it (raw: TRANSX / WIDTHX in percent). absolute / relative: the source's OWN
+ * hard values (VALUEABSOLUTE / VALUERELATIVE read raw as a number); a value inherited from the shape reads as text
+ * ("<<100.00>100.00>"), one from a preset as the preset's name, an absent layer "None" or "": those are left out.
+ */
+export interface SourceDetail extends Hard {
   attribute: string | null;
   preset: PresetRef | null;
   accel?: number;
@@ -417,11 +466,18 @@ async function readLayout(bridge: Gma3Bridge, base: string, t: number): Promise<
   }
   const out: Layout = [];
   for (let n = 1; n <= (steps.items?.length ?? 0); n++) {
-    const src = await childList(bridge, `${base}.1.${n}`, ["ATTRIBUTES", "ACCELX", "DECELX", "TRANSX", "WIDTHX", "Preset"], t);
+    const src = await childList(bridge, `${base}.1.${n}`, ["ATTRIBUTES", "ACCELX", "DECELX", "TRANSX", "WIDTHX", "Preset", "VALUEABSOLUTE", "VALUERELATIVE"], t);
     out.push(
       (src.items ?? []).map((it) => {
         const f = it.fields ?? {};
-        return { attribute: attributeOf(f.ATTRIBUTES), preset: presetOf(f.Preset), accel: rawNumber(f.ACCELX), decel: rawNumber(f.DECELX), trans: rawNumber(f.TRANSX), width: rawNumber(f.WIDTHX) };
+        const d: SourceDetail = { attribute: attributeOf(f.ATTRIBUTES), preset: presetOf(f.Preset), accel: rawNumber(f.ACCELX), decel: rawNumber(f.DECELX), trans: rawNumber(f.TRANSX), width: rawNumber(f.WIDTHX) };
+        if (!d.preset) {
+          const a = rawNumber(f.VALUEABSOLUTE);
+          const r = rawNumber(f.VALUERELATIVE);
+          if (a !== undefined) d.absolute = a;
+          if (r !== undefined) d.relative = r;
+        }
+        return d;
       }),
     );
   }
@@ -429,11 +485,14 @@ async function readLayout(bridge: Gma3Bridge, base: string, t: number): Promise<
 }
 
 /** What the steps ask of each value source of a layout: preset (undefined: not given), trans, width. */
-interface Resolved {
+interface Resolved extends Hard {
   preset?: PresetRef | null;
+  /** The source's attribute as given (the same on both steps after resolveSteps); null: cleared (set). */
+  attribute?: string | null;
   trans?: number;
   width?: number;
 }
+const isHard = (h: Hard | undefined): boolean => !!h && (h.absolute !== undefined || h.relative !== undefined);
 function resolveSteps(steps: StepSpec[], layout: Layout, label: string, stepsField = "steps"): { res: Resolved[][]; errors: string[] } {
   const errors: string[] = [];
   const res: Resolved[][] = layout.map((st) => st.map(() => ({})));
@@ -447,6 +506,14 @@ function resolveSteps(steps: StepSpec[], layout: Layout, label: string, stepsFie
       if (srcs.length !== 1)
         errors.push(`${label} step ${n + 1} has ${srcs.length} value sources (${layoutText([srcs])}): give ${stepsField}[${n}].sources {${srcs.map((x, s) => `${x.attribute ?? s + 1}: "P.X"`).join(", ")}} instead of one preset (At Preset puts one preset into every source)`);
       else res[n][0].preset = { pool: st.pool, number: st.number! };
+    }
+    if (st.attribute !== undefined || isHard(st)) {
+      if (srcs.length !== 1) errors.push(`${label} step ${n + 1} has ${srcs.length} value sources (${layoutText([srcs])}): give attribute / absolute / relative in ${stepsField}[${n}].sources`);
+      else {
+        if (st.attribute !== undefined) res[n][0].attribute = st.attribute;
+        if (st.absolute !== undefined) res[n][0].absolute = st.absolute;
+        if (st.relative !== undefined) res[n][0].relative = st.relative;
+      }
     }
     const given = new Set<number>();
     for (const { key, spec } of st.sources ?? []) {
@@ -464,23 +531,46 @@ function resolveSteps(steps: StepSpec[], layout: Layout, label: string, stepsFie
       if (st.width !== undefined && r.width === undefined) r.width = st.width;
     }
   });
-  for (let s = 0; s < (res[0]?.length ?? 0); s++)
+  for (let s = 0; s < (res[0]?.length ?? 0); s++) {
     if (res[0][s].width !== undefined && res[1]?.[s]?.width !== undefined)
       errors.push(`${label} ${sourceName(layout, s)}: width given on both steps; with Link Steps the 2 widths of a value source keep their sum, so give the width of one step (the other takes the rest)`);
+    // A source's attribute is one for both steps (Assign Attribute on step 1 sets step 2's too, live 2026-11-15).
+    const a0 = res[0][s].attribute;
+    const a1 = res[1]?.[s]?.attribute;
+    if (a0 !== undefined && a1 !== undefined && (a0 === null || a1 === null ? a0 !== a1 : !eqi(a0, a1)))
+      errors.push(`${label} ${sourceName(layout, s)}: attribute ${JSON.stringify(a0)} on step 1 and ${JSON.stringify(a1)} on step 2; a value source has one attribute for both steps`);
+    const a = a0 !== undefined ? a0 : a1;
+    if (a !== undefined) for (const st of res) if (st[s]) st[s].attribute = a;
+  }
   return { res, errors };
 }
 
-/** A value source's output: the step presets it integrates ("-" for the source's own value) and its attribute filter. */
+/** Hard values as text: "a25.00", "r-20.00", "a25.00r10.00" (rounded to 0.01: -20 cooks as -19.999998807907). */
+const fmt2 = (x: number) => {
+  const v = Math.round(x * 100) / 100;
+  return (Object.is(v, -0) ? 0 : v).toFixed(2);
+};
+const hardKey = (h: Hard) => `${h.absolute !== undefined ? `a${fmt2(h.absolute)}` : ""}${h.relative !== undefined ? `r${fmt2(h.relative)}` : ""}`;
+const isPresetKey = (k: string) => /^\d+\.\d+$/.test(k);
+const isHardKey = (k: string) => /^[ar]-?\d/.test(k);
+/** Per step and source, the hard values a line holds (undefined: a preset or the shape's value). */
+type HardGrid = Array<Array<Hard | undefined>>;
+
+/**
+ * A value source's output, per step: the preset it integrates ("P.N"), its hard values ("a25.00", "r-20.00"), "-" for
+ * the source's own value from the shape (any value without a preset), "?" unknown; and its attribute filter.
+ */
 interface Sig {
   line: number;
   source: number;
   attribute: string | null;
   pair: string;
 }
+/** A source whose values can be told apart: a step from a preset or from hard values. */
 const hasPreset = (g: Sig) => g.pair.split("/").some((p) => p !== "-" && p !== "?");
 const usable = (g: Sig) => !g.pair.includes("?") && (hasPreset(g) || g.attribute !== null);
-function sigsOf(line: number, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout): Sig[] {
-  return (layout[0] ?? []).map((x, s) => ({ line, source: s, attribute: x.attribute, pair: presets.map((st) => pkey(st[s])).join("/") }));
+function sigsOf(line: number, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout, hard?: HardGrid): Sig[] {
+  return (layout[0] ?? []).map((x, s) => ({ line, source: s, attribute: x.attribute, pair: presets.map((st, n) => (!st[s] && isHard(hard?.[n]?.[s]) ? hardKey(hard![n][s]!) : pkey(st[s]))).join("/") }));
 }
 /**
  * Two lines' sources that cannot be told apart: the same step presets on the same attribute. A source without any
@@ -488,11 +578,27 @@ function sigsOf(line: number, presets: Array<Array<PresetRef | null | undefined>
  * a single line can have made them.
  */
 const clash = (a: Sig, b: Sig) => usable(a) && usable(b) && hasPreset(a) && hasPreset(b) && a.pair === b.pair && (a.attribute === null || b.attribute === null || eqi(a.attribute, b.attribute));
-const sigText = (g: Sig) => g.pair.split("/").map((p) => (p === "-" ? "the shape's value" : `Preset ${p}`)).join(" / ");
+const sigText = (g: Sig) => g.pair.split("/").map((p) => (p === "-" ? "the shape's value" : isHardKey(p) ? hardText(p) : `Preset ${p}`)).join(" / ");
+const hardText = (k: string) => k.replace(/^a(-?[\d.]+)/, "absolute $1 ").replace(/r(-?[\d.]+)$/, "relative $1").trim();
 
 type Row = PresetRead["rows"][number];
-const rowPairOf = (r: Row) => (r.stepCount === 2 ? [0, 1].map((i) => (r.steps?.[i]?.integrated?.pool !== undefined && r.steps?.[i]?.integrated?.no !== undefined ? `${r.steps[i].integrated!.pool}.${r.steps[i].integrated!.no}` : "-")).join("/") : "?");
-const rowMatches = (r: Row, g: Sig) => usable(g) && rowPairOf(r) === g.pair && (g.attribute === null || eqi(g.attribute, r.attribute));
+type RowStep = NonNullable<Row["steps"]>[number] & { absolute?: number | null; relative?: number | null };
+const cookedNumber = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+/** One cooked step as a key: its integrated preset, else its hard values, else "-". */
+const rowStepKey = (st: RowStep | undefined) => {
+  if (st?.integrated?.pool !== undefined && st?.integrated?.no !== undefined) return `${st.integrated.pool}.${st.integrated.no}`;
+  const h: Hard = { absolute: cookedNumber(st?.absolute), relative: cookedNumber(st?.relative) };
+  return isHard(h) ? hardKey(h) : "-";
+};
+const rowPairOf = (r: Row) => (r.stepCount === 2 ? [0, 1].map((i) => rowStepKey(r.steps?.[i] as RowStep | undefined)).join("/") : "?");
+/** A sig step against a cooked step: the same preset; the same hard values (and no other layer); "-": any step without a preset. */
+const stepMatches = (want: string, got: string) => (want === "-" ? !isPresetKey(got) : want === got);
+const rowMatches = (r: Row, g: Sig) => {
+  if (!usable(g) || (g.attribute !== null && !eqi(g.attribute, r.attribute))) return false;
+  const got = rowPairOf(r).split("/");
+  const want = g.pair.split("/");
+  return got.length === want.length && want.every((w, i) => stepMatches(w, got[i]));
+};
 const rowKey = (r: Row) => `${r.fixture}|${r.attribute}|${rowPairOf(r)}|${r.speed}|${r.measure}|${r.cooked}|${(r.steps ?? []).map((s) => `${s.accel},${s.decel},${s.trans},${s.width}`).join(";")}`;
 const counts = (rows: Row[]) => rows.reduce((m, r) => m.set(rowKey(r), (m.get(rowKey(r)) ?? 0) + 1), new Map<string, number>());
 const near = (a: number | undefined, b: number | undefined, tol: number) => b === undefined || (a !== undefined && Math.abs(a - b) < tol);
@@ -501,16 +607,18 @@ const near = (a: number | undefined, b: number | undefined, tol: number) => b ==
  * The value-source rules shared by create and the edits: each source's 2 presets from one pool, a source without an
  * attribute filter needs a preset, the line has a source from a preset, and a source's preset holds its attribute.
  */
-function sourceProblems(label: string, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout, target: PresetRef, presetRows: Map<string, Row[]>): string[] {
+function sourceProblems(label: string, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout, target: PresetRef, presetRows: Map<string, Row[]>, hard?: HardGrid): string[] {
   const p: string[] = [];
   const single = layout.every((st) => st.length === 1);
-  const sigs = sigsOf(0, presets, layout);
+  const sigs = sigsOf(0, presets, layout, hard);
   for (const g of sigs) {
     const ps = presets.map((st) => st[g.source]).filter((x): x is PresetRef => !!x);
     if (ps.length === 2 && ps[0].pool !== ps[1].pool)
       p.push(single ? `the 2 steps of a line come from one preset pool (one family per line; another family is another line), not pools ${ps[0].pool} and ${ps[1].pool}` : `${label} ${sourceName(layout, g.source)}: the 2 steps of a value source come from one preset pool, not pools ${ps[0].pool} and ${ps[1].pool}`);
     if (ps.some((x) => x.pool === target.pool && x.number === target.number)) p.push("a step preset cannot be the target preset itself");
-    if (!hasPreset(g) && g.attribute === null && !g.pair.includes("?")) p.push(`${label} value source ${g.source + 1} has no attribute filter: it needs a preset (its values could not be told apart)`);
+    // Without an attribute or a preset the line does not cook (live 2026-11-15): hard values need the source's attribute.
+    if (g.attribute === null && g.pair.split("/").some(isHardKey)) p.push(`${label} value source ${g.source + 1} has hard values but no attribute: give its attribute (e.g. "Tilt"); without an attribute or a preset the line does not cook`);
+    else if (!hasPreset(g) && g.attribute === null && !g.pair.includes("?")) p.push(`${label} value source ${g.source + 1} has no attribute filter: it needs a preset, or an attribute with hard values (its values could not be told apart)`);
     if (g.attribute)
       presets.forEach((st, n) => {
         const x = st[g.source];
@@ -519,9 +627,74 @@ function sourceProblems(label: string, presets: Array<Array<PresetRef | null | u
         if (rows && !rows.some((r) => eqi(r.attribute, g.attribute!))) p.push(`${label} step ${n + 1} ${g.attribute}: Preset ${pkey(x)} holds no ${g.attribute} value (it would not cook: IntegratedPresetMiss)`);
       });
   }
-  if (!sigs.some(hasPreset)) p.push(`${label} has no value source from a preset: its values could not be told apart`);
+  if (!sigs.some(hasPreset)) p.push(`${label} has no value source from a preset or hard values: its values could not be told apart`);
   return [...new Set(p)];
 }
+
+/** The layout a line will have: its shape's (or its own), with each source's attribute as given (null: cleared). */
+const effectiveLayout = (layout: Layout, res: Resolved[][]): Layout =>
+  layout.map((st, n) => st.map((x, s) => ({ ...x, attribute: res[n]?.[s]?.attribute !== undefined ? res[n][s].attribute! : x.attribute })));
+/** The attributes the steps name (once each). */
+const givenAttributes = (steps: StepSpec[]) => [
+  ...new Set(steps.flatMap((s) => [s.attribute, ...(s.sources ?? []).map((x) => x.spec.attribute)]).filter((a): a is string => typeof a === "string")),
+];
+/** Attributes the show does not define (Assign Attribute would answer "Illegal object", live 2026-11-15). */
+async function missingAttributes(bridge: Gma3Bridge, names: string[], t: number): Promise<string[]> {
+  const out: string[] = [];
+  for (const a of new Set(names)) if (!(await exists(bridge, `ShowData.LivePatch.AttributeDefinitions.Attributes.${a}`, t))) out.push(`attribute ${JSON.stringify(a)}`);
+  return out;
+}
+/** A source the shape filters on an attribute keeps that filter: another attribute, or clearing it, is refused. */
+function attributeProblems(label: string, shapeLayout: Layout, res: Resolved[][]): string[] {
+  return (shapeLayout[0] ?? []).flatMap((x, s) => {
+    const a = res[0]?.[s]?.attribute;
+    if (a === undefined || x.attribute === null || (a !== null && eqi(a, x.attribute))) return [];
+    return [`${label} value source ${s + 1} is filtered on ${x.attribute} by its shape: ${a === null ? "its attribute cannot be cleared" : `it cannot take attribute ${a}`} (another attribute is a line of its own, on a shape with one value source)`];
+  });
+}
+/**
+ * The attributes and hard values a line's sources must read (as resolved; a hard source reads only the layers given,
+ * the other is None), compared with its value sources as read.
+ */
+function hardDiff(label: string, got: { steps: Array<{ sources: SourceDetail[] }> } | undefined, eff: Layout, res: Resolved[][]): string[] {
+  if (!got) return [];
+  const p: string[] = [];
+  res.forEach((st, n) =>
+    st.forEach((r, s) => {
+      const g = got.steps[n]?.sources[s];
+      if (!g) return;
+      const at = `${label} step ${n + 1} ${sourceName(eff, s)}`;
+      const want = eff[n]?.[s]?.attribute ?? null;
+      if (r.attribute !== undefined && (want === null || g.attribute === null ? want !== g.attribute : !eqi(want, g.attribute))) p.push(`${at} attribute reads ${g.attribute ?? "none"}, ${want ?? "none"} expected`);
+      if (!isHard(r)) return;
+      for (const k of ["absolute", "relative"] as const) {
+        const w = r[k];
+        if (w === undefined ? g[k] !== undefined : !near(g[k], w, 0.01) || g[k] === undefined) p.push(`${at} ${k} reads ${g[k] ?? "none"}, ${w ?? "none"} expected`);
+      }
+      if (g.preset) p.push(`${at} still holds Preset ${pkey(g.preset)}`);
+    }),
+  );
+  return p;
+}
+/** The hard values the resolved steps give. */
+const hardOf = (res: Resolved[][]): HardGrid => res.map((st) => st.map((r) => (isHard(r) ? { ...(r.absolute !== undefined ? { absolute: r.absolute } : {}), ...(r.relative !== undefined ? { relative: r.relative } : {}) } : undefined)));
+
+/**
+ * The commands that put hard values into a value source (live 2026-11-15, Rescue 21.9070): from the command line only
+ * (the Lua set of VALUEABSOLUTE / VALUERELATIVE writes 0); a source keeps its other layer unless it is set to None
+ * (RawValueAbs / RawValueRel "None"), so the layer not given is cleared. A preset on the source is cleared first.
+ */
+function hardActions(src: string, h: Hard, hadPreset: boolean): Action[] {
+  const cmd = (command: string): Action => ({ kind: "cmd", command });
+  const set = (p: string, v: string) => cmd(`Set ${src} Property "${p}" "${v}"`);
+  return [
+    ...(hadPreset ? [{ kind: "set", ref: src, property: "PRESET", value: "", expect: "empty" } as Action] : []),
+    ...(h.absolute !== undefined ? [set("ValueAbsolute", String(h.absolute))] : [set("RawValueAbs", "None")]),
+    ...(h.relative !== undefined ? [set("ValueRelative", String(h.relative))] : [set("RawValueRel", "None")]),
+  ];
+}
+/** The command that sets (or, null, clears) a source's attribute; it applies to both steps of the source. */
+const attributeAction = (src: string, a: string | null): Action => (a === null ? { kind: "set", ref: src, property: "ATTRIBUTES", value: "", expect: "empty" } : { kind: "cmd", command: `Assign Attribute "${a}" At ${src}` });
 
 /** Step presets per step and source, as the line will hold them: given, else the base (a kept or copied source), else the shape's value. */
 const presetsOf = (res: Resolved[][], base?: Array<Array<PresetRef | null | undefined>>, clearMissing = false) =>
@@ -646,24 +819,46 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
   const tm = ctx.requestTimeoutMs;
   const first = specs[0];
   // Line 1 is given one preset per step: built with At Preset in the mode. Otherwise (sources) without, set after the store.
-  const inMode = first.steps.every((s) => s.pool !== undefined);
+  const inMode = first.steps.every((s) => s.pool !== undefined && s.attribute === undefined);
 
   const build: string[] = [`Group ${first.selection}`, `At Shape ${first.shape}`, ...(inMode ? ["Step 1", `At Preset ${first.steps[0].pool}.${first.steps[0].number}`, "Step 2", `At Preset ${first.steps[1].pool}.${first.steps[1].number}`] : []), ...(first.matricks !== undefined ? [`MAtricks ${first.matricks}`] : [])];
   // Filled by the checks: the layout of each line (its shape's) and what each source is given.
   const layouts: Layout[] = [];
+  /** Each line's layout with the attributes it gives its sources (Assign Attribute). */
+  const effLayouts: Layout[] = [];
   const resolved: Resolved[][][] = [];
+  /** A source's attribute as the line gives it, when it differs from what the line starts with (line 1: the shape's; a copy: line 1's). */
+  const attributeActions = (k: number): Action[] =>
+    (effLayouts[k - 1]?.[0] ?? []).flatMap((x, s) => {
+      const from = k === 1 ? layouts[0][0][s].attribute : effLayouts[0][0][s].attribute;
+      const same = from === null || x.attribute === null ? from === x.attribute : eqi(from, x.attribute);
+      return same ? [] : [attributeAction(sourceAt(k, 1, s + 1), x.attribute)];
+    });
   const line1Assigns = (): Action[] =>
-    inMode ? [] : resolved[0].flatMap((st, n) => st.flatMap((r, s): Action[] => (r.preset ? [{ kind: "cmd", command: `Assign Preset ${pkey(r.preset)} At ${sourceAt(1, n + 1, s + 1)}` }] : [])));
-  /** Actions that make line k (k >= 2) out of a copy of line 1: a source given nothing loses line 1's preset (back to the shape's value). */
+    inMode
+      ? []
+      : [
+          ...attributeActions(1),
+          ...resolved[0].flatMap((st, n) => st.flatMap((r, s): Action[] => (r.preset ? [{ kind: "cmd", command: `Assign Preset ${pkey(r.preset)} At ${sourceAt(1, n + 1, s + 1)}` }] : isHard(r) ? hardActions(sourceAt(1, n + 1, s + 1), r, false) : []))),
+        ];
+  /**
+   * Actions that make line k (k >= 2) out of a copy of line 1: its sources' attributes, then each source's preset or
+   * hard values; a source given nothing loses line 1's preset (back to the shape's value). A copy keeps line 1's hard
+   * values, and no command takes them back to the shape's: such a source must be given something (checked first).
+   */
   const copyActions = (k: number, l: LineSpec): Action[] => [
     { kind: "cmd", command: `Copy ${lineAt(1)} At ${lineAt(k)} /NoConfirmation` },
     ...(l.selection !== first.selection ? [{ kind: "cmd", command: `Assign Group ${l.selection} At ${lineAt(k)}` } as Action] : []),
     ...(l.shape !== first.shape ? [{ kind: "cmd", command: `Assign Shape ${l.shape} At ${lineAt(k)}` } as Action] : []),
     ...(l.matricks !== undefined && l.matricks !== first.matricks ? [{ kind: "cmd", command: `Assign MAtricks ${l.matricks} At ${lineAt(k)}` } as Action] : []),
+    ...attributeActions(k),
     ...resolved[k - 1].flatMap((st, n) =>
       st.flatMap((r, s): Action[] => {
-        if (r.preset) return [{ kind: "cmd", command: `Assign Preset ${pkey(r.preset)} At ${sourceAt(k, n + 1, s + 1)}` }];
-        return resolved[0][n]?.[s]?.preset ? [{ kind: "set", ref: sourceAt(k, n + 1, s + 1), property: "PRESET", value: "", expect: "empty" }] : [];
+        const src = sourceAt(k, n + 1, s + 1);
+        const had = !!resolved[0][n]?.[s]?.preset;
+        if (r.preset) return [{ kind: "cmd", command: `Assign Preset ${pkey(r.preset)} At ${src}` }];
+        if (isHard(r)) return hardActions(src, r, had);
+        return had ? [{ kind: "set", ref: src, property: "PRESET", value: "", expect: "empty" }] : [];
       }),
     ),
   ];
@@ -726,6 +921,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
           if (!d) missing.push(`Preset ${p}`);
           else presetRows.set(p, d.rows ?? []);
         }
+        missing.push(...(await missingAttributes(bridge, specs.flatMap((l) => givenAttributes(l.steps)), tm)));
         return missing.length ? `not in the show: ${missing.join(", ")}` : null;
       })) &&
       (await read("check_value_sources", async () => {
@@ -743,16 +939,26 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
           if (i > 0 && !sameLayout(layout, shapes.get(first.shape)!))
             problems.push(`line ${i + 1}: Shape ${l.shape}'s value sources (${layoutText(layout)}) are not line 1's (Shape ${first.shape}: ${layoutText(shapes.get(first.shape)!)}); lines 2+ are copies of line 1 and keep its value sources: put this line first, or in a preset of its own`);
           const r = resolveSteps(l.steps, layout, label, specs.length > 1 ? `lines[${i}].steps` : "steps");
-          problems.push(...r.errors);
+          problems.push(...r.errors, ...attributeProblems(label, layout, r.res));
+          const eff = effectiveLayout(layout, r.res);
           layouts.push(layout);
+          effLayouts.push(eff);
           resolved.push(r.res);
-          if (!r.errors.length) problems.push(...sourceProblems(label, presetsOf(r.res), layout, target, presetRows));
+          if (!r.errors.length) problems.push(...sourceProblems(label, presetsOf(r.res), eff, target, presetRows, hardOf(r.res)));
+          // A copy keeps line 1's hard values and nothing takes them back to the shape's: the line must give that source something.
+          if (i > 0)
+            r.res.forEach((st, n) =>
+              st.forEach((x, s) => {
+                if (isHard(resolved[0][n]?.[s]) && x.preset === undefined && !isHard(x))
+                  problems.push(`${label} step ${n + 1} ${sourceName(layout, s)}: line 1 gives it hard values, which the copy keeps (no command takes them back to the shape's value): give it a preset or hard values, or put a line with presets first`);
+              }),
+            );
         });
         if (problems.length) return [...new Set(problems)].join("; ");
-        const sigs = resolved.flatMap((r, i) => sigsOf(i + 1, presetsOf(r), layouts[i]));
+        const sigs = resolved.flatMap((r, i) => sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)));
         for (const [a, g] of sigs.entries()) {
           const other = sigs.slice(a + 1).find((h) => h.line !== g.line && clash(g, h));
-          if (other) return `lines ${g.line} and ${other.line} have the same 2 step presets (${sigText(g)}${g.attribute ? ` on ${g.attribute}` : ""}): their output could not be told apart in the read-back`;
+          if (other) return `lines ${g.line} and ${other.line} have the same 2 step ${g.pair.split("/").some(isHardKey) ? "values" : "presets"} (${sigText(g)}${g.attribute ? ` on ${g.attribute}` : ""}): their output could not be told apart in the read-back`;
         }
         sourcesChecked = true;
         return null;
@@ -800,7 +1006,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     if (!ok) return fail(`${op} was not performed; nothing was sent: ${steps_.find((s) => s.status !== "succeeded")?.error ?? "a check failed"}`);
     // A source left to the shape's value outputs that value (an absolute Dimmer 100 / 0, a relative Pan 0): named, so it is a choice.
     const shapeValued = resolved.flatMap((r, i) =>
-      sigsOf(i + 1, presetsOf(r), layouts[i]).flatMap((g) => (g.pair.includes("-") ? [`line ${i + 1} ${g.attribute ?? `source ${g.source + 1}`}: ${g.pair.split("/").map((p, n) => (p === "-" ? `step ${n + 1}` : null)).filter(Boolean).join(" and ")} keep(s) the shape's value`] : [])),
+      sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)).flatMap((g) => (g.pair.split("/").includes("-") ? [`line ${i + 1} ${g.attribute ?? `source ${g.source + 1}`}: ${g.pair.split("/").map((p, n) => (p === "-" ? `step ${n + 1}` : null)).filter(Boolean).join(" and ")} keep(s) the shape's value`] : [])),
     );
     const notes = shapeValued.length ? [`value sources without a preset output the shape's own value: ${shapeValued.join("; ")}`] : [];
     const previewWarnings = [...advice, ...adaptiveNotes, ...masterWarnings];
@@ -993,7 +1199,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       if (uncooked.length) problems.push(`${ref} holds ${uncooked.length} uncooked value(s): stored directly, not from the recipe`);
       if (data?.truncated) problems.push(`${ref} was not read completely`);
       // Each cooked value belongs to the value source whose step presets it integrates (and whose attribute it is).
-      const sigs = resolved.map((r, i) => sigsOf(i + 1, presetsOf(r), layouts[i]));
+      const sigs = resolved.map((r, i) => sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)));
       const stray = rows.filter((r) => !sigs.some((gs) => gs.some((g) => rowMatches(r, g))));
       if (stray.length) problems.push(`${stray.length} value(s) do not have 2 steps from one line's step presets (first: fixture ${stray[0].fixture} ${stray[0].attribute}, steps ${rowPairOf(stray[0])})`);
       const multi = layouts.some((l) => l.some((st) => st.length > 1));
@@ -1010,6 +1216,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         const det = details[i];
         problems.push(...flagMasterDiff(`line ${k}`, det, { ...exp.flags, ...(exp.master !== undefined ? { speedMaster: exp.master === null ? "" : (masterNames.get(exp.master) ?? "") } : {}) }));
         if (det?.speedMaster) createdWarnings.push(...masterSpeedWarning(`line ${k}`, det.speedMaster, det.speedHz));
+        problems.push(...hardDiff(`line ${k}`, det, effLayouts[i], resolved[i]));
         const sourceOf = (r: Row) => sigs[i].find((g) => rowMatches(r, g));
         // A value of a source without a preset that another line could have made too is not this line's to check.
         const mine = rows.filter((r) => sourceOf(r) !== undefined && (hasPreset(sourceOf(r)!) || !sigs.some((gs, j) => j !== i && gs.some((g) => rowMatches(r, g)))));
@@ -1159,6 +1366,9 @@ export async function readLineDetails(bridge: Gma3Bridge, ref: string, t: number
 interface SourceExpect {
   attribute: string | null;
   preset?: PresetRef | null;
+  /** Own hard values: a number, null (the layer must be absent), undefined (not compared). */
+  absolute?: number | null;
+  relative?: number | null;
   accel?: number;
   decel?: number;
   trans?: number;
@@ -1182,6 +1392,21 @@ interface LineExpect {
 }
 const layoutOf = (d: { steps: Array<{ sources: Array<{ attribute: string | null }> }> }): Layout => d.steps.map((st) => st.sources.map((x) => ({ attribute: x.attribute, preset: null })));
 const presetsIn = (d: { steps: Array<{ sources: Array<{ preset?: PresetRef | null }> }> }) => d.steps.map((st) => st.sources.map((x) => x.preset));
+/** The own hard values of a line's sources (as read, or as expected). */
+const hardIn = (d: { steps: Array<{ sources: Array<{ preset?: PresetRef | null; absolute?: number | null; relative?: number | null }> }> }): HardGrid =>
+  d.steps.map((st) =>
+    st.sources.map((x) => {
+      if (x.preset) return undefined;
+      const h: Hard = { ...(typeof x.absolute === "number" ? { absolute: x.absolute } : {}), ...(typeof x.relative === "number" ? { relative: x.relative } : {}) };
+      return isHard(h) ? h : undefined;
+    }),
+  );
+/**
+ * A shape's value sources fit a line's: as many per step, and a source the shape filters on an attribute has that
+ * attribute on the line (a line's own attribute on a plain source survives Assign Shape, live 2026-11-15).
+ */
+const fitsLayout = (shape: Layout, line: Layout) =>
+  shape.length === line.length && shape.every((st, n) => st.length === line[n].length && st.every((x, s) => x.attribute === null || (line[n][s].attribute !== null && eqi(x.attribute, line[n][s].attribute!))));
 
 /** The adaptive flags and the speed master (by name, "" for none) a line must read; an undefined field is not compared. */
 function flagMasterDiff(label: string, got: LineDetail | undefined, want: { adaptiveMeasure?: boolean; adaptiveWidth?: boolean; speedMaster?: string }): string[] {
@@ -1225,6 +1450,11 @@ function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect):
       if (!gs) return;
       const at = w.sources.length > 1 ? `${label} step ${n + 1} ${ws.attribute ?? `source ${s + 1}`}` : `${label} step ${n + 1}`;
       if (ws.preset !== undefined && pkey(ws.preset) !== pkey(gs.preset)) p.push(`${at} preset reads ${gs.preset ? pkey(gs.preset) : "none"}, ${ws.preset ? pkey(ws.preset) : "none (the shape's value)"} expected`);
+      if (ws.attribute === null || gs.attribute === null ? ws.attribute !== gs.attribute : !eqi(ws.attribute, gs.attribute)) p.push(`${at} attribute reads ${gs.attribute ?? "none"}, ${ws.attribute ?? "none"} expected`);
+      for (const k of ["absolute", "relative"] as const) {
+        const w = ws[k];
+        if (w === null ? gs[k] !== undefined : w !== undefined && (gs[k] === undefined || !near(gs[k], w, 0.01))) p.push(`${at} ${k} reads ${gs[k] ?? "none"}, ${w ?? "none"} expected`);
+      }
       for (const k of ["accel", "decel", "trans", "width"] as const) if (!near(gs[k], ws[k], 0.01)) p.push(`${at} ${k} reads ${gs[k] ?? "none"}, ${ws[k]} expected`);
     });
   });
@@ -1236,12 +1466,12 @@ const expectOf = (d: LineDetail): LineExpect => ({ class: d.class, group: d.grou
 function lineProblem(l: LineDetail, label: string): string | null {
   if (l.steps.length !== 2) return `${label} has ${l.steps.length} step(s): this release edits lines of 2 steps`;
   if (l.steps.every((st) => st.sources.length === 1 && st.sources[0].attribute === null)) {
-    if (l.steps.some((st) => !st.sources[0].preset)) return `${label} has ${l.steps.length} step(s), not all from a preset: this release edits lines of 2 steps, each from a preset`;
+    if (l.steps.some((st) => !st.sources[0].preset)) return `${label} has ${l.steps.length} step(s), not all from a preset or hard values on an attribute: this release edits lines of 2 steps, each from a preset or hard values`;
     return null;
   }
   if (l.steps[0].sources.length !== l.steps[1].sources.length) return `${label} has steps with different value sources`;
-  const sigs = sigsOf(l.line, presetsIn(l), layoutOf(l));
-  if (!sigs.some(hasPreset)) return `${label} has no value source from a preset: its values could not be told apart`;
+  const sigs = sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l));
+  if (!sigs.some(hasPreset)) return `${label} has no value source from a preset or hard values: its values could not be told apart`;
   const bare = sigs.find((g) => !hasPreset(g) && g.attribute === null);
   return bare ? `${label} value source ${bare.source + 1} has neither a preset nor an attribute filter` : null;
 }
@@ -1321,6 +1551,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     let want: LineExpect | undefined; // the edited or added line after the edit
     let res: Resolved[][] = []; // what each value source of the edited or added line is given
     let clears: Array<[number, number]> = []; // value sources whose preset is cleared (back to their own value)
+    let attrChanges: Array<[number, string | null]> = []; // value sources whose attribute is assigned (or cleared)
     let flagsBefore: Flags = {}; // the line's adaptive flags when its settings are written (after a new shape)
     let masterNames = new Map<number, string>();
     const editNotes: string[] = [];
@@ -1360,10 +1591,17 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         const shapeChanged = action === "set" ? newShape && s.shape !== base.shape : true;
         const layout = layoutOf(base);
         flagsBefore = { adaptiveMeasure: base.adaptiveMeasure, adaptiveWidth: base.adaptiveWidth };
+        // The shape's own value sources: which sources it filters on an attribute (a new line's sources start from them).
+        const attrsGiven = givenAttributes(s.steps ?? []).length > 0 || (s.steps ?? []).some((x) => x.attribute === null || (x.sources ?? []).some((y) => y.spec.attribute === null));
+        let shapeLayout: Layout | null = null;
+        if (action === "add_line" || attrsGiven || (newShape && s.shape !== base.shape)) {
+          const sh = newShape ? s.shape! : base.shape;
+          shapeLayout = sh === null ? null : await readLayout(bridge, `Shape ${sh}.1`, tm);
+          if (!shapeLayout) return `Shape ${sh} is not in the show (or has no phaser recipe)`;
+        }
         if (newShape && s.shape !== base.shape) {
-          const sl = await readLayout(bridge, `Shape ${s.shape}.1`, tm);
-          if (!sl) return `Shape ${s.shape} is not in the show (or has no phaser recipe)`;
-          if (!sameLayout(sl, layout)) return `Shape ${s.shape}'s value sources (${layoutText(sl)}) are not ${action === "set" ? `line ${k}'s` : "line 1's"} (${layoutText(layout)}): Assign Shape keeps a line's value sources, so the shape must have the same ones (another layout is a line of its own, made with create)`;
+          const sl = shapeLayout!;
+          if (!fitsLayout(sl, layout)) return `Shape ${s.shape}'s value sources (${layoutText(sl)}) are not ${action === "set" ? `line ${k}'s` : "line 1's"} (${layoutText(layout)}): Assign Shape keeps a line's value sources, so the shape must have the same ones (another layout is a line of its own, made with create)`;
           // A flag the line set itself stays through Assign Shape; one it took from its shape follows the new shape.
           const sf = await readShapeFlags(bridge, s.shape!, tm);
           flagsBefore = { adaptiveMeasure: base.adaptiveMeasureOwn ? base.adaptiveMeasure : sf.adaptiveMeasure, adaptiveWidth: base.adaptiveWidthOwn ? base.adaptiveWidth : sf.adaptiveWidth };
@@ -1391,16 +1629,35 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         const r = resolveSteps(reqSteps, layout, `line ${k}`);
         if (r.errors.length) return r.errors.join("; ");
         res = r.res;
-        // Presets: given; else kept (set) or, on a copy of line 1 (add_line), cleared back to the source's own value.
+        const attrProblems = shapeLayout ? attributeProblems(`line ${k}`, shapeLayout, res) : [];
+        if (attrProblems.length) return attrProblems.join("; ");
+        // Attributes: given; else kept (set) or, on a copy of line 1 (add_line), the shape's. One per source, both steps.
+        attrChanges = [];
+        (layout[0] ?? []).forEach((x, s_) => {
+          const given = res[0]?.[s_]?.attribute;
+          const want_ = given !== undefined ? given : action === "add_line" ? (shapeLayout?.[0]?.[s_]?.attribute ?? null) : x.attribute;
+          for (const st of w.steps) if (st.sources[s_]) st.sources[s_].attribute = want_;
+          if (want_ === null || x.attribute === null ? want_ !== x.attribute : !eqi(want_, x.attribute)) attrChanges.push([s_, want_]);
+        });
+        // Presets and hard values: given; else kept (set) or, on a copy of line 1 (add_line), cleared back to the
+        // source's own value. Hard values are kept by a copy and nothing takes them back to the shape's: refused.
         clears = [];
+        const baseHard = hardIn(base);
+        const valueProblems: string[] = [];
         res.forEach((st, n) =>
           st.forEach((x, s_) => {
             const ws = w.steps[n].sources[s_];
-            if (x.preset !== undefined) ws.preset = x.preset;
-            else if (action === "add_line" && ws.preset) ws.preset = null;
-            if ((x.preset === null || (x.preset === undefined && action === "add_line")) && base.steps[n].sources[s_].preset) clears.push([n, s_]);
+            const at = `line ${k} step ${n + 1} ${sourceName(layout, s_)}`;
+            if (isHard(x)) Object.assign(ws, { preset: null, absolute: x.absolute ?? null, relative: x.relative ?? null });
+            else if (x.preset) Object.assign(ws, { preset: x.preset, absolute: null, relative: null });
+            else if (x.preset === null || action === "add_line") {
+              if (isHard(baseHard[n]?.[s_])) valueProblems.push(`${at} holds hard values${action === "add_line" ? " on line 1 (the copy keeps them)" : ""}: no command takes them back to the shape's value; give a preset or hard values`);
+              if (base.steps[n].sources[s_].preset) clears.push([n, s_]);
+              ws.preset = null;
+            }
           }),
         );
+        if (valueProblems.length) return valueProblems.join("; ");
         // Curves: a new shape recomputes them (a custom curve survives, not knowable here) and some trans / widths and
         // the measure. Every step given a curve is reset to the shape's first (a named curve over a Snap would keep its
         // TRANS 0), every step of a new line too (a copy keeps line 1's custom curves); then the named curves. Reset
@@ -1467,17 +1724,18 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
           if (!d) missing.push(`Preset ${p}`);
           else presetRows.set(p, d.rows ?? []);
         }
+        missing.push(...(await missingAttributes(bridge, givenAttributes((action === "set" ? change.steps : addSpec?.steps) ?? []), tm)));
         if (missing.length) return `not in the show: ${missing.join(", ")}`;
         const layout = layoutOf(want);
-        const problems = sourceProblems(`line ${k}`, presetsIn(want), layout, target, presetRows);
+        const problems = sourceProblems(`line ${k}`, presetsIn(want), layout, target, presetRows, hardIn(want));
         if (problems.length) return problems.join("; ");
-        const mine = sigsOf(k, presetsIn(want), layout);
+        const mine = sigsOf(k, presetsIn(want), layout, hardIn(want));
         for (const l of before) {
           if (l.line === k && action === "set") continue;
           if (l.class !== "PhaserRecipe") continue;
-          const theirs = sigsOf(l.line, presetsIn(l), layoutOf(l));
+          const theirs = sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l));
           const c = mine.find((g) => theirs.some((h) => clash(g, h)));
-          if (c) return `line ${l.line} already has the step presets ${c.pair}${c.attribute ? ` on ${c.attribute}` : ""}: two lines with the same 2 step presets cannot be told apart in the read-back`;
+          if (c) return `line ${l.line} already has the step ${c.pair.split("/").some(isHardKey) ? "values" : "presets"} ${c.pair}${c.attribute ? ` on ${c.attribute}` : ""}: two lines with the same 2 step ${c.pair.split("/").some(isHardKey) ? "values" : "presets"} cannot be told apart in the read-back`;
         }
         return null;
       })) &&
@@ -1501,8 +1759,10 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
       if (want.group !== base.group) actions.push(cmdA(`Assign Group ${want.group} At ${lineAt(k)}`));
       if (want.shape !== base.shape) actions.push(cmdA(`Assign Shape ${want.shape} At ${lineAt(k)}`));
       if (want.matricks !== base.matricks) actions.push(cmdA(`Assign MAtricks ${want.matricks} At ${lineAt(k)}`));
+      for (const [s_, a] of attrChanges) actions.push(attributeAction(sourceAt(k, 1, s_ + 1), a));
       res.forEach((st, n) => st.forEach((x, s_) => x.preset && actions.push(cmdA(`Assign Preset ${pkey(x.preset)} At ${sourceAt(k, n + 1, s_ + 1)}`))));
       for (const [n, s_] of clears) actions.push({ kind: "set", ref: sourceAt(k, n + 1, s_ + 1), property: "PRESET", value: "", expect: "empty" });
+      res.forEach((st, n) => st.forEach((x, s_) => isHard(x) && actions.push(...hardActions(sourceAt(k, n + 1, s_ + 1), x, !!base.steps[n].sources[s_].preset))));
       // The line's settings: the adaptive flags now (before the widths), the rest (speed, phase, measure, master) last.
       const settings = lineSettings(lineAt(k), s, masterNames, flagsBefore);
       const isFlag = (a: Action) => a.kind === "set" && a.property.startsWith("PLAYBACKADAPTIVE");
@@ -1579,9 +1839,9 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         problems.push(...lineDiff(label, after![i], e.want));
       });
       // Cooked values: the edited line's value sources have values at its speed; the old presets' are gone; every other value unchanged.
-      const oldSigs = action === "add_line" ? [] : sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]));
-      const newSigs = want ? sigsOf(k, presetsIn(want), layoutOf(want)) : [];
-      const otherSigs = before.filter((l) => l.line !== k || action === "add_line").flatMap((l) => (l.class === "PhaserRecipe" ? sigsOf(l.line, presetsIn(l), layoutOf(l)) : []));
+      const oldSigs = action === "add_line" ? [] : sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]), hardIn(before[k - 1]));
+      const newSigs = want ? sigsOf(k, presetsIn(want), layoutOf(want), hardIn(want)) : [];
+      const otherSigs = before.filter((l) => l.line !== k || action === "add_line").flatMap((l) => (l.class === "PhaserRecipe" ? sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l)) : []));
       const shared = (g: Sig) => otherSigs.some((h) => clash(g, h));
       const ofLine = (r: Row, sigs: Sig[]) => sigs.some((g) => rowMatches(r, g));
       // A fixture and attribute the edited line output, before or after, is left out: there one line masks another
@@ -1647,12 +1907,18 @@ const sourceSchema = z.union([
   z.null().describe("No preset: the value source outputs its own value (the shape's). set: clears the source's preset."),
   z.object({
     preset: z.string().nullable().optional().describe('Preset "P.X" (null: the shape\'s own value; set: omit to keep the source\'s).'),
+    attribute: z.string().nullable().optional().describe('The source\'s attribute ("Tilt", "Dimmer", "ColorRGB_B"): needed for hard values on a source the shape does not filter; one per source (both steps). set: null clears it (a plain shape\'s source only).'),
+    absolute: z.number().optional().describe("Hard absolute value, percent 0-100 (VALUEABSOLUTE), instead of a preset."),
+    relative: z.number().optional().describe("Hard relative value, percent of the attribute's WHOLE range, -100 to 100 (VALUERELATIVE; Tilt 180 degrees: 20 = 36 degrees), instead of a preset."),
     trans: z.number().optional().describe("Trans X of this value source, percent (0-100)."),
     width: z.number().optional().describe("Width X of this value source, percent; with Link Steps the other step's width takes the rest of the source's sum, so give it on one step only."),
   }),
 ]);
 const stepSchema = z.object({
-  preset: z.string().optional().describe('Step preset "P.X": a shape with one value source per step (Sine, Ramp...). create / add_line: preset or sources is required; set: omit both to keep the step\'s.'),
+  preset: z.string().optional().describe('Step preset "P.X": a shape with one value source per step (Sine, Ramp...). create / add_line: preset, sources or hard values are required; set: omit them to keep the step\'s.'),
+  attribute: z.string().nullable().optional().describe('A shape with one value source: the source\'s attribute ("Tilt"), for hard values (and it filters a preset); one per source, so giving it on one step sets both. set: null clears it.'),
+  absolute: z.number().optional().describe("A shape with one value source: hard absolute value, percent 0-100, instead of a preset (needs the attribute)."),
+  relative: z.number().optional().describe("A shape with one value source: hard relative value, percent of the attribute's whole range (-100 to 100), instead of a preset (needs the attribute)."),
   sources: z
     .record(z.string(), sourceSchema)
     .optional()
@@ -1689,6 +1955,7 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
       description:
         "action create: builds PhaserRecipe lines (each: selection group, shape, 2 steps from presets with an optional curve, trans and width, MAtricks, speed, phase, measure) in a FREE preset slot. One line: give its fields at the top level; several (e.g. Dimmer + Colour in one preset): lines: [{...}, ...] (1-8). " +
         "A step is {preset} for a shape with one value source per step (Sine...), or {sources: {Attribute: \"P.X\", ...}} for a shape with several (Flyout 19 / Flyout Inverted 20: Dimmer, Tilt, Pan, so one line carries Dimmer + Tilt): each preset goes into the value source filtered on its attribute (or named by number), a source not given keeps the shape's value; a source may be {preset?, trans?, width?}. One preset on a multi-source shape is refused (At Preset would put it into every source). " +
+        "Hard values instead of presets: a step (or a value source) {attribute, absolute? | relative?}: the attribute is assigned once per source (Assign Attribute, shared by both steps), a preset on the source is cleared, the values are set from the command line (Set ... Property \"ValueAbsolute\" / \"ValueRelative\"; the layer not given is set to None); relative is percent of the attribute's whole range; a step may give only the attribute (it keeps the shape's value). Without an attribute or a preset a line does not cook (refused). A copy keeps line 1's hard values and nothing takes them back to the shape's: a line 2+ / add_line source must then be given a preset or values. " +
         "A value source's 2 presets come from one preset pool; one family per line is preferred (a warning names a line with presets from an All pool). The target preset may be in any pool: the pool does not filter recipe lines. " +
         "Checked first, nothing sent otherwise: the slot is free, the groups, shapes, presets and MAtricks exist, each shape has 2 steps and lines 2+ have line 1's value sources, each source's preset holds its attribute, no two lines share a source's step presets, the Edit Recipe mode is off with an empty Part Zero, no dialog is open, the programmer is empty (read completely), RecipeStoreMode is Normal. " +
         "Line 1: an empty Store of the preset (it clears the pending Edit Recipe target, so \"Update last object?\" does not open), EditRecipe queued without blocking the bridge (if \"Update last object?\" opens anyway it is answered Cancel, never OK, and the call stops), Group / At Shape / Step / At Preset (only for one preset per step) / MAtricks one command at a time with the line checked in Part Zero, Store /Merge, the mode switched off and read back, ClearAll (line 1 runs on stage from At Shape until then). A failure up to here switches the mode off, clears the programmer and deletes the preset this call created. " +
