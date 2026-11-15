@@ -43,7 +43,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
     `recook`, below).
 
   Editing a definition and cooking its output cannot be kept apart on the console. The edit tool therefore reports
-  the coverage before and after (`autoCooked`), and the cook tool gives an immediate, verified cook with the option of
+  the coverage before and after and whether the cooked values changed (`autoCooked`), and the cook tool gives an immediate, verified cook with the option of
   your choice.
 - **Cook options and uncooked data** (values stored directly in the same cue or preset):
 
@@ -125,7 +125,13 @@ Afterwards the lines are read back and checked:
 - move and remove: exactly the expected order.
 
 A failed `Assign` can leave an empty line behind on 2.5.1; the line count catches it. The result carries `linesBefore`,
-`linesAfter`, `coverage.before`, `coverage.after` and `autoCooked`.
+`linesAfter`, `coverage.before`, `coverage.after`, `cookedChanges` and `autoCooked`. The coverage names the fixtures
+and attributes only. `cookedChanges` compares the target's cooked values before and after, per fixture and attribute:
+`added`, `removed`, and `changed` in content (value, relative, steps and their layers, phaser layers, and the preset
+each value comes from, which a cooked value references). `autoCooked` is true when the coverage or a cooked value
+changed, so a line moved to another preset with the same attributes (1.9010 to 21.9072: Dimmer then comes from the
+phaser preset) counts as re-cooked although its coverage is the same. Unit-tested on the fake console; not run on a
+console (the bridge was down on 2026-11-15 when this was written).
 
 `values` is the plain string `"4.2"`. A number is refused with that form in the error: as JSON numbers `4.20` and `4.2` are
 the same, as presets they are preset 20 and preset 2. A string with quotes inside it (`"\"4.2\""`) is refused the same way.

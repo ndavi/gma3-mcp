@@ -15,7 +15,8 @@
  * write on a line cooks that line into its target at once (MergeLowPriority), disabling a line removes its output, and
  * a change of an ingredient (group membership, preset content) is re-cooked into the dependent targets a moment later
  * (asynchronously: not yet on an immediate read, done within 3 s). gma3_edit_recipe therefore reports the target's
- * coverage before and after the edit (`autoCooked`). What gma3_cook_recipes adds: an immediate, verified cook of a
+ * coverage before and after the edit and whether its cooked values changed (`autoCooked`: coverage, values or their
+ * source preset). What gma3_cook_recipes adds: an immediate, verified cook of a
  * preset, cue part, cue or whole sequence that does not depend on that background cook, the Merge, Overwrite and
  * Remove options, and the list of affected targets beforehand.
  *
@@ -279,6 +280,22 @@ export function coverageOf(rows: Array<PresetRow & { cooked?: boolean }>) {
     return [...m].map(([fixture, attributes]) => ({ fixture, attributes: attributes.sort() }));
   };
   return { cooked: by(true), uncooked: by(false), cookedCount: rows.filter((r) => r.cooked).length, uncookedCount: rows.filter((r) => !r.cooked).length };
+}
+
+/**
+ * How the cooked values of a target changed between two reads, per fixture and attribute: added, removed, and changed
+ * in content (value, relative, steps and their layers, phaser layers, the preset each layer comes from: rowContent).
+ * A line whose preset is swapped for another with the same attributes changes no coverage, only the values' source.
+ */
+export function cookedChanges(before: Array<PresetRow & { cooked?: boolean }>, after: Array<PresetRow & { cooked?: boolean }>) {
+  const key = (r: PresetRow) => `${r.sfIndex ?? r.fixture}|${r.attribute}`;
+  const map = (rows: Array<PresetRow & { cooked?: boolean }>) => new Map(rows.filter((r) => r.cooked).map((r) => [key(r), rowContent(r)]));
+  const b = map(before);
+  const a = map(after);
+  const added = [...a.keys()].filter((k) => !b.has(k)).length;
+  const removed = [...b.keys()].filter((k) => !a.has(k)).length;
+  const changed = [...a].filter(([k, v]) => b.has(k) && b.get(k) !== v).length;
+  return { added, removed, changed, any: added + removed + changed > 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -891,13 +908,17 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
     const warnings: string[] = [];
     const partial = (dataBefore as PresetRead | null)?.truncated || (dataAfter as PresetRead | null)?.truncated;
     if (partial) warnings.push("the target's data was not read completely, so coverage.before / coverage.after (and autoCooked) are partial");
-    const changed = cb && ca && JSON.stringify(cb) !== JSON.stringify(ca);
-    if (changed) warnings.push("the console re-cooked the target when the line changed (MergeLowPriority); see coverage.before / coverage.after. Use gma3_cook_recipes for another cook option");
+    // The coverage names attributes only; a swap to a preset with the same attributes changes the cooked values and
+    // their source, not the coverage, so the values are compared too.
+    const cc = dataBefore && dataAfter ? cookedChanges((dataBefore as PresetRead).rows, (dataAfter as PresetRead).rows) : null;
+    const coverageChanged = !!(cb && ca && JSON.stringify(cb) !== JSON.stringify(ca));
+    const changed = coverageChanged || !!cc?.any;
+    if (changed) warnings.push(`the console re-cooked the target when the line changed (MergeLowPriority): ${coverageChanged ? "see coverage.before / coverage.after" : "the same fixtures and attributes, other values or sources"} (cookedChanges). Use gma3_cook_recipes for another cook option`);
     const old = action === "set" ? b[n - 1] : undefined;
     if (old?.values && typeof generator === "number") warnings.push(`Generator ${generator} replaced the values of line ${n} (${old.values.name ?? "a preset"}): a line holds one or the other`);
     if (old?.generator && values) warnings.push(`the values replaced Generator ${old.generator.no} on line ${n}: a line holds one or the other`);
     if (typeof generator === "number") warnings.push("the line's Speed X has no effect on a generator: its speed is the generator's (gma3_store_generator)");
-    return buildResult({ operation: op, target, steps, verification, warnings, extra: { ...extra, linesAfter: after, coverage: { before: cb, after: ca }, autoCooked: !!changed } });
+    return buildResult({ operation: op, target, steps, verification, warnings, extra: { ...extra, linesAfter: after, coverage: { before: cb, after: ca }, ...(cc ? { cookedChanges: { added: cc.added, removed: cc.removed, changed: cc.changed } } : {}), autoCooked: changed } });
   };
   return preview ? body() : ctx.mutations.run(body);
 }
@@ -1675,7 +1696,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Add, change, move or remove a recipe line",
       description:
         "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset or generator, matricks?, filter?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
-        "References are checked first; the result reads every line back (the edited one and that the others are unchanged or moved as asked). The console re-cooks an edited line by itself (MergeLowPriority) and a removed line's output disappears: the result shows the target's coverage before and after (autoCooked). " +
+        "References are checked first; the result reads every line back (the edited one and that the others are unchanged or moved as asked). The console re-cooks an edited line by itself (MergeLowPriority) and a removed line's output disappears: the result shows the target's coverage before and after, and autoCooked (coverage, cooked values or their source preset changed). " +
         "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. filter: N limits the line to the filter's attributes (assigned before the values; null clears it in set); the filter must exist (gma3_store_filter). generator: N (preset lines only) puts a Random generator in place of the values (Assign Generator N At the line; each replaces the other; null clears it in set); the generator must exist (gma3_store_generator); the line's Speed X has no effect on it. Phaser lines and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
       inputSchema: {
         target: targetSchema.describe("Preset or cue part."),

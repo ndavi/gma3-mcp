@@ -2,7 +2,7 @@ import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
 import { SILENT } from "./helpers/fake-bridge.ts";
-import { registerRecipeTools, axisSelection, parseTarget, parseScope, targetRef, lineRef, coverageOf, verifyCoverage, setReplyMatches } from "../src/tools/recipes.ts";
+import { registerRecipeTools, axisSelection, parseTarget, parseScope, targetRef, lineRef, coverageOf, cookedChanges, verifyCoverage, setReplyMatches } from "../src/tools/recipes.ts";
 import { ValidationError } from "../src/validate.ts";
 
 // ---------------------------------------------------------------------------
@@ -82,7 +82,7 @@ test("set replies are compared per property", () => {
 interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterNo?: number; generator?: number; props?: Record<string, string> }
 /** A filter as the console reads it: its attribute mask, rules and layer flags. */
 interface FFilter { name: string; attrs: string[]; rules?: Array<{ cls: string; applyToFixtures?: boolean; invert?: boolean }>; layers?: Partial<Record<"ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING", boolean>> }
-interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean; stepCount?: number; phase?: number }
+interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean; stepCount?: number; phase?: number; absPreset?: { valid: boolean; addr: string; addrNative: string } }
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
 class Console {
@@ -178,7 +178,8 @@ class Console {
       const f = l.filterNo !== undefined && !this.ignoreFilter ? this.filters.get(l.filterNo) : undefined;
       for (const m of members) for (const a of p.attrs) if (!f || f.attrs.includes(a)) {
         const ph = p.phaser?.find((x) => x.sfIndex === m.sfIndex);
-        out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true, ...(p.phaser ? { stepCount: 2, phase: this.cookPhase.get(m.sfIndex) ?? ph?.phase ?? 0 } : {}) });
+        // A cooked value references the preset it comes from (abs_preset), as on 2.5.1.
+        out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true, absPreset: { valid: true, addr: p.addr, addrNative: `PresetPools.${l.preset}` }, ...(p.phaser ? { stepCount: 2, phase: this.cookPhase.get(m.sfIndex) ?? ph?.phase ?? 0 } : {}) });
       }
     }
     return out;
@@ -451,6 +452,39 @@ test("enabled: false switches a new line off before its values, so it never cook
   assert.equal(result.autoCooked, false);
   assert.equal(con.part(9060, 1).rows.length, 0);
   assert.deepEqual(h.fake.requests.filter((r) => r.op === "set").map((r) => `${r.args.property}=${r.args.value}`), ["Enabled=No"]);
+});
+
+test("autoCooked: a swap to a preset with the same attributes changes the values' source, not the coverage", async () => {
+  // As on 2.5.1: a cooked value names the preset it comes from (abs_preset); a line moved from one Dimmer preset to
+  // another keeps the coverage (the same fixtures, Dimmer) while the console re-cooks it.
+  con.presets.set("1.12", { addr: "14.14.1.5.1.12", attrs: ["Dimmer"], value: 100 });
+  con.presets.set("1.13", { addr: "14.14.1.5.1.13", attrs: ["Dimmer"], value: 40 });
+  con.part(9060, 1);
+  await edit({ action: "add", selection: 908, values: "1.11" });
+  const source = await edit({ action: "set", line: 1, values: "1.12" });
+  assert.equal(source.result.verification.status, "matched", JSON.stringify(source.result.verification));
+  assert.deepEqual(source.result.coverage.before, source.result.coverage.after, "the same attributes before and after");
+  assert.equal(source.result.autoCooked, true, "same value, other source preset");
+  assert.deepEqual(source.result.cookedChanges, { added: 0, removed: 0, changed: 2 });
+  assert.ok(source.result.warnings.some((w: string) => /the same fixtures and attributes, other values or sources/.test(w)), JSON.stringify(source.result.warnings));
+  const value = await edit({ action: "set", line: 1, values: "1.13" });
+  assert.equal(value.result.autoCooked, true, "other value");
+  assert.deepEqual(value.result.cookedChanges, { added: 0, removed: 0, changed: 2 });
+  // A name changes nothing the cook produces.
+  const name = await edit({ action: "set", line: 1, name: "Dim" });
+  assert.equal(name.result.autoCooked, false, JSON.stringify(name.result.cookedChanges));
+  assert.deepEqual(name.result.cookedChanges, { added: 0, removed: 0, changed: 0 });
+  assert.ok(!(name.result.warnings ?? []).some((w: string) => /re-cooked/.test(w)));
+});
+
+test("cookedChanges compares the cooked rows' content and source per fixture and attribute; uncooked rows are left out", () => {
+  const row = (extra: Record<string, unknown>) => ({ fixture: "401", sfIndex: 3, attribute: "Dimmer", value: 100, cooked: true, absPreset: { valid: true, addrNative: "P.1.11" }, ...extra });
+  assert.deepEqual(cookedChanges([row({})], [row({})]), { added: 0, removed: 0, changed: 0, any: false });
+  assert.deepEqual(cookedChanges([row({})], [row({ absPreset: { valid: true, addrNative: "P.1.12" } })]), { added: 0, removed: 0, changed: 1, any: true });
+  assert.deepEqual(cookedChanges([row({})], [row({ value: 40 })]), { added: 0, removed: 0, changed: 1, any: true });
+  assert.deepEqual(cookedChanges([row({})], [row({ relative: 0 })]), { added: 0, removed: 0, changed: 1, any: true }, "a relative 0 is a layer");
+  assert.deepEqual(cookedChanges([row({})], [row({ attribute: "Pan" })]), { added: 1, removed: 1, changed: 0, any: true });
+  assert.deepEqual(cookedChanges([row({ cooked: false })], [row({ cooked: false, value: 10 })]), { added: 0, removed: 0, changed: 0, any: false });
 });
 
 test("references, lines and targets are checked before anything is sent", async () => {
