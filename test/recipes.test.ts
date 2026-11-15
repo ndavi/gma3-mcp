@@ -79,7 +79,7 @@ test("set replies are compared per property", () => {
 // Fake console
 // ---------------------------------------------------------------------------
 
-interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterNo?: number; props?: Record<string, string> }
+interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterNo?: number; generator?: number; props?: Record<string, string> }
 /** A filter as the console reads it: its attribute mask, rules and layer flags. */
 interface FFilter { name: string; attrs: string[]; rules?: Array<{ cls: string; applyToFixtures?: boolean; invert?: boolean }>; layers?: Partial<Record<"ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING", boolean>> }
 interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean }
@@ -93,6 +93,8 @@ class Console {
   filters = new Map<number, FFilter>([[7, { name: "F DIM", attrs: ["Dimmer"] }]]);
   /** A console whose cook ignores the lines' filters. */
   ignoreFilter = false;
+  /** Random generators: one channel per attribute (Generator N.2.k). */
+  generators = new Map<number, { name: string; attrs: string[] }>([[9003, { name: "Random 9003", attrs: ["Dimmer", "Pan"] }]]);
   targets = new Map<string, FTarget>();
   commands: string[] = [];
   /** An Assign that leaves an extra empty line behind (seen with Assign Shape on 2.5.1). */
@@ -140,6 +142,12 @@ class Console {
   private output(t: FTarget): FRow[] {
     const out: FRow[] = [];
     for (const l of t.lines) {
+      // A generator line cooks a token value on every member that has a channel's attribute (the fake fixtures: ColorRGB_R, Dimmer).
+      const gen = l.generator !== undefined ? this.generators.get(l.generator) : undefined;
+      if (l.enabled && l.group !== null && gen) {
+        for (const m of this.groups.get(l.group) ?? []) for (const a of gen.attrs) if (["ColorRGB_R", "Dimmer"].includes(a)) out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: 6500, cooked: true });
+        continue;
+      }
       if (!l.enabled || l.group === null || !l.preset || l.cls !== "StandardRecipe") continue;
       const p = this.presetOf(l.preset)?.[1];
       if (!p) continue;
@@ -179,6 +187,11 @@ class Console {
     h.fake.on("children", (args) => {
       const ref = String(args.ref);
       let m: RegExpMatchArray | null;
+      if ((m = ref.match(/^Generator (\d+)\.2$/))) {
+        const g = this.generators.get(Number(m[1]));
+        if (!g) throw new Error(`no object found for '${ref}'`);
+        return { total: g.attrs.length, offset: 0, count: g.attrs.length, items: g.attrs.map((a, i) => ({ class: "RandomChannel", index: i + 1, fields: { ATTRIBUTE: args.asText === false ? a : "#20000087E", SPEED: args.asText === false ? 60 : "1.000000", RATIO: args.asText === false ? 50 : "50.00", SPEEDMASTER: "" } })) };
+      }
       if ((m = ref.match(/^Filter (\d+)\.1\.1$/))) {
         const f = this.filters.get(Number(m[1]));
         if (!f) throw new Error(`no object found for '${ref}'`);
@@ -207,7 +220,8 @@ class Console {
             Selection: l.group !== null ? { name: `Group ${l.group}`, class: "Group", index: l.group, addr: `g.${l.group}` } : "",
             Values: l.preset ? { name: this.presetOf(l.preset)?.[0] ?? "?", class: "Preset", addr: l.preset } : "",
             MAtricks: l.matricks !== null ? { name: `M${l.matricks}`, class: "MAtrick", index: l.matricks } : "",
-            Filter: l.filter ? { name: l.filter, class: "Filter", ...(l.filterNo !== undefined ? { index: l.filterNo } : {}) } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
+            Filter: l.filter ? { name: l.filter, class: "Filter", ...(l.filterNo !== undefined ? { index: l.filterNo } : {}) } : "",
+            Generator: l.generator !== undefined ? { name: this.generators.get(l.generator)?.name ?? "?", class: "Random", index: l.generator } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
             X: l.props?.X ?? "None", Y: l.props?.Y ?? "None", Z: l.props?.Z ?? "None",
           },
         })),
@@ -242,6 +256,11 @@ class Console {
       return { total: 2, offset: 0, count: 2, attributes: [{ attribute: "ColorRGB_R" }, { attribute: "Dimmer" }] };
     });
     h.fake.on("objects", (args) => {
+      const gm = String(args.ref).match(/^Generator (\d+)$/);
+      if (gm) {
+        const g = this.generators.get(Number(gm[1]));
+        return g ? { total: 1, count: 1, items: [{ class: "Random", index: Number(gm[1]), name: g.name, childCount: 2, fields: { Name: g.name } }] } : { total: 0, count: 0, items: [] };
+      }
       const fm = String(args.ref).match(/^Filter (\d+)$/);
       if (fm) {
         const f = this.filters.get(Number(fm[1]));
@@ -271,30 +290,33 @@ class Console {
       const f = this.find(ref)!;
       const l = f.t.lines[f.line! - 1];
       // The per-line MAtricks columns (#101) read in the edit role: seconds with two decimals, integers, None.
-      const column = !["Name", "Enabled", "SelectionMode", "Values", "Filter"].includes(prop);
+      const column = !["Name", "Enabled", "SelectionMode", "Values", "Filter", "Generator"].includes(prop);
       if (this.ignoreSet.has(prop)) return { value: prop === "Enabled" ? l.enabled : prop === "Name" ? l.name : prop === "SelectionMode" ? l.mode : column ? l.props?.[prop] ?? "None" : "" };
       if (prop === "Name") l.name = String(args.value);
       if (prop === "Enabled") l.enabled = args.value === "Yes";
       if (prop === "SelectionMode") l.mode = String(args.value);
       if (prop === "Values") l.preset = null;
       if (prop === "Filter") { l.filter = undefined; l.filterNo = undefined; }
+      if (prop === "Generator") l.generator = undefined;
       if (column) (l.props ??= {})[prop] = args.value === "None" ? "None" : /^(Fade|Delay)/.test(prop) ? Number(args.value).toFixed(2) : String(Number(args.value));
       this.cook(f.t, "/MergeLowPriority");
-      return { value: prop === "Enabled" ? l.enabled : prop === "Values" || prop === "Filter" ? "" : prop === "Name" ? l.name : column ? l.props![prop] : l.mode };
+      return { value: prop === "Enabled" ? l.enabled : prop === "Values" || prop === "Filter" || prop === "Generator" ? "" : prop === "Name" ? l.name : column ? l.props![prop] : l.mode };
     });
     h.fake.on("cmd", (args) => {
       const c = String(args.command);
       this.commands.push(c);
       if (this.reject?.test(c)) return { feedback: "Illegal object" };
       let m: RegExpMatchArray | null;
-      if ((m = c.match(/^Assign (Group|Preset|MAtricks|Filter) (\S+) At (.+)$/))) {
+      if ((m = c.match(/^Assign (Group|Preset|MAtricks|Filter|Generator) (\S+) At (.+)$/))) {
         const f = this.find(m[3]);
         if (!f) return { feedback: "Illegal object" };
         let l = f.t.lines[f.line! - 1];
         if (!l) { l = { cls: "StandardRecipe", group: null, preset: null, matricks: null, enabled: true, name: "", mode: "Strict" }; f.t.lines.push(l); if (this.strayLine) f.t.lines.push({ cls: "StandardRecipe", group: null, preset: null, matricks: null, enabled: true, name: "", mode: "Strict" }); }
         if (this.ignoreAssign.has(m[1])) return { feedback: "OK" };
         if (m[1] === "Group") l.group = Number(m[2]);
-        if (m[1] === "Preset") l.preset = this.presets.get(m[2])!.addr;
+        // As on 2.5.1.1: a line holds values or a generator, each Assign replaces the other; a missing generator answers OK and changes nothing.
+        if (m[1] === "Preset") { l.preset = this.presets.get(m[2])!.addr; l.generator = undefined; }
+        if (m[1] === "Generator" && this.generators.has(Number(m[2]))) { l.generator = Number(m[2]); l.preset = null; }
         if (m[1] === "MAtricks") l.matricks = Number(m[2]);
         // As on 2.5.1.1: a missing filter answers OK and changes nothing.
         if (m[1] === "Filter" && this.filters.has(Number(m[2]))) { l.filterNo = Number(m[2]); l.filter = this.filters.get(l.filterNo)!.name; }
@@ -1022,4 +1044,88 @@ test("store_recipe_cues writes a line's filter before its values, checks it exis
   const ignored = await store({ mode: "append", cues: [{ cue: 1, lines: [line(908, "21.5", { filter: 7 })] }] });
   assert.equal(ignored.result.verification.status, "mismatched");
   assert.match(JSON.stringify(ignored.result.items[0]), /line 3 filter reads none/);
+});
+
+// ---------------------------------------------------------------------------
+// Generators on preset lines
+// ---------------------------------------------------------------------------
+
+const P = { preset: "21.9077" };
+const presetTarget = () => {
+  const t: FTarget = { lines: [], rows: [] };
+  con.targets.set("Preset 21.9077", t);
+  return t;
+};
+
+test("add with a generator: Assign Group then Assign Generator on a preset line, no values; read back and predicted on the channels' attributes", async () => {
+  const t = presetTarget();
+  const { result, isError } = await edit({ target: P, action: "add", selection: 908, generator: 9003 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  assert.deepEqual(con.commands, ["Assign Group 908 At Preset 21.9077.1", "Assign Generator 9003 At Preset 21.9077.1"]);
+  assert.equal(t.lines[0].generator, 9003);
+  assert.equal(t.lines[0].preset, null);
+  assert.deepEqual(result.coverage.after.cooked, [{ fixture: "401", attributes: ["Dimmer"] }, { fixture: "402", attributes: ["Dimmer"] }]);
+  assert.match(result.warnings.join(), /Speed X has no effect on a generator/);
+  const rd = await h.callJson("gma3_recipes", { target: P });
+  assert.deepEqual(rd.result.lines[0].generator, { no: 9003, name: "Random 9003" });
+  assert.deepEqual(rd.result.lines[0].generatorAttributes, ["Dimmer", "Pan"]);
+  assert.deepEqual(rd.result.lines[0].problems, []);
+  assert.equal(rd.result.lines[0].notPredicted, undefined);
+  // Pan is a channel of the generator, but the fixtures have no Pan: only Dimmer is expected.
+  assert.equal(rd.result.expectedPairs, 2);
+  const ok = await h.callJson("gma3_cook_recipes", { target: P, mode: "merge_low_priority" });
+  assert.equal(ok.result.verification.status, "matched", JSON.stringify(ok.result.verification));
+  assert.equal(ok.result.affected[0].lines[0].generator, "Generator 9003");
+});
+
+test("generator refusals before anything is sent: a cue line, values and generator together, null on add, a missing generator", async () => {
+  presetTarget();
+  con.part(9060, 1);
+  const cue = await edit({ action: "add", selection: 908, generator: 9003 });
+  assert.match(cue.result.summary, /generator: only on a preset line/);
+  const both = await edit({ target: P, action: "add", selection: 908, values: "1.11", generator: 9003 });
+  assert.match(both.result.summary, /values and generator exclude each other/);
+  const nul = await edit({ target: P, action: "add", selection: 908, values: "1.11", generator: null });
+  assert.match(nul.result.summary, /generator: null clears a line's generator/);
+  const none = await edit({ target: P, action: "add", selection: 908 });
+  assert.match(none.result.summary, /add needs selection \(a group\) and values \(a preset\) or generator/);
+  const missing = await edit({ target: P, action: "add", selection: 908, generator: 9999 });
+  assert.equal(missing.isError, true);
+  assert.match(stepError(missing.result, "check_references"), /not in the show: Generator 9999/);
+  assert.equal(con.commands.length, 0);
+});
+
+test("set generator replaces the line's values (and values the generator); null clears it with set Generator \"\"", async () => {
+  const t = presetTarget();
+  t.lines = [
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.1.11", matricks: null, enabled: true, name: "", mode: "Strict" },
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.4.4", matricks: null, enabled: true, name: "", mode: "Strict" },
+  ];
+  const g = await edit({ target: P, action: "set", line: 1, generator: 9003 });
+  assert.equal(g.result.verification.status, "matched", JSON.stringify(g.result.verification));
+  assert.equal(t.lines[0].preset, null);
+  assert.match(g.result.warnings.join(), /Generator 9003 replaced the values of line 1 \(1.11\)/);
+  const v = await edit({ target: P, action: "set", line: 1, values: "1.11" });
+  assert.equal(v.result.verification.status, "matched", JSON.stringify(v.result.verification));
+  assert.equal(t.lines[0].generator, undefined);
+  assert.match(v.result.warnings.join(), /the values replaced Generator 9003 on line 1/);
+  t.lines[0] = { ...t.lines[0], preset: null, generator: 9003 };
+  h.fake.reset();
+  con.install(h);
+  const c = await edit({ target: P, action: "set", line: 1, generator: null });
+  assert.equal(c.result.verification.status, "matched", JSON.stringify(c.result.verification));
+  assert.deepEqual(sets(), ["Preset 21.9077.1 Generator="]);
+  assert.equal(t.lines[0].generator, undefined);
+});
+
+test("a generator the console ignores is a mismatch; a deleted generator is a problem of the line", async () => {
+  const t = presetTarget();
+  con.ignoreAssign.add("Generator");
+  const { result } = await edit({ target: P, action: "add", selection: 908, generator: 9003 });
+  assert.equal(result.verification.status, "mismatched");
+  assert.match(result.verification.detail, /line 1 generator reads none/);
+  t.lines = [{ cls: "StandardRecipe", group: 908, preset: null, matricks: null, enabled: true, name: "", mode: "Strict", generator: 9004 }];
+  const rd = await h.callJson("gma3_recipes", { target: P });
+  assert.match(rd.result.lines[0].problems.join(), /Generator 9004 does not exist: the line cooks nothing/);
 });

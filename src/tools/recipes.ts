@@ -3,7 +3,8 @@
  *
  *   gma3_recipes        read-only: the recipe lines of a preset or cue part (selection, values, MAtricks, filter, state,
  *                       dangling references) and what the target holds cooked and uncooked per fixture
- *   gma3_edit_recipe    add, set, move or remove one standard recipe line (the definition), with its filter
+ *   gma3_edit_recipe    add, set, move or remove one standard recipe line (the definition), with its filter, or a
+ *                       generator in place of the values (preset lines)
  *   gma3_store_recipe_cues  the standard lines of many cue parts in one call (replace or append), with the per-line
  *                       MAtricks columns, the cue's name and note; references checked once, a compact read-back (#101)
  *   gma3_cook_recipes   cook a preset, a cue part, a cue or a whole sequence with an explicit option, after showing every
@@ -39,6 +40,10 @@
  *   - `Assign Filter N At <line>` sets a line's filter and `set Filter ""` clears it (each re-cooks the line); with a
  *     filter only its attributes are cooked, a phaser preset keeps its phaser on them and a RELEASE preset releases
  *     only them (2026-11-15). `Assign Filter <missing> At <line>` answers OK and changes nothing.
+ *   - `Assign Generator N At Preset P.N.L` puts a Random generator in place of the line's values (Assign Preset puts
+ *     the values back and clears it; `set Generator ""` clears it); the line cooks a token value on every member of
+ *     its group that has a channel's attribute (generators.ts). `Assign Generator <missing>` answers OK and changes
+ *     nothing (2026-11-15).
  */
 import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
@@ -47,6 +52,7 @@ import { presetId, type PresetRead, type PresetRow } from "./presets.js";
 import { cueRef, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
 import { readFilter, type FilterInfo } from "./filters.js";
+import { generatorAttributes, readGenerator, type GeneratorInfo } from "./generators.js";
 import { MAX_BATCH_ITEMS, batchOptionShape, duplicates, hasUncertainStep, itemOk, runBatch } from "../batch.js";
 import { HeldLock } from "../mutations.js";
 import {
@@ -138,6 +144,8 @@ export interface Line {
   filter: string | null;
   /** The filter's pool number (read by index; the name alone is not unique). */
   filterNo?: number;
+  /** The generator in place of the values (Assign Generator N At the line; generators.ts). */
+  generator?: { no: number; name?: string } | null;
   selectionMode?: string;
   selectionFromValue?: boolean | null;
   /** The line's own X / Y / Z column when it is set ("X 1"): only part of the group gets values (#101). */
@@ -145,7 +153,7 @@ export interface Line {
   status: { failedCookedPart?: string; emptyLastCooking?: boolean | null };
 }
 
-const LINE_FIELDS = ["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", "X", "Y", "Z"];
+const LINE_FIELDS = ["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "Generator", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", "X", "Y", "Z"];
 
 /**
  * The X / Y / Z columns of a line that select part of its group: a number from 1, as a number or text (also "<2>", the
@@ -192,6 +200,7 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
     const val = handle(f.Values);
     const mtx = handle(f.MAtricks);
     const flt = handle(f.Filter);
+    const gen = handle(f.Generator);
     lines.push({
       line: typeof it.index === "number" ? it.index : i + 1,
       class: String(it.class),
@@ -202,6 +211,7 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
       matricks: mtx && mtx.class === "MAtrick" ? { no: mtx.index, name: mtx.name } : null,
       filter: flt ? flt.name ?? "?" : null,
       ...(flt && flt.class === "Filter" && typeof flt.index === "number" ? { filterNo: flt.index } : {}),
+      ...(gen && typeof gen.index === "number" ? { generator: { no: gen.index, name: gen.name } } : {}),
       selectionMode: typeof f.SelectionMode === "string" ? f.SelectionMode : undefined,
       selectionFromValue: bool(f.SelectionFromValue),
       ...(axisSelection(f) ? { axisSelect: axisSelection(f) } : {}),
@@ -265,6 +275,8 @@ export interface LineReport extends Line {
   members?: string[];
   /** The attributes the line's filter passes (when the filter was read and is modelled). */
   filterAttributes?: string[];
+  /** The attributes the line's generator cooks (one per channel), when it was read. */
+  generatorAttributes?: string[];
 }
 
 interface Expected {
@@ -286,7 +298,7 @@ interface Expected {
  * row). A line with a filter gives only the preset's attributes the filter passes (the others are `excluded`), when
  * the filter has the modelled shape (readFilter); otherwise it is not predicted. Phaser recipe lines are not predicted.
  */
-export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
+export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map(), generators: Map<number, GeneratorInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
   const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set() };
   const dependencyNotes: string[] = [];
   const reports: LineReport[] = [];
@@ -319,6 +331,33 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
     if (l.class !== "StandardRecipe") { unpredictable(`${l.class} lines are listed and kept, not modelled by this release`, g); continue; }
     // The X / Y / Z column gives values to only part of the group (one element, one block): which part is not modelled.
     if (l.axisSelect) { unpredictable(`the line's MAtricks selects part of its group (${l.axisSelect}); coverage not predicted`, g); continue; }
+    // A generator takes the place of the values: the line cooks a token value on every member that has a channel's attribute.
+    if (l.generator) {
+      const gi = await readGenerator(bridge, l.generator.no, t, generators);
+      const ga = generatorAttributes(gi);
+      if ("why" in ga) {
+        if (!gi.exists) rep.problems.push(`Generator ${l.generator.no} does not exist: the line cooks nothing`);
+        else unpredictable(`the generator (Generator ${l.generator.no}) is not modelled: ${ga.why}; coverage not predicted`, g);
+        continue;
+      }
+      rep.generatorAttributes = ga.attributes;
+      if (l.values || l.filter) { unpredictable(`a generator line with ${l.values ? "values" : "a filter"} is not modelled; coverage not predicted`, g); continue; }
+      if (!g || !g.exists || !g.members.length) continue;
+      let gave = 0;
+      for (const m of g.members) {
+        const fa = (await bridge.request("fixtureAttributes", { ref: `Fixture ${m.fixture}`, limit: 500 }, t).catch(() => null)) as { total?: number; offset?: number; count?: number; attributes?: Array<{ attribute?: string }> } | null;
+        if (!fa || !listComplete({ ...fa, items: fa.attributes })) {
+          const why = `the attributes of ${m.fixture} could not be read${fa ? " completely" : ""}, so the generator's values were not predicted for it`;
+          expected.uncertain.add(m.sfIndex);
+          if (!rep.notPredicted) { rep.notPredicted = why; expected.unpredicted++; }
+          dependencyNotes.push(`line ${l.line}: ${why}`);
+        }
+        const has = new Set((fa?.attributes ?? []).map((a) => String(a.attribute)));
+        for (const a of ga.attributes) if (has.has(a)) { expected.pairs.add(`${m.sfIndex}|${a}`); gave++; }
+      }
+      if (!gave && !rep.notPredicted) rep.problems.push(`no fixture of Group ${l.selection?.group} has an attribute of Generator ${l.generator.no} (${ga.attributes.join(", ")}): the line cooks nothing`);
+      continue;
+    }
     if (!l.values) { rep.problems.push("no values: the preset is missing (deleted?) or was never assigned"); continue; }
     // A filter passes only its attributes: modelled for the filter shape verified on the console (readFilter).
     let pass: Set<string> | null = null;
@@ -465,6 +504,7 @@ interface EditArgs {
   values?: string | number | null;
   matricks?: number;
   filter?: number | null;
+  generator?: number | null;
   enabled?: boolean;
   name?: string;
   selection_mode?: "strict" | "normal";
@@ -488,12 +528,14 @@ export function valuesPreset(field: string, value: unknown): { pool: number; num
 }
 
 function sameLine(a: Line, b: Line): boolean {
-  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && (a.filter ?? null) === (b.filter ?? null) && (a.filterNo ?? null) === (b.filterNo ?? null);
+  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && (a.filter ?? null) === (b.filter ?? null) && (a.filterNo ?? null) === (b.filterNo ?? null) && (a.generator?.no ?? null) === (b.generator?.no ?? null);
 }
 
 /** Every requested field of a line, compared per property. */
-export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; filter?: number | null; enabled?: boolean; name?: string; selectionMode?: string }): string[] {
+export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; filter?: number | null; generator?: number | null; enabled?: boolean; name?: string; selectionMode?: string }): string[] {
   const out: string[] = [];
+  if (f.generator === null && l.generator) out.push(`line ${n} still has a generator (Generator ${l.generator.no})`);
+  if (typeof f.generator === "number" && l.generator?.no !== f.generator) out.push(`line ${n} generator reads ${l.generator ? `Generator ${l.generator.no}` : "none"}`);
   if (f.filter === null && l.filter) out.push(`line ${n} still has a filter (${l.filter})`);
   if (typeof f.filter === "number" && l.filterNo !== f.filter) out.push(`line ${n} filter reads ${l.filter ? `${l.filter}${l.filterNo !== undefined ? ` (Filter ${l.filterNo})` : ""}` : "none"}`);
   if (f.selection !== undefined && l.selection?.group !== f.selection) out.push(`line ${n} selection reads ${l.selection ? `Group ${l.selection.group}` : "none"}`);
@@ -525,18 +567,25 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
   const values = raw.values === undefined || raw.values === null ? raw.values : v.check(() => valuesPreset("values", raw.values));
   const matricks = raw.matricks === undefined ? undefined : v.check(() => objectNumber("matricks", raw.matricks, { max: 9999 }));
   const filter = raw.filter === undefined || raw.filter === null ? raw.filter : v.check(() => objectNumber("filter", raw.filter, { max: 9999 }));
+  const generator = raw.generator === undefined || raw.generator === null ? raw.generator : v.check(() => objectNumber("generator", raw.generator, { max: 9999 }));
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") v.fail("enabled must be true or false");
   if (raw.selection_mode !== undefined && !(raw.selection_mode in SELECTION_MODES)) v.fail("selection_mode must be strict or normal");
-  const fields = { selection, values, matricks, filter, enabled: raw.enabled, name, selection_mode: raw.selection_mode };
+  const fields = { selection, values, matricks, filter, generator, enabled: raw.enabled, name, selection_mode: raw.selection_mode };
   const anyField = Object.values(fields).some((x) => x !== undefined);
   // Only for a missing field: an invalid one has its own error.
-  if (action === "add" && (raw.selection === undefined || raw.values === undefined || raw.values === null)) v.fail("add needs selection (a group) and values (a preset): a line without both cooks nothing");
+  const hasGenerator = raw.generator !== undefined && raw.generator !== null;
+  if (action === "add" && (raw.selection === undefined || ((raw.values === undefined || raw.values === null) && !hasGenerator))) v.fail("add needs selection (a group) and values (a preset) or generator: a line without both cooks nothing");
+  // A line holds a values preset or a generator: each Assign replaces the other (onPC 2.5.1.1).
+  if (hasGenerator && raw.values !== undefined && raw.values !== null) v.fail("values and generator exclude each other: a line holds one of them (Assign Generator replaces the values, Assign Preset the generator); put them on two lines");
+  if (action === "add" && raw.generator === null) v.fail("generator: null clears a line's generator (set); a new line has none");
   if ((action === "set" || action === "move" || action === "remove") && line === undefined) v.fail(`${action} needs line`);
-  if (action === "set" && !anyField) v.fail("set needs at least one of selection, values, matricks, filter, enabled, name, selection_mode");
+  if (action === "set" && !anyField) v.fail("set needs at least one of selection, values, matricks, filter, generator, enabled, name, selection_mode");
   if (action === "add" && raw.filter === null) v.fail("filter: null clears a line's filter (set); a new line has none");
   if (action === "move" && to === undefined) v.fail("move needs to");
   if ((action === "move" || action === "remove") && anyField) v.fail(`${action} takes no line fields`);
+  // Verified on preset lines only (a cue calls the preset with a standard line).
+  if (raw.generator !== undefined && t && t.kind !== "preset") v.fail("generator: only on a preset line (verified on the console); put the generator in a preset and call the preset from the cue");
   const target: Record<string, unknown> = { target: raw.target, action };
   if (!v.ok || !t) return validationFailure(op, target, v.errors);
   target.ref = label(t);
@@ -581,6 +630,8 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
             }
             // `Assign Filter <missing> At <line>` answers OK and changes nothing (onPC 2.5.1.1).
             if (typeof filter === "number" && !(await readFilter(bridge, filter, tm)).exists) missing.push(`Filter ${filter}`);
+            // `Assign Generator <missing> At <line>` answers OK and changes nothing (onPC 2.5.1.1).
+            if (typeof generator === "number" && !(await readGenerator(bridge, generator, tm)).exists) missing.push(`Generator ${generator}`);
           } catch (err) {
             return asRead(stepFromError("check_references", err, { op: "objects" }));
           }
@@ -619,6 +670,8 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
       if (filter === null) commands.push({ name: "clear_filter", set: { property: "Filter", value: "" } });
       if (values) commands.push({ name: "assign_values", command: `Assign Preset ${values.pool}.${values.number} At ${ref}` });
       if (values === null) commands.push({ name: "clear_values", set: { property: "Values", value: "" } });
+      if (typeof generator === "number") commands.push({ name: "assign_generator", command: `Assign Generator ${generator} At ${ref}` });
+      if (generator === null) commands.push({ name: "clear_generator", set: { property: "Generator", value: "" } });
       if (matricks !== undefined) commands.push({ name: "assign_matricks", command: `Assign MAtricks ${matricks} At ${ref}` });
       if (raw.selection_mode) commands.push({ name: "set_selection_mode", set: { property: "SelectionMode", value: SELECTION_MODES[raw.selection_mode] } });
       if (name !== undefined) commands.push({ name: "set_name", set: { property: "Name", value: name } });
@@ -661,7 +714,8 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
       const a = after ?? [];
       const problems: string[] = [];
       const valuesAddr = values ? (await readData(bridge, `Preset ${values.pool}.${values.number}`, tm))?.addr ?? "?" : values === null ? null : undefined;
-      const want = { selection, valuesAddr, matricks, filter, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
+      // Each of values and generator replaces the other on the line.
+      const want = { selection, valuesAddr: typeof generator === "number" && valuesAddr === undefined ? null : valuesAddr, matricks, filter, generator: values && generator === undefined ? null : generator, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
       if (action === "add") {
         if (a.length !== b.length + 1) problems.push(`${a.length} line(s) after adding to ${b.length}`);
         const l = a[n - 1];
@@ -689,6 +743,10 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
     if (partial) warnings.push("the target's data was not read completely, so coverage.before / coverage.after (and autoCooked) are partial");
     const changed = cb && ca && JSON.stringify(cb) !== JSON.stringify(ca);
     if (changed) warnings.push("the console re-cooked the target when the line changed (MergeLowPriority); see coverage.before / coverage.after. Use gma3_cook_recipes for another cook option");
+    const old = action === "set" ? b[n - 1] : undefined;
+    if (old?.values && typeof generator === "number") warnings.push(`Generator ${generator} replaced the values of line ${n} (${old.values.name ?? "a preset"}): a line holds one or the other`);
+    if (old?.generator && values) warnings.push(`the values replaced Generator ${old.generator.no} on line ${n}: a line holds one or the other`);
+    if (typeof generator === "number") warnings.push("the line's Speed X has no effect on a generator: its speed is the generator's (gma3_store_generator)");
     return buildResult({ operation: op, target, steps, verification, warnings, extra: { ...extra, linesAfter: after, coverage: { before: cb, after: ca }, autoCooked: !!changed } });
   };
   return preview ? body() : ctx.mutations.run(body);
@@ -755,6 +813,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     const groups = new Map<number, GroupInfo>();
     const presets = new Map<string, PresetRead | null>();
     const filters = new Map<number, FilterInfo>();
+    const generators = new Map<number, GeneratorInfo>();
     type Plan = { target: Target; lines: LineReport[]; expected: Expected; before: PresetRead | null; conflicts: string[]; losses: string[]; notes: string[] };
     const plans: Plan[] = [];
     let truncated = false;
@@ -781,7 +840,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
                 continue;
               }
               if (!lines.length) continue;
-              const an = await analyzeLines(bridge, lines, t, groups, presets, filters);
+              const an = await analyzeLines(bridge, lines, t, groups, presets, filters, generators);
               let before: PresetRead | null;
               try {
                 before = await readData(bridge, targetRef(tg), t);
@@ -809,7 +868,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     ]);
     const describePlan = (p: Plan) => ({
       target: label(p.target),
-      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
+      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), ...(l.generator ? { generator: `Generator ${l.generator.no}`, ...(l.generatorAttributes ? { generatorAttributes: l.generatorAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
       coverageBefore: p.before ? coverageOf(p.before.rows) : null,
       expectedCooked: p.expected.pairs.size,
       ...(mode === "merge" && p.conflicts.length ? { replacedUncooked: p.conflicts } : {}),
@@ -1316,7 +1375,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Read the recipe lines of a preset or cue part",
       description:
         "Read-only. target: {preset: \"N.M\"} or {sequence, cue, part?} (part 0 by default). Returns every recipe line (standard and phaser) with its selection (group and its members), values (preset), MAtricks, filter, Enabled, SelectionMode, the console's last cooking state, and problems (missing or empty group, missing preset, disabled), " +
-        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
+        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); a generator line (generator in place of the values) on the generator's channel attributes (generatorAttributes) the members have; lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
       inputSchema: { target: targetSchema.describe("Preset or cue part.") },
     },
     async (args) => {
@@ -1333,9 +1392,9 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
     {
       title: "Add, change, move or remove a recipe line",
       description:
-        "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset, matricks?, filter?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
+        "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset or generator, matricks?, filter?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
         "References are checked first; the result reads every line back (the edited one and that the others are unchanged or moved as asked). The console re-cooks an edited line by itself (MergeLowPriority) and a removed line's output disappears: the result shows the target's coverage before and after (autoCooked). " +
-        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. filter: N limits the line to the filter's attributes (assigned before the values; null clears it in set); the filter must exist (gma3_store_filter). Phaser lines and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
+        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. filter: N limits the line to the filter's attributes (assigned before the values; null clears it in set); the filter must exist (gma3_store_filter). generator: N (preset lines only) puts a Random generator in place of the values (Assign Generator N At the line; each replaces the other; null clears it in set); the generator must exist (gma3_store_generator); the line's Speed X has no effect on it. Phaser lines and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
       inputSchema: {
         target: targetSchema.describe("Preset or cue part."),
         action: z.enum(["add", "set", "move", "remove"]),
@@ -1347,6 +1406,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
         values: z.string().nullable().optional().describe('Preset as the plain string "N.M" ("4.2"; 4.20 and 4.2 are different presets); null clears it.'),
         matricks: z.number().optional().describe("MAtricks pool number."),
         filter: z.number().nullable().optional().describe("Filter pool number (Assign Filter N At the line, before the values): the line cooks only the filter's attributes. null clears it (set). gma3_store_filter creates one from a preset."),
+        generator: z.number().nullable().optional().describe("Generator pool number, preset lines only: in place of values (Assign Generator N At the line). null clears it (set). gma3_store_generator creates one."),
         enabled: z.boolean().optional(),
         name: z.string().optional(),
         selection_mode: z.enum(["strict", "normal"]).optional().describe("Strict: values only on the selected fixtures; Normal: passed down to sub-fixtures."),

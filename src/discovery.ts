@@ -22,7 +22,7 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "chases", tools: ["gma3_build_chase"] },
   { task: "executors and sequence playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
   { task: "speed masters and tempo", tools: ["gma3_configure_speed_master", "gma3_speed_master_action", "gma3_speed_masters"] },
-  { task: "recipes, many cues per call", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_store_recipe_cues", "gma3_cook_recipes", "gma3_edit_phaser_recipe", "gma3_store_filter"] },
+  { task: "recipes, many cues per call", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_store_recipe_cues", "gma3_cook_recipes", "gma3_edit_phaser_recipe", "gma3_store_filter", "gma3_store_generator"] },
   { task: "macros and their dialogs", tools: ["gma3_store_macro", "gma3_edit_macro_line", "gma3_run_macro", "gma3_macros", "gma3_dialog"] },
   { task: "console variables ($name in macros, cue commands)", tools: ["gma3_variables", "gma3_set_variable"] },
   { task: "tags: tagging, kill types, which objects carry a tag", tools: ["gma3_tags", "gma3_assign_tag", "gma3_store_tag", "gma3_delete_tag", "gma3_configure_tag", "gma3_playback"] },
@@ -38,16 +38,16 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
 /** Tools that watch the console over time on the server side: no Lua loop, no Lua time budget. */
 export const OBSERVING_TOOLS: ReadonlyArray<{ tool: string; what: string }> = [
   { tool: "gma3_observe_tempo", what: "how fast running sequences (chases) advance" },
-  { tool: "gma3_observe_values", what: "fixtures' programmer or DMX output values as they change" },
+  { tool: "gma3_observe_values", what: "programmer or DMX output values as they change" },
   { tool: "gma3_build_chase", what: "one cycle of the chase it built" },
   { tool: "gma3_run_macro", what: "a macro's running line" },
-  { tool: "gma3_timecode_transport", what: "a timecode show's cursor, the sequences it fires" },
+  { tool: "gma3_timecode_transport", what: "a timecode show's cursor, fired sequences" },
 ];
 
 /** Tools with a batch form (SU-12): one call with a list, each item with the single form's checks and read-back. */
 export const BATCH_TOOLS: ReadonlyArray<{ tool: string; list: string }> = [
   { tool: "gma3_store_group", list: "groups" },
-  { tool: "gma3_store_preset", list: "presets, each from explicit content" },
+  { tool: "gma3_store_preset", list: "presets from explicit content" },
   { tool: "gma3_store_macro", list: "macros" },
   { tool: "gma3_edit_macro_line", list: "edits" },
   { tool: "gma3_assign_to_executor", list: "assignments" },

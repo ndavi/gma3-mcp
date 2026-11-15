@@ -10,7 +10,9 @@ These tools combine groups, presets and MAtricks into programming that adapts to
   preset per value source on a shape with several, such as Flyout: Dimmer + Tilt in one line) in a free preset slot, through the programmer's Edit Recipe mode, and edits an existing phaser preset (a line's
   settings, add or remove a line) without the programmer (bridge **0.52.1**);
 - `gma3_store_filter` creates a filter from a preset, for a line's `filter` (the line then cooks only the filter's
-  attributes).
+  attributes);
+- `gma3_store_generator` creates or edits a Random generator, for a preset line's `generator` (the line then cooks
+  the generator in place of a values preset).
 
 Recipe definitions are read and written with the existing object ops (`children`, `objects`, `set`) and `Assign` /
 `Move` / `Delete` / `Cook` commands. The cooked state of a target comes from `preset.read`, which bridge **0.24.0**
@@ -25,6 +27,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | `gma3_cook_recipes` | the cooked (and, with merge or overwrite, the uncooked) data of the affected targets | untouched |
 | `gma3_edit_phaser_recipe` | create: one preset with 1-8 PhaserRecipe lines, cooked; set / add_line / remove_line: one line of an existing phaser preset | create: **used** (must be empty first, cleared with ClearAll at the end); edits: untouched |
 | `gma3_store_filter` | one new filter in a free slot | untouched |
+| `gma3_store_generator` | create: one new generator in a free slot; edit: channels of an existing one | create, or a new channel: **must be empty** (checked, never cleared); settings only: untouched |
 
 ## The things to know first
 
@@ -64,6 +67,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | Standard lines: group selection, preset values, MAtricks reference, Enabled, Name, SelectionMode | read, add, set, move, remove; coverage predicted and verified |
 | Per-line MAtricks columns (XWings, XBlock, XGroup, XWidth, XShift, XShuffle, X, FadeFromX / FadeToX, DelayFromX / DelayToX, PhaseFromX / PhaseToX, SpeedFromX / SpeedToX, and the Y and Z ones) | written by `gma3_store_recipe_cues` and read back there; **not verified on a console** (see below); not edited by `gma3_edit_recipe`. A line whose X, Y or Z column is set (also inherited, `<2>`) gives values to only part of its group: it is read (`axisSelect`) and its coverage is not predicted by `gma3_recipes` and `gma3_cook_recipes` |
 | A line's filter (`filter`: a Filter pool number) | written by `gma3_edit_recipe` (add, set; `null` clears) and `gma3_store_recipe_cues`, read back by number; coverage predicted on the filter's attributes for the filter shape described [below](#filters-on-a-line), otherwise not predicted (named) |
+| A preset line's generator (`generator`: a Generator pool number, in place of the values) | written by `gma3_edit_recipe` (add, set; `null` clears) on preset lines only, read back by number; coverage predicted on the generator's channel attributes ([below](#generators-on-a-preset-line)); not written by `gma3_store_recipe_cues` |
 | Standard lines with a world, SelectionFromValue | read and kept; not edited; coverage not predicted (named in the result; a merge treats what they reach as possibly replaced) |
 | Phaser recipe lines (PhaserRecipe), shapes | read and kept; not created or edited; coverage not predicted (likewise) |
 | Targets | presets and cue parts (edit, read); a preset, cue part, cue or whole sequence (cook) |
@@ -75,7 +79,8 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 
 - every line (standard and phaser) with:
   - `selection` (group and its `members`), `values` (`preset` "N.M" and name), `matricks`, `filter` (its name) and
-    `filterNo`, `filterAttributes` (what the filter passes, when it is modelled), `enabled`, `selectionMode`;
+    `filterNo`, `filterAttributes` (what the filter passes, when it is modelled), `generator` (`{no, name}`) and
+    `generatorAttributes` (one per channel), `enabled`, `selectionMode`;
   - the console's last cooking state (`failedCookedPart`, `emptyLastCooking`);
   - `problems`: missing selection, missing or empty group, missing or empty preset, disabled;
   - `axisSelect` when its X / Y / Z column selects part of the group ("X 1");
@@ -90,15 +95,16 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 
 | action | Parameters | Commands |
 | --- | --- | --- |
-| `add` | `selection` (group), `values` ("N.M"), `matricks?`, `filter?`, `name?`, `enabled?`, `selection_mode?` (strict/normal) | `Assign Group G At <line n+1>`, (`set Enabled No` when `enabled: false`), `Assign Filter F At <line>`, `Assign Preset N.M At <line>`, `Assign MAtricks M At <line>`, `set` Name / SelectionMode / Enabled |
-| `set` | `line` and any of the fields above; `values: null` clears the values, `filter: null` the filter (`set Filter ""`) | the same, on that line |
+| `add` | `selection` (group), `values` ("N.M") or `generator` (preset lines), `matricks?`, `filter?`, `name?`, `enabled?`, `selection_mode?` (strict/normal) | `Assign Group G At <line n+1>`, (`set Enabled No` when `enabled: false`), `Assign Filter F At <line>`, `Assign Preset N.M At <line>`, `Assign Generator N At <line>`, `Assign MAtricks M At <line>`, `set` Name / SelectionMode / Enabled |
+| `set` | `line` and any of the fields above; `values: null` clears the values, `filter: null` the filter (`set Filter ""`), `generator: null` the generator (`set Generator ""`) | the same, on that line |
 | `move` | `line`, `to` | `Move <line a> At <line b>`; only upward moves, which land where asked (moving down by k is k moves of the lines below it) |
 | `remove` | `line` | `Delete <line> /NoConfirmation` |
 
 Before anything is sent:
 - the target and the line exist, and the line is a standard line (move and remove also take phaser lines);
-- the referenced group, preset, MAtricks and filter exist (`Assign Filter <missing> At <line>` answers OK and changes
-  nothing on 2.5.1.1).
+- the referenced group, preset, MAtricks, filter and generator exist (`Assign Filter <missing>` and `Assign Generator
+  <missing> At <line>` answer OK and change nothing on 2.5.1.1);
+- `values` and `generator` are not both given (a line holds one of them), and `generator` is only on a preset target.
 
 `enabled: false` switches a new line off before it gets values, so it never cooks. The filter is assigned before the
 values for the same reason: the line is never cooked unfiltered.
@@ -107,8 +113,10 @@ Each `set` reply is compared for its property: Enabled by its truth value, Selec
 unchanged SelectionMode is a failure, not a match). A line list read only in part fails `read_lines` before anything is
 sent, and a partial read of the target's data is named in `warnings` (the coverage and `autoCooked` are then partial).
 Afterwards the lines are read back and checked:
-- add and set: every requested field of the line — selection, values (by the preset's address), MAtricks, filter (by
-  number), Enabled, Name, SelectionMode; the other lines unchanged (SelectionMode and filter included);
+- add and set: every requested field of the line — selection, values (by the preset's address), MAtricks, filter and
+  generator (by number), Enabled, Name, SelectionMode; the other lines unchanged (SelectionMode, filter and generator
+  included). A generator assigned to a line with values must leave it without values, and values assigned to a
+  generator line must leave it without a generator (both are warned);
 - move and remove: exactly the expected order.
 
 A failed `Assign` can leave an empty line behind on 2.5.1; the line count catches it. The result carries `linesBefore`,
@@ -238,6 +246,58 @@ an Assign onto an existing filter is not modelled), and a preset that holds valu
    predicted).
 
 Nothing is undone after a failure: a filter created before a failed step is kept, and the warnings say so.
+
+## Generators on a preset line
+
+A ma2 Random effect becomes a **generator** (ma3 Generator pool, `ShowData.DataPools.Default.GeneratorTypes.Generators`,
+class Random) on a **standard** line of a preset: `Assign Generator N At Preset P.N.L`, in place of the values preset.
+The line cooks a token value (6500) on every member of its group that has a channel's attribute, and a cue that
+calls the preset with a standard line stays 100 % recipe. The console facts (onPC 2.5.1.1, 2026-11-15):
+- a line holds a values preset **or** a generator: `Assign Generator` clears the values and `Assign Preset` the
+  generator; `set Generator ""` clears it (the line then cooks nothing); `Assign Generator <missing>` answers OK and
+  changes nothing;
+- the line re-cooks by itself on the Assign, like any other line;
+- the line's Speed X has no effect on a generator: its speed is the channel's own (cycles per minute).
+
+`gma3_recipes` and `gma3_cook_recipes` read the generator (`readGenerator`: its channels with asText false and as text)
+and predict the line on the channel attributes the group's members have (`fixtureAttributes` per member): a Pan
+channel on a fixture without Pan is not expected. A generator that cannot be read completely, or a generator line with
+values or a filter, is not predicted (named); a missing generator is a problem ("the line cooks nothing").
+`gma3_edit_recipe` takes `generator` only on a preset target: a generator on a cue line was not tried on the console;
+the cue calls the preset instead.
+
+## `gma3_store_generator`
+
+`{generator, action: "create" | "edit", name?, channels?: [{channel?, attribute?, speed?, ratio?, attack?, decay?,
+low_variance?, high_variance?, phase_variance?, speed_master?}], preview?}`.
+
+| Field | Console property | Range | Note |
+| --- | --- | --- | --- |
+| `attribute` | `Assign Attribute "<Attr>" At Generator N.2.k` | an attribute name | a `set` is refused; an unknown attribute answers "Illegal object" |
+| `speed` | Speed | 0.001-6000 | **cycles per minute** (15 = one cycle every 4 s); reads raw in cycles per minute, as text in Hz |
+| `ratio` | Ratio | 0-100 | % of the time at the high level (about the ma2 Width) |
+| `attack`, `decay` | Attack, Decay | 0-100 | % |
+| `low_variance`, `high_variance` | LowVariance, HighVariance | 0-100 | % (100 with attack / decay 0 is about a ma2 random) |
+| `phase_variance` | PhaseVariance | 0-360 | degrees (360 spreads the fixtures) |
+| `speed_master` | SpeedMaster | 1-16, `0` / `null` clears | master 3.n, **sent 0-based** (`"1"` is 3.2), cleared with `"None"`; reads back as the master's name |
+
+1. Checks: `create` needs a free slot and every channel's attribute; `edit` needs the generator (a Random one, read
+   completely), a channel number per entry, and new channels at count + 1, + 2, ... with their attribute. Values out
+   of range are refused (the console clamps them silently: Ratio "150" stores 100). A speed master must be in the
+   show (a duplicate or empty master name is warned: the read-back is by name). When the call would `Store`
+   (`create`, or a new channel), the programmer must be **known to be empty** (`programmer`, a complete scan): the
+   tool refuses otherwise and never clears it.
+2. `create`: `Store Generator N /NoConfirmation` (one channel: Dimmer, Speed 60, Ratio 50, Attack 100, Decay 100,
+   variances 0); each further channel `Store Generator N.2.k /NoConfirmation` (same defaults). Then per channel
+   `Assign Attribute`, then one `Set Generator N.2.k Property "<P>" "<v>"` per setting given (the console takes one
+   property per command). Then the name (`set`).
+3. Read back: the channel count, each written attribute and setting (the percent fields as text: raw they read
+   truncated, RATIO 19 for 20), the speed master by name, on `edit` the channels not asked for unchanged, and the
+   name. The result has every channel field (`generator.channels`, the unwritten ones under `other`).
+
+Nothing is undone after a failure: a generator created before a failed step is kept, and the warnings say so. The
+speed master link takes effect at the next Goto of the cue that plays it (THK migration bench) and the master
+multiplies the channel's speed.
 
 ## `gma3_edit_phaser_recipe`
 
@@ -683,6 +743,31 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   - not run on a console: a cue that really kept old values (so a re-cook that changes them), `mode: "merge"`, a
     skipped part, a cue line with its own Speed X, several parts in one cue, an incomplete scan (fake bridge only,
     `test/phaser-recipes.test.ts`).
+- Verified live for generators (onPC 2.5.1.1, show "Rescue", 2026-11-15, Group 9001 = Daytona 251-254, the code run
+  directly against the bridge):
+  - by hand first (Generator 9003, preset 21.9076): the commands of the THK bench, the defaults of a new generator and
+    of a new channel, the raw / text reads, SpeedMaster `"0"` = Speed1 (3.1), `"2"` = TILT (3.3), `"None"` clears;
+    "Illegal object" for an unknown attribute, "Illegal value" for "abc", Ratio "150" stored as 100; `Assign
+    Generator 9999` answered OK and changed nothing; values and generator replace each other on a line; `set Generator
+    ""` cleared it (the preset re-cooked to nothing);
+  - `gma3_store_generator create` 9004 "TEST GEN I5": Dimmer (speed 15, ratio 20, attack 0, decay 0, variances 100,
+    phase variance 360) and Pan (speed 7.5, ratio 50, phase variance 360, speed master 2): the empty programmer
+    checked, every command OK, matched (Pan read "PAN"); after the output check below, `edit` channel 2 (attack 0,
+    decay 0, speed master `null`): matched, channel 1 unchanged;
+  - `gma3_edit_recipe add` on the empty preset 21.9077 (`Store Preset 21.9077 /NoConfirmation`): Group 9001 +
+    generator 9004, matched, auto-cooked 8 values (Dimmer and Pan, 6500, on the 4 fixtures). `gma3_recipes` predicted
+    8 pairs (`generatorAttributes` Dimmer, Pan, no problem); `gma3_cook_recipes` of the preset matched. On 21.9076,
+    `set generator` 9003 over values (warned), `null`, then 9003 again: each matched;
+  - Sequence 9032 Cue 1 (`Store Sequence 9032 Cue 1 /NoConfirmation`) = Group 9001 + 21.9077 (`gma3_edit_recipe`),
+    cooked merge low priority: matched, `ownNonCookedDataPresent: false`, 8 cooked values;
+  - output after `Go+ Sequence 9032` (16-bit, every 200 ms for 16 s): the 4 Dimmers jumped between random levels
+    (3200 to 65484), about every 4 s (15 cycles per minute), each fixture at its own time (phase variance 360). Pan
+    (variances 0, attack / decay 100, master 3.2) ramped up and down with a period of about 8.2 s (7.5 cycles per
+    minute: 8 s), 251 and 253 out of phase. Sequence 9032 was switched off;
+  - not run on a console: a generator on a cue line (refused by the tool), several generators on one preset, a
+    generator line with a filter or MAtricks, a generator whose settings change while a cue plays it (whether the cue
+    follows without a re-cook), the speed master multiplying the speed (the bench notes say it does), channels
+    beyond 2, generator types other than Random.
 - Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
   a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
   (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES
