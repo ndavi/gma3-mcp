@@ -410,8 +410,9 @@ function compareSteps(r: ProgrammerRow, s: PresetRow, embed: boolean): string[] 
 
 /**
  * Whether a stored single-step row holds the absolute / relative layer: its value is present (a number, 0 included).
- * A layer the row lacks has no key at all (2.9044: relative 0, no value; hasRelative true, hasAbsolute false). The
- * value, not the dict_flags, decides: the flags of a single-step absolute row were not read on a console.
+ * A layer the row lacks has no key at all (2.9044 and 2.9045: relative 0, no value; hasRelative true, hasAbsolute
+ * false; 1.9010: value 100, no relative key; hasAbsolute true, hasRelative false, read on the console 15 Nov 2026).
+ * The value decides; the flags agree on every row read so far.
  */
 export const storedHasAbsolute = (s: PresetRow) => typeof s.value === "number";
 export const storedHasRelative = (s: PresetRow) => typeof s.relative === "number";
