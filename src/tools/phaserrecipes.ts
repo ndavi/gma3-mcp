@@ -48,6 +48,12 @@
  *     RawValueRel). Relative is percent of the attribute's whole range. Own values read raw as numbers, inherited ones
  *     as text ("<<100.00>100.00>"); nothing takes a hard value back to the shape's. Without attribute or preset a line
  *     does not cook.
+ *   - Transform and the line's own MAtricks columns (live 2026-11-15, 21.9073 / 21.9074): PHASERTRANSFORM, INVERTSTYLE,
+ *     XWINGS / XBLOCK / XGROUP, the Y ones and PHASEFROMY / PHASETOY take a Lua set and read back raw ("None" clears;
+ *     only the exact names "Mirror" / "None" are taken; other text is ignored). Mirror sets INVERTSTYLE Pan and XInvW with XWings (YInvW with
+ *     YWings; without wings nothing is mirrored); None switches the inverts off. Mirror applies at the cook, on the
+ *     attributes INVERTSTYLE names: the second wing cooks hard values without the step preset, absolute 100 - x and
+ *     relative -x. A line with a MAtricks object reads these from the object.
  *
  * Release: create builds in a free preset slot in any pool, 1 to 8 lines of exactly 2 steps each. A step is one
  * preset (a shape with one value source), a preset per value source (`sources`, by attribute or number), or hard
@@ -58,7 +64,8 @@ import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { presetId, type PresetRead } from "./presets.js";
-import { readLines } from "./recipes.js";
+import { matricksValue } from "./groups.js";
+import { readGroup, readLines, type GroupInfo } from "./recipes.js";
 import { asRead, buildResult, commandStep, notRequested, stepFromError, validationFailure, type OperationResult, type StepResult, type Verification } from "../results.js";
 import { Validator, finiteNumber, objectName, objectNumber } from "../validate.js";
 
@@ -217,6 +224,24 @@ interface StepSpec extends Hard {
   trans?: number;
   width?: number;
 }
+/**
+ * The line's own MAtricks columns this tool writes (live 2026-11-15, Rescue 21.9073: a Lua set, read back raw as a
+ * number or "None"; None clears), and phase Y. Phase X is `phase` (PHASEFROMX / PHASETOX).
+ */
+export const LINE_COLUMNS = { x: { wings: "XWINGS", blocks: "XBLOCK", groups: "XGROUP" }, y: { wings: "YWINGS", blocks: "YBLOCK", groups: "YGROUP" } } as const;
+type ColumnProp = "XWINGS" | "XBLOCK" | "XGROUP" | "YWINGS" | "YBLOCK" | "YGROUP" | "PHASEFROMY" | "PHASETOY";
+const COLUMN_PROPS: ColumnProp[] = ["XWINGS", "XBLOCK", "XGROUP", "YWINGS", "YBLOCK", "YGROUP", "PHASEFROMY", "PHASETOY"];
+/** Per column: a number, null (None), absent (not given / not compared). */
+type Columns = Partial<Record<ColumnProp, number | null>>;
+/**
+ * INVERTSTYLE: which attributes the inverts, and so Mirror, act on (live 2026-11-15, 21.9073: with Pan a Tilt line is
+ * not mirrored, with Tilt it is). The console names; a text it does not know is ignored (the previous value stays).
+ */
+export const INVERT_STYLES = { pan: "Pan", tilt: "Tilt", pan_tilt: "P+T", all: "All" } as const;
+type InvertStyle = keyof typeof INVERT_STYLES;
+/** The attributes a Mirror line mirrors, per INVERTSTYLE as read (null: any). */
+const MIRRORED_ATTRIBUTES: Record<string, string[] | null> = { Pan: ["Pan"], Tilt: ["Tilt"], "P+T": ["Pan", "Tilt"], All: null };
+
 interface LineSpec {
   selection: number;
   shape: number;
@@ -230,6 +255,11 @@ interface LineSpec {
   /** Adaptive Measure / Adaptive Width of the line (PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH). */
   adaptiveMeasure?: boolean;
   adaptiveWidth?: boolean;
+  /** PHASERTRANSFORM: mirror sets Mirror (the console then sets INVERTSTYLE Pan and switches XInvW / YInvW on with the wings). */
+  transform?: "none" | "mirror";
+  invertStyle?: InvertStyle;
+  /** The line's own MAtricks columns and phase Y. */
+  columns?: Columns;
 }
 
 interface CreateArgs {
@@ -247,11 +277,16 @@ interface CreateArgs {
   speed_master?: unknown;
   adaptive_measure?: unknown;
   adaptive_width?: unknown;
+  transform?: unknown;
+  invert_style?: unknown;
+  x?: unknown;
+  y?: unknown;
+  phase_y?: unknown;
   exclusive?: unknown;
   preview?: unknown;
 }
 
-const LINE_FIELDS = ["selection", "shape", "steps", "matricks", "speed_bpm", "phase", "measure", "speed_master", "adaptive_measure", "adaptive_width"] as const;
+const LINE_FIELDS = ["selection", "shape", "steps", "matricks", "speed_bpm", "phase", "measure", "speed_master", "adaptive_measure", "adaptive_width", "transform", "invert_style", "x", "y", "phase_y"] as const;
 const MAX_MASTER = 16;
 
 /**
@@ -312,6 +347,53 @@ function parsePhase(v: Validator, raw: unknown, at: string): LineSpec["phase"] {
   const to = v.check(() => finiteNumber(`${at}.to`, p.to, { min: -36000, max: 36000 }));
   return from !== undefined && to !== undefined ? { from, to } : undefined;
 }
+
+/** transform, invert_style, the x / y columns (wings, blocks, groups) and phase_y of a line; reported on `v`. */
+function parseMatricksFields(v: Validator, raw: Record<string, unknown>, at: (f: string) => string): Pick<LineSpec, "transform" | "invertStyle" | "columns"> {
+  const out: Pick<LineSpec, "transform" | "invertStyle" | "columns"> = {};
+  if (raw.transform !== undefined) {
+    if (raw.transform === "none" || raw.transform === "mirror") out.transform = raw.transform;
+    else v.fail(`${at("transform")} must be "none" or "mirror"`);
+  }
+  if (raw.invert_style !== undefined) {
+    if (typeof raw.invert_style === "string" && Object.hasOwn(INVERT_STYLES, raw.invert_style)) out.invertStyle = raw.invert_style as InvertStyle;
+    else v.fail(`${at("invert_style")} must be one of ${Object.keys(INVERT_STYLES).join(", ")}`);
+  }
+  const cols: Columns = {};
+  for (const axis of ["x", "y"] as const) {
+    const r = raw[axis];
+    if (r === undefined) continue;
+    if (!r || typeof r !== "object" || Array.isArray(r)) {
+      v.fail(`${at(axis)} must be {wings?, blocks?, groups?} (a number; 0 or null: None)`);
+      continue;
+    }
+    for (const [k, val] of Object.entries(r as Record<string, unknown>)) {
+      const prop = (LINE_COLUMNS[axis] as Record<string, ColumnProp>)[k];
+      if (!prop) {
+        v.fail(`${at(axis)}.${k} is not a line column this tool sets (wings, blocks, groups; phase ${axis.toUpperCase()} is ${axis === "x" ? "phase" : "phase_y"})`);
+        continue;
+      }
+      if (val === null) cols[prop] = null;
+      else {
+        const n = v.check(() => finiteNumber(`${at(axis)}.${k}`, val, { integer: true, min: 0, max: 10000 }));
+        if (n !== undefined) cols[prop] = n === 0 ? null : n;
+      }
+    }
+  }
+  if (raw.phase_y === null) Object.assign(cols, { PHASEFROMY: null, PHASETOY: null });
+  else if (raw.phase_y !== undefined) {
+    const p = parsePhase(v, raw.phase_y, at("phase_y"));
+    if (p) Object.assign(cols, { PHASEFROMY: p.from, PHASETOY: p.to });
+  }
+  if (Object.keys(cols).length) out.columns = cols;
+  return out;
+}
+const givesColumns = (l: Pick<LineSpec, "transform" | "invertStyle" | "columns">) => l.transform !== undefined || l.invertStyle !== undefined || l.columns !== undefined;
+/** A line with a MAtricks pool object reads its columns from it (21.9056: XWings 2 and Transform Mirror of MAtricks 9008). */
+const matricksColumnsProblem = (at: string, matricks: number) =>
+  `${at} has MAtricks ${matricks}: a line with a MAtricks object reads its columns, Transform and invert style from it, and writing them on the line is not verified (it might reach the shared object); give the line its own columns and Transform without a MAtricks (gma3_configure_matricks sets an object's columns, not its Transform)`;
+/** A wings column given (wings, blocks or groups move the phase positions: Adaptive Measure / Width follow them). */
+const movesPositions = (c: Columns | undefined) => !!c && (["XWINGS", "XBLOCK", "XGROUP", "YWINGS", "YBLOCK", "YGROUP"] as const).some((p) => c[p] !== undefined);
 
 function parseSources(v: Validator, raw: unknown, at: string): StepSpec["sources"] {
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || !Object.keys(raw).length) {
@@ -382,6 +464,8 @@ function parseLine(v: Validator, raw: Record<string, unknown>, path: string): Li
   const speedMaster = raw.speed_master === undefined ? undefined : parseSpeedMaster(v, raw.speed_master, at("speed_master"));
   const adaptiveMeasure = raw.adaptive_measure === undefined ? undefined : parseFlag(v, raw.adaptive_measure, at("adaptive_measure"));
   const adaptiveWidth = raw.adaptive_width === undefined ? undefined : parseFlag(v, raw.adaptive_width, at("adaptive_width"));
+  const mx = parseMatricksFields(v, raw, at);
+  if (matricks !== undefined && givesColumns(mx)) v.fail(matricksColumnsProblem(path || "the line", matricks));
   const steps: StepSpec[] = [];
   const before = v.errors.length;
   if (!Array.isArray(raw.steps) || raw.steps.length !== 2) v.fail(`${at("steps")} must be exactly 2 items [{preset: "P.X"}, {preset: "P.Y"}] or [{sources: {...}}, {sources: {...}}] (2-step phasers only in this release)`);
@@ -390,7 +474,7 @@ function parseLine(v: Validator, raw: Record<string, unknown>, path: string): Li
   if (steps.length === 2 && steps.every((s) => s.pool !== undefined) && steps[0].pool !== steps[1].pool) v.fail(`${at("steps")}: the 2 steps of a line come from one preset pool (one family per line; another family is another line), not pools ${steps[0].pool} and ${steps[1].pool}`);
   adaptiveConflicts(v, { measure, adaptiveMeasure, adaptiveWidth, steps }, at);
   if (selection === undefined || shape === undefined || steps.length !== 2 || v.errors.length > before) return undefined;
-  return { selection, shape, steps, matricks, speed, phase, measure, ...(raw.speed_master !== undefined ? { speedMaster } : {}), ...(adaptiveMeasure !== undefined ? { adaptiveMeasure } : {}), ...(adaptiveWidth !== undefined ? { adaptiveWidth } : {}) };
+  return { selection, shape, steps, matricks, speed, phase, measure, ...(raw.speed_master !== undefined ? { speedMaster } : {}), ...(adaptiveMeasure !== undefined ? { adaptiveMeasure } : {}), ...(adaptiveWidth !== undefined ? { adaptiveWidth } : {}), ...mx };
 }
 
 // ---- Value sources: the layout of a shape or a line, and what a line's steps ask of each source.
@@ -565,6 +649,21 @@ interface Sig {
   source: number;
   attribute: string | null;
   pair: string;
+  /** The line is mirrored (PHASERTRANSFORM Mirror, as read): its values on the mirrored wing, see mirrorMatch. */
+  mirror?: MirrorScope;
+}
+/**
+ * Where a Mirror line's mirrored values may be (live 2026-11-15, Rescue 21.9055 / 21.9073, group 9001 = 251-254, XWings
+ * 2): on the second wing the cooked values are hard values without the step preset, absolute 100 - x and relative -x
+ * (30 / 60 cooks 70 / 40, relative 10 / -20 cooks -10 / 20), only on the attributes INVERTSTYLE names. Which fixtures
+ * form the wing is not predicted: any member of the line's group (by subfixture index, else fixture).
+ */
+interface MirrorScope {
+  members: Set<string>;
+  /** The attributes mirrored (INVERTSTYLE as read); null: any. */
+  attributes: string[] | null;
+  /** The pair as the mirrored wing cooks it: "*" for a preset step (any value without a preset), the mirrored hard key, "-". */
+  pair: string;
 }
 /** A source whose values can be told apart: a step from a preset or from hard values. */
 const hasPreset = (g: Sig) => g.pair.split("/").some((p) => p !== "-" && p !== "?");
@@ -593,12 +692,42 @@ const rowStepKey = (st: RowStep | undefined) => {
 const rowPairOf = (r: Row) => (r.stepCount === 2 ? [0, 1].map((i) => rowStepKey(r.steps?.[i] as RowStep | undefined)).join("/") : "?");
 /** A sig step against a cooked step: the same preset; the same hard values (and no other layer); "-": any step without a preset. */
 const stepMatches = (want: string, got: string) => (want === "-" ? !isPresetKey(got) : want === got);
-const rowMatches = (r: Row, g: Sig) => {
+const straightMatch = (r: Row, g: Sig) => {
   if (!usable(g) || (g.attribute !== null && !eqi(g.attribute, r.attribute))) return false;
   const got = rowPairOf(r).split("/");
   const want = g.pair.split("/");
   return got.length === want.length && want.every((w, i) => stepMatches(w, got[i]));
 };
+/** A hard step key as the mirrored wing cooks it (absolute 100 - x, relative -x); a preset step: "*"; "-" and "?" unchanged. */
+export function mirrorKey(k: string): string {
+  if (isPresetKey(k)) return "*";
+  const m = k.match(/^(?:a(-?[\d.]+))?(?:r(-?[\d.]+))?$/);
+  if (!m || (m[1] === undefined && m[2] === undefined)) return k;
+  return hardKey({ ...(m[1] !== undefined ? { absolute: 100 - Number(m[1]) } : {}), ...(m[2] !== undefined ? { relative: -Number(m[2]) } : {}) });
+}
+const memberOf = (r: Row, members: Set<string>) => (typeof r.sfIndex === "number" ? members.has(`sf:${r.sfIndex}`) : members.has(`fx:${r.fixture}`));
+/** A cooked value of a Mirror line's mirrored wing: a group member, a mirrored attribute, each step its mirrored key ("*" and "-": any step without a preset). */
+const mirrorMatch = (r: Row, g: Sig) => {
+  const m = g.mirror;
+  if (!m || !usable(g) || !memberOf(r, m.members)) return false;
+  if (g.attribute !== null && !eqi(g.attribute, r.attribute)) return false;
+  if (m.attributes && !m.attributes.some((a) => eqi(a, r.attribute))) return false;
+  const got = rowPairOf(r).split("/");
+  const want = m.pair.split("/");
+  return got.length === want.length && want.every((w, i) => (w === "*" || w === "-" ? !isPresetKey(got[i]) : w === got[i]));
+};
+/** strict: the step presets or hard values themselves (evidence that the line cooked); otherwise a mirrored value counts too. */
+const rowMatches = (r: Row, g: Sig, strict = false) => straightMatch(r, g) || (!strict && mirrorMatch(r, g));
+/** The sig of `mine` a row belongs to: its own values first; a mirrored value only when no other line's own values match it. */
+const ownerSig = (r: Row, mine: Sig[], others: Sig[]) => mine.find((g) => straightMatch(r, g)) ?? (others.some((h) => straightMatch(r, h)) ? undefined : mine.find((g) => mirrorMatch(r, g)));
+/** The sigs of a line made mirror-aware when the line reads PHASERTRANSFORM Mirror (members read once per group). */
+async function withMirror(bridge: Gma3Bridge, t: number, sigs: Sig[], line: { group: number | null; transform?: string; invertStyle?: string } | undefined, groups: Map<number, GroupInfo>): Promise<Sig[]> {
+  if (!line || line.transform !== "Mirror" || line.group === null) return sigs;
+  const g = await readGroup(bridge, line.group, t, groups);
+  const members = new Set(g.members.flatMap((m) => [`sf:${m.sfIndex}`, `fx:${m.fixture}`]));
+  const attributes = line.invertStyle !== undefined && Object.hasOwn(MIRRORED_ATTRIBUTES, line.invertStyle) ? MIRRORED_ATTRIBUTES[line.invertStyle] : null;
+  return sigs.map((x) => ({ ...x, mirror: { members, attributes, pair: x.pair.split("/").map(mirrorKey).join("/") } }));
+}
 const rowKey = (r: Row) => `${r.fixture}|${r.attribute}|${rowPairOf(r)}|${r.speed}|${r.measure}|${r.cooked}|${(r.steps ?? []).map((s) => `${s.accel},${s.decel},${s.trans},${s.width}`).join(";")}`;
 const counts = (rows: Row[]) => rows.reduce((m, r) => m.set(rowKey(r), (m.get(rowKey(r)) ?? 0) + 1), new Map<string, number>());
 const near = (a: number | undefined, b: number | undefined, tol: number) => b === undefined || (a !== undefined && Math.abs(a - b) < tol);
@@ -706,7 +835,9 @@ type Action =
   /** A Yes/No property (the adaptive flags), read back as Yes/No. */
   | { kind: "set"; ref: string; property: string; value: "Yes" | "No"; expect: "yesno" }
   /** SPEEDMASTEROVERRIDE: written as a number, read back as the master's name ("" when cleared). */
-  | { kind: "set"; ref: string; property: string; value: string; expect: "text"; text: string };
+  | { kind: "set"; ref: string; property: string; value: string; expect: "text"; text: string }
+  /** A MAtricks column or phase Y: read back as a number, "90°" or "None" (want null). */
+  | { kind: "set"; ref: string; property: string; value: string; expect: "column"; column: "int" | "phase"; want: number | null };
 const actionText = (a: Action) => (a.kind === "cmd" ? a.command : `set ${a.ref} ${a.property}=${a.value === "" ? '""' : a.value}`);
 
 async function runAction(bridge: Gma3Bridge, name: string, a: Action, t: number): Promise<StepResult> {
@@ -718,6 +849,7 @@ async function runAction(bridge: Gma3Bridge, name: string, a: Action, t: number)
       a.expect === "empty" ? empty && r?.readOk !== false
       : a.expect === "yesno" ? yesNoOf(r?.value)?.value === (a.value === "Yes")
       : a.expect === "text" ? (a.text === "" ? empty : String(r?.value ?? "").trim() === a.text.trim()) && r?.readOk !== false
+      : a.expect === "column" ? columnMatches(a.want, matricksValue(a.column, r?.value))
       : numberMatches(Number(a.value), r?.value);
     const wanted = a.expect === "text" ? ` (${a.text === "" ? "no master" : JSON.stringify(a.text)} expected)` : "";
     return { name, status: good ? "succeeded" : "failed", op: "set", detail: { ref: a.ref, property: a.property }, ...(good ? {} : { error: `${a.ref} ${a.property} reads ${JSON.stringify(r?.value)} after writing ${a.value === "" ? '""' : a.value}${wanted}` }) };
@@ -725,6 +857,9 @@ async function runAction(bridge: Gma3Bridge, name: string, a: Action, t: number)
     return stepFromError(name, err, { op: "set" });
   }
 }
+
+/** A column as read (a number, null for None, undefined unreadable) against the one asked. */
+const columnMatches = (want: number | null, got: number | null | undefined) => (want === null ? got === null : typeof got === "number" && Math.abs(got - want) < 0.01);
 
 /** Trans and width of each source (widths first: with Link Steps a width moves the other step's). */
 function sourceSettings(at: (step: number, source: number) => string, res: Resolved[][]): Action[] {
@@ -759,16 +894,52 @@ function expectedLine(specs: LineSpec[], i: number): { flags: Flags; master: num
 }
 
 /**
+ * create: the Transform fields line i must read. A line 2+ is a copy of line 1 and keeps what line 1 set unless it sets
+ * it itself (a new MAtricks object replaces the columns: not compared). Mirror sets INVERTSTYLE Pan (a style given is
+ * written after it); the inverts follow from the transform and the wings. A field nobody set is not compared.
+ */
+function expectedTransform(specs: LineSpec[], i: number): TransformFields {
+  const own = specs[i];
+  const from = i > 0 && own.matricks === undefined ? specs[0] : undefined;
+  const pick = <T>(f: (l: LineSpec) => T | undefined): T | undefined => f(own) ?? (from ? f(from) : undefined);
+  const t = pick((l) => l.transform);
+  const transform = t === undefined ? undefined : t === "mirror" ? "Mirror" : "None";
+  const columns: Columns = {};
+  for (const p of COLUMN_PROPS) {
+    const c = own.columns?.[p] !== undefined ? own.columns[p] : from?.columns?.[p];
+    if (c !== undefined) columns[p] = c;
+  }
+  const styleOf = (l: LineSpec | undefined) => (!l ? undefined : l.invertStyle ? INVERT_STYLES[l.invertStyle] : l.transform === "mirror" ? "Pan" : undefined);
+  const invertStyle = styleOf(own) ?? (own.transform === undefined ? styleOf(from) : undefined);
+  return { transform, invertStyle, ...derivedInverts(transform, columns), columns };
+}
+/** A Mirror line without X or Y wings mirrors nothing (live 2026-11-15, 21.9073: XWings None, the 4 fixtures cooked alike, XInvW No). */
+const mirrorWithoutWings = (label: string, e: TransformFields) =>
+  e.transform === "Mirror" && !e.columns?.XWINGS && !e.columns?.YWINGS
+    ? [`${label} has Transform Mirror without X or Y wings on the line: Mirror mirrors along the wings (it switches XInvW / YInvW on with them), so nothing is mirrored (live: XWings None, every fixture cooked alike); give x: {wings: 2}`]
+    : [];
+
+/**
  * A line's settings in order: SPEEDX, PHASEFROMX / PHASETOX, the adaptive flags (before MEASURE, and before the widths
  * which are set later), MEASURE, SPEEDMASTEROVERRIDE (a number; read back as the master's name). Adaptive Measure is
  * switched off for a measure when the line has it on (or it is not known).
  */
-function lineSettings(ref: string, l: Pick<LineSpec, "speed" | "phase" | "measure" | "speedMaster" | "adaptiveMeasure" | "adaptiveWidth">, names: Map<number, string>, before: Flags): Action[] {
+function lineSettings(ref: string, l: Pick<LineSpec, "speed" | "phase" | "measure" | "speedMaster" | "adaptiveMeasure" | "adaptiveWidth" | "transform" | "invertStyle" | "columns">, names: Map<number, string>, before: Flags): Action[] {
   const num = (property: string, value: number): Action => ({ kind: "set", ref, property, value: String(value), expect: "number" });
   const flag = (property: string, on: boolean): Action => ({ kind: "set", ref, property, value: on ? "Yes" : "No", expect: "yesno" });
   const out: Action[] = [];
   if (l.speed !== undefined) out.push(num("SPEEDX", l.speed));
   if (l.phase) out.push(num("PHASEFROMX", l.phase.from), num("PHASETOX", l.phase.to));
+  // The columns and phase Y, then Transform (it switches the wings' inverts on and sets INVERTSTYLE Pan), then the style.
+  for (const p of COLUMN_PROPS) {
+    const want = l.columns?.[p];
+    if (want !== undefined) out.push({ kind: "set", ref, property: p, value: want === null ? "None" : String(want), expect: "column", column: p.startsWith("PHASE") ? "phase" : "int", want });
+  }
+  if (l.transform) {
+    const tr = l.transform === "mirror" ? "Mirror" : "None";
+    out.push({ kind: "set", ref, property: "PHASERTRANSFORM", value: tr, expect: "text", text: tr });
+  }
+  if (l.invertStyle) out.push({ kind: "set", ref, property: "INVERTSTYLE", value: INVERT_STYLES[l.invertStyle], expect: "text", text: INVERT_STYLES[l.invertStyle] });
   if (l.measure !== undefined ? before.adaptiveMeasure !== false : l.adaptiveMeasure !== undefined) out.push(flag("PLAYBACKADAPTIVEMEASURE", l.measure !== undefined ? false : l.adaptiveMeasure!));
   if (l.adaptiveWidth !== undefined) out.push(flag("PLAYBACKADAPTIVEWIDTH", l.adaptiveWidth));
   if (l.measure !== undefined) out.push(num("MEASURE", l.measure));
@@ -807,6 +978,11 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
   if (specs[0]?.matricks !== undefined && specs.some((l) => l.matricks === undefined)) v.fail("lines[0] has a MAtricks and another line has none: the other lines are copies of line 1 and keep its MAtricks; give every line one, or put a line without MAtricks first");
   // Preferred, not required: one family per line (a cue reads more clearly). All-pool step presets may mix families.
   const advice = specs.flatMap((l, i) => (stepPresets(l).some((s) => s.pool >= 21 && s.pool <= 25) ? [`line ${i + 1} takes its steps from an All pool (${stepPresets(l).find((s) => s.pool >= 21 && s.pool <= 25)!.pool}): its presets may mix families; one family per line (Dimmer, Colour, Position... each its own line) is preferred`] : []));
+  // Transform: a Mirror without wings mirrors nothing; a copy of a Mirror line 1 is mirrored too unless it says otherwise.
+  const transformNotes = specs.flatMap((l, i) => [
+    ...mirrorWithoutWings(specs.length > 1 ? `line ${i + 1}` : "the line", expectedTransform(specs, i)),
+    ...(i > 0 && l.transform === undefined && l.matricks === undefined && specs[0].transform === "mirror" ? [`line ${i + 1} is a copy of line 1 and keeps its Transform Mirror (and its columns): give it transform: "none" to leave it unmirrored`] : []),
+  ]);
   const preview = raw.preview === true;
   if (!preview && raw.exclusive !== true) v.fail("exclusive must be true: the build uses the programmer (it is checked empty first, and cleared with ClearAll at the end) and the Edit Recipe mode; nobody else may use them meanwhile");
   const tgt: Record<string, unknown> = { action: raw.action, preset: raw.preset };
@@ -1009,7 +1185,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)).flatMap((g) => (g.pair.split("/").includes("-") ? [`line ${i + 1} ${g.attribute ?? `source ${g.source + 1}`}: ${g.pair.split("/").map((p, n) => (p === "-" ? `step ${n + 1}` : null)).filter(Boolean).join(" and ")} keep(s) the shape's value`] : [])),
     );
     const notes = shapeValued.length ? [`value sources without a preset output the shape's own value: ${shapeValued.join("; ")}`] : [];
-    const previewWarnings = [...advice, ...adaptiveNotes, ...masterWarnings];
+    const previewWarnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...transformNotes];
     if (preview) return buildResult({ operation: op, target: tgt, steps: steps_, summary: "Preview only; nothing was sent.", ...(previewWarnings.length ? { warnings: previewWarnings } : {}), extra: { plan, preview: true, ...(notes.length ? { notes } : {}) } });
 
     // ---- Line 1 in Edit Recipe mode.
@@ -1198,8 +1374,11 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       if (!rows.length) problems.push(`${ref} holds no values (nothing cooked)`);
       if (uncooked.length) problems.push(`${ref} holds ${uncooked.length} uncooked value(s): stored directly, not from the recipe`);
       if (data?.truncated) problems.push(`${ref} was not read completely`);
-      // Each cooked value belongs to the value source whose step presets it integrates (and whose attribute it is).
-      const sigs = resolved.map((r, i) => sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)));
+      // Each cooked value belongs to the value source whose step presets it integrates (and whose attribute it is), or
+      // on a Mirror line (as read) to its mirrored values on the line's group.
+      const groups = new Map<number, GroupInfo>();
+      const sigs: Sig[][] = [];
+      for (const [i, r] of resolved.entries()) sigs.push(await withMirror(bridge, tm, sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)), details[i] && { ...details[i], group: specs[i].selection }, groups));
       const stray = rows.filter((r) => !sigs.some((gs) => gs.some((g) => rowMatches(r, g))));
       if (stray.length) problems.push(`${stray.length} value(s) do not have 2 steps from one line's step presets (first: fixture ${stray[0].fixture} ${stray[0].attribute}, steps ${rowPairOf(stray[0])})`);
       const multi = layouts.some((l) => l.some((st) => st.length > 1));
@@ -1217,11 +1396,14 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         problems.push(...flagMasterDiff(`line ${k}`, det, { ...exp.flags, ...(exp.master !== undefined ? { speedMaster: exp.master === null ? "" : (masterNames.get(exp.master) ?? "") } : {}) }));
         if (det?.speedMaster) createdWarnings.push(...masterSpeedWarning(`line ${k}`, det.speedMaster, det.speedHz));
         problems.push(...hardDiff(`line ${k}`, det, effLayouts[i], resolved[i]));
-        const sourceOf = (r: Row) => sigs[i].find((g) => rowMatches(r, g));
+        problems.push(...transformDiff(`line ${k}`, det, expectedTransform(specs, i)));
+        const others = sigs.filter((_, j) => j !== i).flat();
+        const sourceOf = (r: Row) => ownerSig(r, sigs[i], others);
         // A value of a source without a preset that another line could have made too is not this line's to check.
         const mine = rows.filter((r) => sourceOf(r) !== undefined && (hasPreset(sourceOf(r)!) || !sigs.some((gs, j) => j !== i && gs.some((g) => rowMatches(r, g)))));
+        // Evidence that the line cooked: its own step presets or hard values (a mirrored value is not).
         for (const g of sigs[i].filter(hasPreset))
-          if (!mine.some((r) => rowMatches(r, g))) problems.push(`no cooked value comes from line ${k}${multi ? ` ${g.attribute ?? `source ${g.source + 1}`}` : ""} (${sigText(g)})`);
+          if (!mine.some((r) => rowMatches(r, g, true))) problems.push(`no cooked value comes from line ${k}${multi ? ` ${g.attribute ?? `source ${g.source + 1}`}` : ""} (${sigText(g)})`);
         if (!mine.length) continue;
         // The cooked speed is in Hz (60 BPM = 1 Hz), the measure x100. The phase is spread per fixture by the MAtricks: only its set reply is compared.
         if (l.speed !== undefined) {
@@ -1275,7 +1457,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     } catch (err) {
       steps_.push(asRead(stepFromError("read_back", err, { op: "preset.read" })));
     }
-    const warnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...createdWarnings, "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
+    const warnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...transformNotes, ...createdWarnings, "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (the preset and its lines are kept)`);
     return buildResult({ operation: op, target: tgt, steps: steps_, verification, warnings, extra: { plan, lines, linesMade, coverage, ...(notes.length ? { notes } : {}) } });
   };
@@ -1321,15 +1503,50 @@ export interface LineDetail {
   adaptiveWidthOwn?: boolean;
   /** SPEEDMASTEROVERRIDE as the console reads it: the master's name, "" for none. */
   speedMaster?: string;
+  /** PHASERTRANSFORM ("None" / "Mirror"), INVERTSTYLE ("Pan", "Tilt", "P+T", "All"), XINVW / YINVW, the columns and phase Y (null: None). */
+  transform?: string;
+  invertStyle?: string;
+  xInvW?: boolean;
+  yInvW?: boolean;
+  columns?: Columns;
   failedCookedPart?: string;
   steps: StepDetail[];
+}
+/** The Transform fields of a line (as read or as expected); an undefined field is not compared. */
+type TransformFields = Pick<LineDetail, "transform" | "invertStyle" | "xInvW" | "yInvW" | "columns">;
+/** A column read raw: a number, "None" (null), "90°" or "2" as text. */
+const columnOf = (v: unknown): number | null | undefined => (typeof v === "number" ? (Number.isFinite(v) ? v : undefined) : matricksValue("phase", v));
+/**
+ * The inverts Transform switches (live 2026-11-15, 21.9073): Mirror switches XInvW on with XWings and YInvW with YWings
+ * (a column at None leaves its invert off: Mirror without wings mirrors nothing); None switches them off. undefined: not known.
+ */
+function derivedInverts(transform: string | undefined, cols: Columns | undefined): Pick<LineDetail, "xInvW" | "yInvW"> {
+  if (transform === "None") return { xInvW: false, yInvW: false };
+  if (transform !== "Mirror") return {};
+  const on = (c: number | null | undefined) => (c === undefined ? undefined : c !== null);
+  return { xInvW: on(cols?.XWINGS), yInvW: on(cols?.YWINGS) };
+}
+function transformDiff(label: string, got: LineDetail | undefined, want: TransformFields): string[] {
+  if (!got) return [];
+  const p: string[] = [];
+  const yn = (b: boolean | undefined) => (b === undefined ? "unreadable" : b ? "Yes" : "No");
+  if (want.transform !== undefined && got.transform !== want.transform) p.push(`${label} transform reads ${got.transform ?? "unreadable"}, ${want.transform} expected`);
+  if (want.invertStyle !== undefined && got.invertStyle !== want.invertStyle) p.push(`${label} invert style reads ${got.invertStyle ?? "unreadable"}, ${want.invertStyle} expected${want.transform === "Mirror" ? " (Mirror sets it to Pan)" : ""}`);
+  if (want.xInvW !== undefined && got.xInvW !== want.xInvW) p.push(`${label} XInvW reads ${yn(got.xInvW)}, ${yn(want.xInvW)} expected (Mirror switches it on with XWings)`);
+  if (want.yInvW !== undefined && got.yInvW !== want.yInvW) p.push(`${label} YInvW reads ${yn(got.yInvW)}, ${yn(want.yInvW)} expected (Mirror switches it on with YWings)`);
+  const txt = (c: number | null | undefined) => (c === null ? "None" : c === undefined ? "unreadable" : String(+c.toFixed(3)));
+  for (const prop of COLUMN_PROPS) {
+    const w = want.columns?.[prop];
+    if (w !== undefined && !columnMatches(w, got.columns?.[prop])) p.push(`${label} ${prop} reads ${txt(got.columns?.[prop])}, ${txt(w)} expected`);
+  }
+  return p;
 }
 
 /** Every recipe line of a preset with its group, MAtricks, shape, speed, phase, measure and value sources; null when the preset is not in the show. */
 export async function readLineDetails(bridge: Gma3Bridge, ref: string, t: number): Promise<LineDetail[] | null> {
   let top: ChildList;
   try {
-    top = await childList(bridge, ref, ["SPEEDX", "PHASEFROMX", "PHASETOX", "MEASURE", "SHAPE", "MAtricks", "Selection", "FailedCookedPart", "PLAYBACKADAPTIVEMEASURE", "PLAYBACKADAPTIVEWIDTH", "SPEEDMASTEROVERRIDE"], t);
+    top = await childList(bridge, ref, ["SPEEDX", "PHASEFROMX", "PHASETOX", "MEASURE", "SHAPE", "MAtricks", "Selection", "FailedCookedPart", "PLAYBACKADAPTIVEMEASURE", "PLAYBACKADAPTIVEWIDTH", "SPEEDMASTEROVERRIDE", "PHASERTRANSFORM", "INVERTSTYLE", "XINVW", "YINVW", ...COLUMN_PROPS], t);
   } catch (err) {
     if (notFound(err)) return null;
     throw err;
@@ -1352,6 +1569,18 @@ export async function readLineDetails(bridge: Gma3Bridge, ref: string, t: number
       if (aw) Object.assign(d, { adaptiveWidth: aw.value, adaptiveWidthOwn: aw.own });
       if (typeof f.SPEEDMASTEROVERRIDE === "string") d.speedMaster = f.SPEEDMASTEROVERRIDE.trim();
       else if (f.SPEEDMASTEROVERRIDE === null) d.speedMaster = "";
+      if (typeof f.PHASERTRANSFORM === "string" && f.PHASERTRANSFORM.trim()) d.transform = f.PHASERTRANSFORM.trim();
+      if (typeof f.INVERTSTYLE === "string" && f.INVERTSTYLE.trim()) d.invertStyle = f.INVERTSTYLE.trim();
+      const xi = yesNoOf(f.XINVW);
+      const yi = yesNoOf(f.YINVW);
+      if (xi) d.xInvW = xi.value;
+      if (yi) d.yInvW = yi.value;
+      const cols: Columns = {};
+      for (const p of COLUMN_PROPS) {
+        const c = columnOf(f[p]);
+        if (c !== undefined) cols[p] = c;
+      }
+      if (Object.keys(cols).length) d.columns = cols;
       for (const sources of (await readLayout(bridge, `${ref}.${line}`, t)) ?? []) {
         const s1 = sources[0];
         d.steps.push({ preset: s1?.preset ?? null, accel: s1?.accel, decel: s1?.decel, trans: s1?.trans, width: s1?.width, sources });
@@ -1388,6 +1617,11 @@ interface LineExpect {
   adaptiveWidth?: boolean;
   /** The master's name, "" for none. */
   speedMaster?: string;
+  transform?: string;
+  invertStyle?: string;
+  xInvW?: boolean;
+  yInvW?: boolean;
+  columns?: Columns;
   steps: Array<{ sources: SourceExpect[] }>;
 }
 const layoutOf = (d: { steps: Array<{ sources: Array<{ attribute: string | null }> }> }): Layout => d.steps.map((st) => st.sources.map((x) => ({ attribute: x.attribute, preset: null })));
@@ -1439,6 +1673,7 @@ function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect):
   if (!near(got.phaseFrom, want.phaseFrom, 0.01) || !near(got.phaseTo, want.phaseTo, 0.01)) p.push(`${label} phase reads ${got.phaseFrom} to ${got.phaseTo}, ${want.phaseFrom ?? "(unchanged)"} to ${want.phaseTo ?? "(unchanged)"} expected`);
   if (!near(got.measure, want.measure, 0.01)) p.push(`${label} measure reads ${got.measure ?? "none"}, ${want.measure} expected`);
   p.push(...flagMasterDiff(label, got, want));
+  p.push(...transformDiff(label, got, want));
   if (got.failedCookedPart && got.failedCookedPart !== "None") p.push(`${label} failed to cook (${got.failedCookedPart})`);
   if (got.steps.length !== want.steps.length) p.push(`${label} has ${got.steps.length} step(s), ${want.steps.length} expected`);
   want.steps.forEach((w, n) => {
@@ -1460,7 +1695,7 @@ function lineDiff(label: string, got: LineDetail | undefined, want: LineExpect):
   });
   return p;
 }
-const expectOf = (d: LineDetail): LineExpect => ({ class: d.class, group: d.group, matricks: d.matricks, shape: d.shape, speedHz: d.speedHz, phaseFrom: d.phaseFrom, phaseTo: d.phaseTo, measure: d.measure, adaptiveMeasure: d.adaptiveMeasure, adaptiveWidth: d.adaptiveWidth, speedMaster: d.speedMaster, steps: d.steps.map((st) => ({ sources: st.sources.map((x) => ({ ...x })) })) });
+const expectOf = (d: LineDetail): LineExpect => ({ class: d.class, group: d.group, matricks: d.matricks, shape: d.shape, speedHz: d.speedHz, phaseFrom: d.phaseFrom, phaseTo: d.phaseTo, measure: d.measure, adaptiveMeasure: d.adaptiveMeasure, adaptiveWidth: d.adaptiveWidth, speedMaster: d.speedMaster, transform: d.transform, invertStyle: d.invertStyle, xInvW: d.xInvW, yInvW: d.yInvW, columns: d.columns ? { ...d.columns } : undefined, steps: d.steps.map((st) => ({ sources: st.sources.map((x) => ({ ...x })) })) });
 
 /** Why a line cannot be edited by this release (its values must be told apart by their value sources' presets), or null. */
 function lineProblem(l: LineDetail, label: string): string | null {
@@ -1507,6 +1742,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     if (raw.speed_master !== undefined) change.speedMaster = parseSpeedMaster(v, raw.speed_master, "speed_master");
     if (raw.adaptive_measure !== undefined) change.adaptiveMeasure = parseFlag(v, raw.adaptive_measure, "adaptive_measure");
     if (raw.adaptive_width !== undefined) change.adaptiveWidth = parseFlag(v, raw.adaptive_width, "adaptive_width");
+    Object.assign(change, parseMatricksFields(v, raw as Record<string, unknown>, (f) => f));
     if (raw.steps !== undefined) {
       if (!Array.isArray(raw.steps) || raw.steps.length !== 2) v.fail('steps must be exactly 2 items, each {preset? | sources?, curve?, trans?, width?} ({} keeps that step)');
       else change.steps = raw.steps.map((s, i) => parseStep(v, s, `steps[${i}]`, false));
@@ -1625,6 +1861,18 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
           w.phaseFrom = s.phase.from;
           w.phaseTo = s.phase.to;
         }
+        // Transform and the columns: a line with a MAtricks object reads them from it (refused); a new MAtricks object
+        // replaces them (not compared). Mirror sets INVERTSTYLE Pan; the inverts follow the transform and the wings.
+        if (givesColumns(s) && w.matricks !== null) return matricksColumnsProblem(`line ${k}`, w.matricks);
+        if (w.matricks !== base.matricks) Object.assign(w, { transform: undefined, invertStyle: undefined, xInvW: undefined, yInvW: undefined, columns: undefined });
+        if (s.columns) w.columns = { ...w.columns, ...s.columns };
+        if (s.transform !== undefined) w.transform = s.transform === "mirror" ? "Mirror" : "None";
+        if (s.transform === "mirror") w.invertStyle = "Pan";
+        if (s.invertStyle) w.invertStyle = INVERT_STYLES[s.invertStyle];
+        if (s.transform !== undefined || (w.transform === "Mirror" && (s.columns?.XWINGS !== undefined || s.columns?.YWINGS !== undefined))) Object.assign(w, derivedInverts(w.transform, w.columns));
+        if (givesColumns(s)) editNotes.push(...mirrorWithoutWings(`line ${k}`, w));
+        if (action === "add_line" && s.transform === undefined && w.transform === "Mirror")
+          editNotes.push(`line ${k} is a copy of line 1 and keeps its Transform Mirror (and its columns): give transform: "none" to leave it unmirrored`);
         const reqSteps: StepSpec[] = s.steps ?? [{}, {}];
         const r = resolveSteps(reqSteps, layout, `line ${k}`);
         if (r.errors.length) return r.errors.join("; ");
@@ -1702,7 +1950,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         // Under Adaptive Measure / Width the console derives the measure and the widths from the phase positions: a new
         // group or MAtricks moves them, and so does switching a flag (Chase, live 2026-11-14: measure 4 = 4 fixtures, 2
         // with XWings 2; widths 25 / 75, 100 / 100 once Adaptive Width is off). Those are not compared.
-        const positionsMoved = s.selection !== undefined || s.matricks !== undefined || shapeChanged;
+        const positionsMoved = s.selection !== undefined || s.matricks !== undefined || shapeChanged || movesPositions(s.columns);
         const amToggled = w.adaptiveMeasure !== base.adaptiveMeasure;
         const awToggled = w.adaptiveWidth !== base.adaptiveWidth;
         if ((w.adaptiveMeasure !== false && positionsMoved) || amToggled) w.measure = undefined;
@@ -1839,11 +2087,14 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         problems.push(...lineDiff(label, after![i], e.want));
       });
       // Cooked values: the edited line's value sources have values at its speed; the old presets' are gone; every other value unchanged.
-      const oldSigs = action === "add_line" ? [] : sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]), hardIn(before[k - 1]));
-      const newSigs = want ? sigsOf(k, presetsIn(want), layoutOf(want), hardIn(want)) : [];
+      // A Mirror line (as read, before and after) also owns its mirrored values on its group (see MirrorScope).
+      const groups = new Map<number, GroupInfo>();
+      const oldSigs = action === "add_line" ? [] : await withMirror(bridge, tm, sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]), hardIn(before[k - 1])), before[k - 1], groups);
+      const newSigs = want ? await withMirror(bridge, tm, sigsOf(k, presetsIn(want), layoutOf(want), hardIn(want)), after[k - 1] && { ...after[k - 1], group: want.group }, groups) : [];
       const otherSigs = before.filter((l) => l.line !== k || action === "add_line").flatMap((l) => (l.class === "PhaserRecipe" ? sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l)) : []));
       const shared = (g: Sig) => otherSigs.some((h) => clash(g, h));
-      const ofLine = (r: Row, sigs: Sig[]) => sigs.some((g) => rowMatches(r, g));
+      // The line's own values; a mirrored value only when no other line's own values match it.
+      const ofLine = (r: Row, sigs: Sig[]) => sigs.some((g) => straightMatch(r, g)) || (sigs.some((g) => mirrorMatch(r, g)) && !otherSigs.some((h) => straightMatch(r, h)));
       // A fixture and attribute the edited line output, before or after, is left out: there one line masks another
       // (the later line wins), so another line's value may rightly appear or go.
       const covered = new Set([...rowsBefore.filter((r) => ofLine(r, oldSigs)), ...rows.filter((r) => ofLine(r, newSigs))].map((r) => `${r.fixture}|${r.attribute}`));
@@ -1859,13 +2110,14 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
       const multi = (want ?? expectOf(before[k - 1] ?? before[0])).steps.some((st) => st.sources.length > 1);
       for (const g of oldSigs) {
         if (!hasPreset(g) || newSigs.some((h) => h.pair === g.pair && h.attribute === g.attribute) || shared(g)) continue;
-        const stale = rows.filter((r) => rowMatches(r, g));
+        const stale = rows.filter((r) => rowMatches(r, g, true));
         if (stale.length) problems.push(`${stale.length} cooked value(s) still come from the old step presets ${g.pair}${multi ? ` (${g.attribute ?? `source ${g.source + 1}`})` : ""}`);
       }
       if (want) {
         for (const g of newSigs.filter(hasPreset)) {
-          const got = rows.filter((r) => rowMatches(r, g));
-          if (!got.length) {
+          // Evidence: the line's own step presets or hard values; the values checked: those and its mirrored ones.
+          const got = rows.filter((r) => ofLine(r, [g]));
+          if (!rows.some((r) => rowMatches(r, g, true))) {
             problems.push(`no cooked value comes from line ${k}${multi ? ` ${g.attribute ?? `source ${g.source + 1}`}` : ""} (${sigText(g)})`);
             continue;
           }
@@ -1945,6 +2197,22 @@ const lineShape = {
     .describe("Speed master 1-16 the line follows (SPEEDMASTEROVERRIDE, always written as a number; read back by the master's name and in the cooked values). 0 or null clears the link; text is refused (None would link master 1, a name another master). The master multiplies Speed X: a line that follows a master has Speed X 60 (one cycle = Measure x 60 / master BPM); another Speed X is warned about. Lines 2+ and add_line otherwise keep line 1's; set keeps the line's."),
   adaptive_measure: z.boolean().optional().describe("Adaptive Measure of the line (PLAYBACKADAPTIVEMEASURE; Chase 7 has it: measure = the number of phase positions, i.e. fixtures or MAtricks positions, one beat each). Default: the shape's; a measure switches it off."),
   adaptive_width: z.boolean().optional().describe("Adaptive Width of the line (PLAYBACKADAPTIVEWIDTH; Chase 7 has it: step 1 width = 100 / positions, one position lit at a time). Default: the shape's. A width on a line under Adaptive Width is refused unless adaptive_width is false (the console ignores WIDTHX under it, and switching it off changes the look)."),
+  transform: z
+    .enum(["none", "mirror"])
+    .optional()
+    .describe("PHASERTRANSFORM of the line. mirror: on the second wing the values run the other way (absolute 100 - x, relative -x), only on the attributes invert_style names (the console sets it to Pan); it needs wings (x: {wings: 2}): Mirror switches XInvW on with XWings (YInvW with YWings), without wings nothing is mirrored. The mirrored values cook as hard values without the step preset (the cue stays in recipe). none: switches the inverts off. Lines 2+ and add_line otherwise keep line 1's."),
+  invert_style: z.enum(["pan", "tilt", "pan_tilt", "all"]).optional().describe("INVERTSTYLE: the attributes Mirror acts on (Pan, Tilt, P+T, All). Mirror sets Pan; give tilt for a Tilt line. Written after transform."),
+  x: z
+    .object({ wings: z.number().nullable().optional(), blocks: z.number().nullable().optional(), groups: z.number().nullable().optional() })
+    .strict()
+    .optional()
+    .describe("The line's own X MAtricks columns XWINGS / XBLOCK / XGROUP (0 or null: None). Not with a MAtricks object (matricks): the line reads them from it."),
+  y: z
+    .object({ wings: z.number().nullable().optional(), blocks: z.number().nullable().optional(), groups: z.number().nullable().optional() })
+    .strict()
+    .optional()
+    .describe("The line's own Y columns YWINGS / YBLOCK / YGROUP (0 or null: None); Y follows the group's grid."),
+  phase_y: z.object({ from: z.number(), to: z.number() }).nullable().optional().describe("Phase Y from/to in degrees (PHASEFROMY / PHASETOY; adds to phase X along the group's grid Y); null: None."),
 };
 
 export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
@@ -1968,7 +2236,8 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         "Checked first: the preset and line exist, the line is a PhaserRecipe of 2 steps whose values are told apart by their value sources' presets, each source's presets from one pool and holding its attribute, no other line with the same source presets, the references exist, no dialog, the Edit Recipe mode off. " +
         "Sent: Assign Group / Shape / MAtricks At the line, Assign Preset At each value source, set PRESET \"\" on a cleared source, the curves after the shape, WIDTHX / TRANSX, SPEEDX / PHASEFROMX / PHASETOX / MEASURE, Cook /MergeLowPriority. " +
         "Read back: the edited line as asked (presets, trans, width per source, curves, measure, cook state), every other line and its cooked values unchanged, the edited line's values cooked at its speed and measure, the old presets' values gone. Cues calling the preset follow it without a re-cook (a cue line's own Speed X still replaces the speed). " +
-        "Per line: speed_master n (1-16, a number only; 0 / null clears) links the line to speed master 3.n (SPEEDMASTEROVERRIDE), read back by the master's name (read from the master) and in the cooked values; the master multiplies Speed X, so a line with a master and a Speed X other than 60 is warned about. adaptive_measure / adaptive_width set PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH; a measure switches Adaptive Measure off first (warned when the line had it); a width under Adaptive Width needs adaptive_width: false. Under Adaptive the measure / widths the console derives (a new group or MAtricks) are not compared. " +
+        "Per line: speed_master n (1-16, a number only; 0 / null clears) links the line to speed master 3.n (SPEEDMASTEROVERRIDE), read back by the master's name (read from the master) and in the cooked values; the master multiplies Speed X, so a line with a master and a Speed X other than 60 is warned about. adaptive_measure / adaptive_width set PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH; a measure switches Adaptive Measure off first (warned when the line had it); a width under Adaptive Width needs adaptive_width: false. Under Adaptive the measure / widths the console derives (a new group, MAtricks or wings) are not compared. " +
+        "Per line: transform (none / mirror, PHASERTRANSFORM), invert_style, x / y {wings, blocks, groups} (the line's own columns; null clears) and phase_y, set with the line's settings and read back (Mirror also reads INVERTSTYLE Pan unless invert_style is given, and XInvW / YInvW Yes with the X / Y wings). Mirror applies at the cook: on the mirrored wing the cooked values are hard (100 - x absolute, -x relative) with no step preset; the read-back counts them as the line's own (any member of its group, the attributes of INVERTSTYLE), and requires its step presets on the other wing. Mirror without wings is warned about (it mirrors nothing). Refused with a MAtricks object on the line. " +
         "preview: true runs the checks and returns the plan. Needs bridge 0.52.1.",
       inputSchema: {
         action: z.enum(["create", "set", "add_line", "remove_line"]),
@@ -1986,6 +2255,11 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         speed_master: lineShape.speed_master,
         adaptive_measure: lineShape.adaptive_measure,
         adaptive_width: lineShape.adaptive_width,
+        transform: lineShape.transform,
+        invert_style: lineShape.invert_style,
+        x: lineShape.x,
+        y: lineShape.y,
+        phase_y: lineShape.phase_y,
         exclusive: z.boolean().optional().describe("create: required (true) unless preview: nobody else uses the programmer or the Edit Recipe mode meanwhile. Not used by the edit actions."),
         preview: z.boolean().optional(),
       },

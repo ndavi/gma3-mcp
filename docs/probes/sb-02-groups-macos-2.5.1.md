@@ -68,7 +68,12 @@ existing op could read them.
 | two rows (401@0/1, 402@1/0, 403@0/0, 404@1/1) | X 0 → 0, X 1 → 100 in both rows |
 | the row with `XWings 2` | 0, 33, 67, 100, 100, 67, 33, 0; `SelectionNext` reports X 0 1 2 3 3 2 1 0 |
 | `XBlock 2` / `XGroup 2` | 0 0 33 33 67 67 100 100 / 0 100 0 100 ... |
-| `XWings 2` with `XInv`, `XInvW` or `InvertX` Yes | unchanged (the invert flags did not change a value spread) |
+| `XWings 2` with `XInv`, `XInvW` or `InvertX` Yes | unchanged (the invert flags alone did not change a value spread) |
+
+Later finding (2026-11-15, phaser recipe lines on group 9001): the invert flags alone (`XInv`, `XInvW`, `InvertX`,
+`InvertStyle`) have no effect on phasers either, but `PhaserTransform` Mirror does. With XWings 2 it switches XInvW
+on, and on the second wing the phaser values run the other way (absolute 100 − x, relative −x), on the attributes
+`InvertStyle` names (Pan by default). See `docs/tools/recipes.md`, Transform (Mirror).
 
 A cue stored from the row with `Recall MAtricks` (XWings 2, DelayFromX 1, DelayToX 0) keeps `gridposmatr` 0 1 2 3 3 2
 1 0 per channel (`GetPresetData` on the part) but no per-fixture delay; the programmer phaser data has none either.

@@ -289,6 +289,45 @@ line sets it itself and as `"<Yes>"` / `"<No>"` when it comes from the shape; a 
 Assign Shape, the other follows the new shape. Under Adaptive, the measure and widths the console derives after a new
 group, MAtricks or shape, or after a flag changes, are not compared.
 
+**Transform (Mirror) and the line's own MAtricks columns.** `transform: "none" | "mirror"` (PHASERTRANSFORM),
+`invert_style: "pan" | "tilt" | "pan_tilt" | "all"` (INVERTSTYLE: Pan, Tilt, P+T, All), `x` / `y: {wings?, blocks?,
+groups?}` (XWINGS / XBLOCK / XGROUP and the Y ones; `0` or `null` writes None, which clears the column) and
+`phase_y: {from, to}` (PHASEFROMY / PHASETOY; `null` clears both). Phase X stays `phase`. All are written with the
+Lua `set` on the line, after the speed and phase X, in the order columns, phase Y, transform, invert style. Each
+reply is compared (`"2"`, `"90°"`, `"None"`, `"Mirror"`), and each line reads them back. Verified live (onPC
+2.5.1.1, Rescue, 2026-11-15, Group 9001 = 251-254, presets 21.9073 / 21.9074):
+
+- The console only takes the exact names, `"Mirror"` and `"None"`. Any other text (`"mirror"`, `"none"`; for
+  INVERTSTYLE `"Dimmer"`, `"Bogus"`) is ignored with `readOk` true and the previous value stays, so the tool sends
+  the console name and compares the reply.
+- **Mirror sets INVERTSTYLE to Pan** (it was Tilt), and switches XInvW on **only with XWings** (YInvW with YWings).
+  With XWings None, Mirror leaves XInvW at No and mirrors nothing: the 4 fixtures cooked alike. XBlock does not
+  switch XInvB on. Transform None switches the inverts off. The read-back expects these values: INVERTSTYLE Pan after
+  `mirror` (unless `invert_style` is given; it is written after the transform), and XInvW / YInvW Yes when the line
+  has the X / Y wings. Mirror without wings gets a warning.
+- **Mirror applies at the cook, on the attributes INVERTSTYLE names.** On the second wing (253, 254 with XWings 2) the
+  cooked values are hard values with no step preset: absolute 100 − x (step presets 41.67 / 58.33 cooked 58.33 /
+  41.67; absolute 30 / 60 cooked 70 / 40) and relative −x (10 / −20 cooked −10 / 20). It is a value mirror, not a
+  step swap. A Tilt line under INVERTSTYLE Pan cooked the same on all 4 fixtures; with `invert_style: "tilt"` its
+  second wing cooked 70 / 40. The preset's lines keep their step presets and the Transform, and a cue calling the
+  preset stays in recipe (`ownNonCookedDataPresent: false`).
+- The read-back counts a Mirror line's mirrored values as its own. To be counted, a value must be on a member of the
+  line's group (matched by subfixture index; which members form the wing is not predicted) and on an attribute of
+  INVERTSTYLE (any attribute for All). It must have no preset in any step, and its hard values must be the mirrored
+  ones. When another line's own values match a value, that line keeps it. Evidence that the line cooked (its step
+  presets, and old presets left after an edit) still comes only from the unmirrored wing. Mirror is detected from the
+  line as read, before and after the edit, so a line mirrored through a MAtricks object (21.9056) is read the same
+  way.
+- A line with a MAtricks object (`matricks`) reads its columns and Transform from that object (21.9056 / 21.9058 read
+  XWings 2 and Mirror from MAtricks 9008). Whether a write on such a line reaches the shared object is not known, so
+  Transform, the columns and `invert_style` are refused on a line that has or gets a MAtricks. Set the columns on the
+  object with `gma3_configure_matricks`, or give the line its own columns without a MAtricks (that tool has no
+  Transform setting). A new MAtricks on a line in `set` drops those fields from the comparison.
+- A copy (lines 2+ in `create`, `add_line`) keeps line 1's Transform, invert style and columns unless it gives its
+  own. A copy of a Mirror line 1 is noted in the warnings (give `transform: "none"`). A change of wings, blocks or
+  groups moves the phase positions, so under Adaptive Measure / Width the derived measure and widths are not
+  compared.
+
 **Several lines.** A step holds one value source per attribute filter: a second `At Preset` on the same step replaces the first, and a
 second `At Shape` on the same group re-shapes the line instead of adding one. Line 1 is therefore built in Edit Recipe
 mode, and lines 2+ are copies of it: `Copy Preset P.N.1 At Preset P.N.k /NoConfirmation`, then `Assign Group / Shape /
@@ -369,7 +408,7 @@ No programmer and no Edit Recipe mode (no `exclusive`): every change is an `Assi
 preset's lines, then `Cook Preset P.N /MergeLowPriority`.
 
 - `set` changes line `line` (default 1): `selection`, `shape`, `matricks`, `speed_bpm`, `phase`, `measure`,
-  `speed_master`, `adaptive_measure`, `adaptive_width`, `name`,
+  `speed_master`, `adaptive_measure`, `adaptive_width`, `transform`, `invert_style`, `x`, `y`, `phase_y`, `name`,
   and `steps: [{preset? | sources?, curve?, trans?, width?}, ...]` (`{}` keeps a step; in `sources` a source not
   given is kept and `null` clears its preset with `set PRESET ""`, back to the shape's value). A new shape must have
   the line's value sources (Flyout and Flyout Inverted do). The line must be a PhaserRecipe of 2 steps whose values
@@ -502,6 +541,30 @@ read-back tells cooked values apart by their step presets.
     `null` on a hard source;
   - Sequence 9028 Cue 1 calling 21.9072 with one standard line, cooked merge low priority: `ownNonCookedDataPresent:
     false`, 8 / 8 cooked; output on fixture 251: Dimmer 10.3 % to 89.9 %, Pan 50 % ±10.0 % (10 % of the whole range).
+
+- Verified live for Transform and the line's own columns (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-15,
+  Group 9001 of 4 Daytona, the code run directly against the bridge), each read back matched:
+  - `create` 21.9074 with 2 lines: Pan 2.9042 / 2.9043 at 40 BPM with `transform: "mirror"`, `x: {wings: 2}`, then a
+    Tilt line (absolute 35 / 65, phase 90, 30 BPM) with `transform: "none"`. Read back: line 1 Mirror, INVERTSTYLE
+    Pan, XInvW Yes, XWings 2; line 2 None, XInvW No, XWings 2 (kept from the copy). 8 / 8 cooked: 251 / 252 Pan
+    integrate 2.9042 / 2.9043, 253 / 254 Pan cook 58.33 / 41.67 without a preset, Tilt the same on all 4. No stray
+    value is reported;
+  - `set` of `speed_bpm` 20 on line 1: matched, with no "values of the other lines changed". The old code reported
+    "4 value(s) of the other lines changed (first: 253 Pan ...)" on the same kind of line (probe preset 21.9073);
+  - on 21.9073 (a Tilt hard-value line): `set` with `transform: "mirror"` and `x: {wings: 2}` left Tilt unmirrored
+    (INVERTSTYLE Pan); `invert_style: "tilt"` then mirrored 253 / 254 (70 / 40). Both matched;
+  - Sequence 9029 Cue 1 calling 21.9074 with one standard line, cooked merge low priority: `ownNonCookedDataPresent:
+    false`, 8 / 8 cooked. Output while it played (16-bit Pan, sampled every 0.5 s for 6 s): Pan on 251 and 253 moved
+    in opposite directions. At 2.1 s 251 was at its maximum (38090) and 253 at its minimum (27612), and at 5.0 s the
+    reverse (27322 / 38131); the two sum to about 65,500 throughout. Tilt was the same on both.
+  - more `set`s on 21.9073, each matched: `transform: "mirror"` on a line already Mirror (INVERTSTYLE Tilt went
+    back to Pan, as expected); `transform: "none"` with style Tilt (inverts off, style kept at Tilt); a new shape
+    (Sine to Linear) and a new group (9002 and back) on a Mirror line with style Tilt (the console kept Transform,
+    style, XWings and XInvW).
+  - Not run on a console: `y` columns and `phase_y` beyond the write and read-back (Group 9001 is one row; phase Y on
+    grids is the migration bench's 5th series), the `pan_tilt` and `all` styles in the output, Mirror with blocks or
+    groups, on an odd group or with wings other than 2, a line mirrored through a MAtricks object edited by the tool
+    (21.9056 was read, not edited), and `add_line` behind a Mirror line 1 (fake bridge only).
 
 ## Live test
 

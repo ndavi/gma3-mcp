@@ -202,14 +202,15 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
   return lines;
 }
 
-interface GroupInfo {
+export interface GroupInfo {
   exists: boolean;
   members: Array<{ fixture: string; sfIndex: number }>;
   unreadable: number;
   truncated?: boolean;
 }
 
-async function readGroup(bridge: Gma3Bridge, n: number, t: number, cache: Map<number, GroupInfo>): Promise<GroupInfo> {
+/** A group's members (fixture and subfixture index), cached per call; exists false when the group is not in the show. */
+export async function readGroup(bridge: Gma3Bridge, n: number, t: number, cache: Map<number, GroupInfo>): Promise<GroupInfo> {
   const hit = cache.get(n);
   if (hit) return hit;
   let info: GroupInfo;

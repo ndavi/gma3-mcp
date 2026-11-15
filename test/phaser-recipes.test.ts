@@ -655,11 +655,14 @@ test("edit preview: checks and the plan, nothing sent", async () => {
 /** abs / rel: the source's own hard values (a number, "None" for a layer set to None, undefined for the shape's or the preset's). */
 type MSource = { attribute: string | null; preset: string | null; trans: number; width: number; abs?: number | "None"; rel?: number | "None" };
 type Flag = { value: boolean; own: boolean };
-type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][]; am?: Flag; aw?: Flag; master?: number | null };
+/** transform / style / cols: PHASERTRANSFORM, INVERTSTYLE and the line's own MAtricks columns (null: None). */
+type MLine = { group: number; shape: number; matricks: number | null; speedHz: number; measure: number; steps: MSource[][]; am?: Flag; aw?: Flag; master?: number | null; transform?: "Mirror" | "None"; style?: string; cols?: Record<string, number | null> };
+const MCOLS = ["XWINGS", "XBLOCK", "XGROUP", "YWINGS", "YBLOCK", "YGROUP", "PHASEFROMY", "PHASETOY"];
+const STYLE_ATTRS: Record<string, string[]> = { Pan: ["Pan"], Tilt: ["Tilt"], "P+T": ["Pan", "Tilt"], All: ["Dimmer", "Pan", "Tilt"] };
 const HOLDS: Record<string, string[]> = { "1.9020": ["Dimmer"], "1.9021": ["Dimmer"], "2.9020": ["Pan", "Tilt", "PanTiltDistance"], "2.9021": ["Pan", "Tilt", "PanTiltDistance"], "2.9022": ["Pan", "Tilt"] };
 const fromShape = (shape: number): MSource[][] => SHAPES[shape].map((st) => st.map((x) => ({ attribute: x.attribute, preset: null, trans: x.trans, width: x.width })));
 
-async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number; ignoreValues?: boolean } = {}) {
+async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number; ignoreValues?: boolean; ignoreTransform?: boolean } = {}) {
   const h = await startHarness(registerPhaserRecipeTools);
   const P = "Preset 21.9030";
   const c = { editing: false, pz: null as null | MLine, preset: initial.length > 0, lines: structuredClone(initial), pending: false, name: "", values: 0 };
@@ -702,6 +705,13 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
   const measureOf = (l: MLine) => (am(l) ? fixturesOf(l.group).length : l.measure);
   const widthOf = (l: MLine, step: number, s: number) => (aw(l) ? (step === 0 ? 100 / fixturesOf(l.group).length : 100 - 100 / fixturesOf(l.group).length) : l.steps[step][s].width);
   const flagRead = (f: Flag | undefined, shape: number) => (f?.own ? f.value : `<${shapeFlag(shape).value ? "Yes" : "No"}>`);
+  // Mirror (live 2026-11-15, 21.9055 / 21.9073): with XWings 2 the second half of the group runs the other way on the
+  // attributes of INVERTSTYLE (Pan by default); XInvW / YInvW read Yes with Mirror and the X / Y wings.
+  const mirrored = (l: MLine, fixture: string, attribute: string) => l.transform === "Mirror" && (l.cols?.XWINGS ?? 0) >= 2 && fixturesOf(l.group).indexOf(fixture) >= fixturesOf(l.group).length / 2 && STYLE_ATTRS[l.style ?? "Pan"].includes(attribute);
+  h.fake.on("group.read", (args) => {
+    const g = Number(String(args.ref).replace(/^Group /, ""));
+    return { ref: args.ref, truncated: false, items: fixturesOf(g).map((fixture, i) => ({ fixture, sfIndex: 500 + i })) };
+  });
   let step = 0;
   h.fake.onCommand((command) => {
     cmds.push(command);
@@ -784,6 +794,21 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
       if (!am(x.l)) x.l.measure = Number(value);
       return { value: measureOf(x.l).toFixed(2) };
     }
+    const prop = String(args.property);
+    if (MCOLS.includes(prop)) {
+      const col = (x.l.cols = { ...x.l.cols, [prop]: value === "None" ? null : Number(value) })[prop];
+      return { value: col === null ? "None" : prop.startsWith("PHASE") ? `${col}°` : String(col), readOk: true };
+    }
+    if (prop === "PHASERTRANSFORM") {
+      // Only the exact names are taken (other text is ignored, live 2026-11-15); Mirror sets INVERTSTYLE Pan.
+      if (!o.ignoreTransform && (value === "Mirror" || value === "None")) {
+        x.l.transform = value;
+        if (value === "Mirror") x.l.style = "Pan";
+      }
+      return { value: x.l.transform ?? "None", readOk: true };
+    }
+    // A text INVERTSTYLE does not know is ignored, the previous value stays (live 2026-11-15).
+    if (prop === "INVERTSTYLE") return { value: (x.l.style = Object.hasOwn(STYLE_ATTRS, value) ? value : (x.l.style ?? "Pan")), readOk: true };
     return { value: Number(value).toFixed(2) };
   });
   const miss = (l: MLine) => l.steps.some((st) => st.some((x) => x.preset && x.attribute && !HOLDS[x.preset]?.includes(x.attribute)));
@@ -795,7 +820,7 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
     if (ref === "ShowData.Masters.Speed") return list(MASTER_NAMES.map((name, i) => ({ class: "MasterSpeed", index: i + 1, name, fields: { Name: name } })));
     if (ref === P) {
       if (!c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
-      return list(c.lines.map((l, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: l.group, addr: `14.14.1.6.${l.group}` }, MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: 0, PHASETOX: 0, MEASURE: `<< ${measureOf(l).toFixed(2)}> 4.00>`, PLAYBACKADAPTIVEMEASURE: flagRead(l.am, l.shape), PLAYBACKADAPTIVEWIDTH: flagRead(l.aw, l.shape), SPEEDMASTEROVERRIDE: l.master ? MASTER_NAMES[l.master - 1] : "", FailedCookedPart: miss(l) ? "IntegratedPresetMiss" : "None" } })));
+      return list(c.lines.map((l, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: l.group, addr: `14.14.1.6.${l.group}` }, MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: 0, PHASETOX: 0, MEASURE: `<< ${measureOf(l).toFixed(2)}> 4.00>`, PLAYBACKADAPTIVEMEASURE: flagRead(l.am, l.shape), PLAYBACKADAPTIVEWIDTH: flagRead(l.aw, l.shape), SPEEDMASTEROVERRIDE: l.master ? MASTER_NAMES[l.master - 1] : "", FailedCookedPart: miss(l) ? "IntegratedPresetMiss" : "None", PHASERTRANSFORM: l.transform ?? "None", INVERTSTYLE: l.style ?? "Pan", XINVW: l.transform === "Mirror" && l.cols?.XWINGS != null, YINVW: l.transform === "Mirror" && l.cols?.YWINGS != null, ...Object.fromEntries(MCOLS.map((p) => [p, l.cols?.[p] ?? "None"])) } })));
     }
     let m = ref.match(/^Preset 21\.9030\.(\d+)\.1$/);
     if (m) return list(c.lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
@@ -813,11 +838,19 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
       for (const fixture of fixturesOf(l.group))
         l.steps[0].forEach((_, s) => {
           const srcs = [l.steps[0][s], l.steps[1][s]];
-          const attribute = srcs[0].attribute ?? "Dimmer";
+          // A source without an attribute cooks the step preset's first attribute (Dimmer for 1.9020, Pan for 2.9022).
+          const attribute = srcs[0].attribute ?? (srcs[0].preset ? HOLDS[srcs[0].preset]?.[0] : undefined) ?? "Dimmer";
           if (srcs.some((x) => x.preset && !HOLDS[x.preset]?.includes(attribute))) return; // IntegratedPresetMiss: nothing cooks
           // A hard value cooks as the step's absolute / relative, a little off as float32 (-20 reads -19.999998807907).
           const f32 = (v: number | "None" | undefined) => (typeof v === "number" ? Math.fround(v) : undefined);
-          const steps = srcs.map((x, n) => ({ step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0, integrated: x.preset ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null, ...(x.preset ? {} : { absolute: f32(x.abs), relative: f32(x.rel) }) }));
+          // The mirrored wing cooks hard values without the step preset: absolute 100 - x, relative -x (a preset's 40 reads 60).
+          const mir = mirrored(l, fixture, attribute);
+          const mirror = (v: number | "None" | undefined) => (typeof v === "number" ? (x_: "a" | "r") => (x_ === "a" ? 100 - v : -v) : undefined);
+          const steps = srcs.map((x, n) => ({
+            step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0,
+            integrated: x.preset && !mir ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null,
+            ...(x.preset ? (mir ? { absolute: f32(60) } : {}) : mir ? { absolute: f32(mirror(x.abs)?.("a")), relative: f32(mirror(x.rel)?.("r")) } : { absolute: f32(x.abs), relative: f32(x.rel) }),
+          }));
           // The cooked speed master is 0-based (master 2 reads 1); absent without one.
           out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: measureOf(l) * 100, ...(l.master ? { speedMaster: l.master - 1 } : {}), steps });
         });
@@ -1400,5 +1433,132 @@ test("set / add_line, hard values: back to the shape's value is refused; a prese
     assert.match(noValues.text, /holds hard values on line 1 \(the copy keeps them\)/);
   } finally {
     await h.close();
+  }
+});
+
+// ---- Transform (Mirror) and the line's own MAtricks columns, against the fake's model of the bench (live 2026-11-15,
+// Rescue 21.9055 / 21.9073, group 9001 = 251-254): a Lua set of PHASERTRANSFORM / XWINGS / PHASEFROMY reads back
+// ("Mirror", "2", "0°"); Mirror sets INVERTSTYLE Pan and XInvW with XWings; on the second wing the cooked values are
+// hard, absolute 100 - x / relative -x, without the step preset, on INVERTSTYLE's attributes only.
+const MIRROR_LINE = (): MLine => {
+  const steps = fromShape(1);
+  steps[0][0].preset = "2.9022";
+  steps[1][0].preset = "2.9020";
+  return { group: 9002, shape: 1, matricks: null, speedHz: 0.5, measure: 1, steps, transform: "Mirror", style: "Pan", cols: { XWINGS: 2 } };
+};
+const MIRROR = { action: "create", preset: "21.9030", exclusive: true, selection: 9002, shape: 1, steps: [{ preset: "2.9022" }, { preset: "2.9020" }], transform: "mirror", x: { wings: 2 }, phase_y: { from: 0, to: 90 } };
+
+test("create, Mirror: columns, phase Y and Transform set; the mirrored wing's hard values are the line's own; Mirror without wings is warned about", async () => {
+  const { h, c } = await flySetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", MIRROR);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(setsOf(h), ["Preset 21.9030.1 XWINGS=2", "Preset 21.9030.1 PHASEFROMY=0", "Preset 21.9030.1 PHASETOY=90", "Preset 21.9030.1 PHASERTRANSFORM=Mirror"]);
+    assert.deepEqual(c.lines[0].cols, { XWINGS: 2, PHASEFROMY: 0, PHASETOY: 90 });
+    assert.equal(c.lines[0].style, "Pan");
+    // 102 is on the mirrored wing: Pan without the step preset (the fake cooks 60 = 100 - 40).
+    const rows = (await h.fake.handlerFor("preset.read")!({ ref: "Preset 21.9030" })) as { rows: Array<{ fixture: string; steps: Array<{ integrated: unknown; absolute?: number }> }> };
+    assert.deepEqual(rows.rows.map((r) => [r.fixture, r.steps[0].integrated === null]), [["101", false], ["102", true]]);
+    assert.ok(!(result.warnings ?? []).some((w: string) => /without X or Y wings/.test(w)));
+  } finally {
+    await h.close();
+  }
+  const noWings = await flySetup();
+  try {
+    const { result } = await noWings.h.callJson("gma3_edit_phaser_recipe", { ...MIRROR, x: undefined, phase_y: undefined, preview: true });
+    assert.match(result.warnings.join(" "), /Transform Mirror without X or Y wings .* nothing is mirrored/);
+  } finally {
+    await noWings.h.close();
+  }
+});
+
+test("create, Mirror: a Transform the console did not take, and a copy that keeps line 1's Mirror, are reported", async () => {
+  const { h } = await flySetup([], { ignoreTransform: true });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", MIRROR);
+    assert.equal(isError, true);
+    assert.match(result.failure.error, /PHASERTRANSFORM reads "None" after writing Mirror/);
+    assert.match(result.verification.detail, /line 1 transform reads None, Mirror expected/);
+  } finally {
+    await h.close();
+  }
+  const two = await flySetup();
+  try {
+    const lines = [{ selection: 9002, steps: MIRROR.steps, transform: "mirror", x: { wings: 2 } }, { selection: 9003, steps: [{ preset: "1.9020" }, { preset: "1.9021" }] }];
+    const { result, isError } = await two.h.callJson("gma3_edit_phaser_recipe", { action: "create", preset: "21.9030", exclusive: true, lines });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.match(result.warnings.join(" "), /line 2 is a copy of line 1 and keeps its Transform Mirror/);
+    assert.equal(two.c.lines[1].transform, "Mirror");
+  } finally {
+    await two.h.close();
+  }
+});
+
+test("set on a Mirror line: speed changes without a false 'other lines changed'; Transform none switches XInvW off; Tilt mirrors only with invert_style tilt", async () => {
+  const { h, c } = await flySetup([MIRROR_LINE(), PRESET_LINE()]);
+  try {
+    let r = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_bpm: 40 });
+    assert.equal(r.isError, false, JSON.stringify(r.result, null, 1));
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    r = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", transform: "none", x: { wings: null } });
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.equal(c.lines[0].transform, "None");
+    assert.equal(r.result.lines[0].xInvW, false);
+    assert.deepEqual(r.result.lines[0].columns.XWINGS, null);
+  } finally {
+    await h.close();
+  }
+  const tilt = HV_LINE();
+  Object.assign(tilt, { transform: "Mirror", style: "Pan", cols: { XWINGS: 2 } });
+  const t = await flySetup([tilt]);
+  try {
+    // INVERTSTYLE Pan: the Tilt line is not mirrored (both fixtures cook -20 / 20); tilt mirrors 102 (20 / -20).
+    let r = await t.h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", speed_bpm: 45 });
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    r = await t.h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", invert_style: "tilt", speed_bpm: 50 });
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.equal(t.c.lines[0].style, "Tilt");
+    assert.equal(r.result.lines[0].invertStyle, "Tilt");
+  } finally {
+    await t.h.close();
+  }
+});
+
+test("set / add_line on a Mirror line: new step presets are evidenced by the unmirrored wing; add_line keeps line 1's Mirror (noted)", async () => {
+  const { h, c } = await flySetup([MIRROR_LINE()]);
+  try {
+    let r = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ preset: "2.9021" }, {}] });
+    assert.equal(r.isError, false, JSON.stringify(r.result, null, 1));
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    r = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9030", selection: 9003, steps: [{ preset: "1.9020" }, { preset: "1.9021" }] });
+    assert.equal(r.result.verification.status, "matched", JSON.stringify(r.result.verification));
+    assert.match(r.result.warnings.join(" "), /line 2 is a copy of line 1 and keeps its Transform Mirror/);
+    assert.equal(c.lines[1].transform, "Mirror");
+  } finally {
+    await h.close();
+  }
+});
+
+test("Transform and columns: refused before anything is sent", async () => {
+  for (const [start, args, re] of [
+    [[], { ...MIRROR, matricks: 9000 }, /has MAtricks 9000: a line with a MAtricks object reads its columns/],
+    [[], { ...MIRROR, transform: "Mirror" }, /transform[\s\S]*mirror/],
+    [[], { ...MIRROR, x: { width: 2 } }, /unrecognized[\s\S]*width/i],
+    [[], { ...MIRROR, x: { wings: 1.5 } }, /x\.wings must be an integer/],
+    [[], { ...MIRROR, invert_style: "P+T" }, /invert_style/],
+    [[FLY_LINE()], { action: "set", preset: "21.9030", x: { wings: 2 } }, /line 1 has MAtricks 9000/],
+  ] as const) {
+    const { h, cmds } = await flySetup(start as unknown as MLine[]);
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", args as Record<string, unknown>);
+      assert.equal(isError, true, text);
+      assert.match(text, re as RegExp);
+      assert.deepEqual(cmds, []);
+      assert.ok(!h.fake.requests.some((x) => x.op === "set"));
+    } finally {
+      await h.close();
+    }
   }
 });

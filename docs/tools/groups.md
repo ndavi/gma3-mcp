@@ -190,8 +190,11 @@ Apply a MAtricks to a selection with `Recall MAtricks <n>` (`Call MAtricks` answ
 - **Not verifiable per fixture: MAtricks timing.** Fade, delay, phase and speed distributions are not baked into
   programmer values or into a stored cue's channel data, so the tools verify the MAtricks object's settings; that a
   delay reaches the centre first follows from the transformed positions, not from a measured fade.
-- Not qualified: the invert flags (`XInv`, `XInvW`, `InvertX`, ...) did not change a value distribution in the probe
-  and are not modelled; group-level MAtricks (the MAtricks properties a group object also has) are not touched;
+- Not qualified: the invert flags (`XInv`, `XInvW`, `InvertX`, ...) on their own did not change a value distribution in
+  the probe, and they are not modelled. Their absence of effect holds for the flags alone, `InvertStyle` included,
+  and on phasers too. It does not hold for `PhaserTransform` Mirror: with XWings, Mirror switches XInvW on and runs
+  the second wing's phaser values the other way, on the attributes `InvertStyle` names (verified 2026-11-15; see
+  [recipes](recipes.md), Transform (Mirror)). `gma3_configure_matricks` has no Transform setting (it only resets PhaserTransform to None on a new object); group-level MAtricks (the MAtricks properties a group object also has) are not touched;
   `Width`, `Shift` and `Shuffle` are written and read back but their distribution was not measured.
 - Not covered: groups and MAtricks of other data pools (the tools address the current one by number).
 - Not verified live: the name check (`children` of `DataPool.Groups` and `DataPool.MAtricks` with `No` and `Name`),
