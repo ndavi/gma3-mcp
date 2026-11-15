@@ -82,17 +82,19 @@ test("set replies are compared per property", () => {
 interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterNo?: number; generator?: number; props?: Record<string, string> }
 /** A filter as the console reads it: its attribute mask, rules and layer flags. */
 interface FFilter { name: string; attrs: string[]; rules?: Array<{ cls: string; applyToFixtures?: boolean; invert?: boolean }>; layers?: Partial<Record<"ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING", boolean>> }
-interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean }
+interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean; stepCount?: number; phase?: number }
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
 class Console {
   groups = new Map<number, Array<{ fixture: string; sfIndex: number; x?: number; y?: number; z?: number }>>([[908, [{ fixture: "401", sfIndex: 63 }, { fixture: "402", sfIndex: 64 }]], [909, []]]);
-  presets = new Map<string, { addr: string; attrs: string[]; value: number }>([["4.4", { addr: "14.14.1.5.4.4", attrs: ["ColorRGB_R"], value: 100 }], ["1.11", { addr: "14.14.1.5.1.11", attrs: ["Dimmer"], value: 100 }], ["21.5", { addr: "14.14.1.5.21.5", attrs: ["Dimmer", "ColorRGB_R"], value: 100 }]]);
+  presets = new Map<string, { addr: string; attrs: string[]; value: number; phaser?: Array<{ fixture: string; sfIndex: number; phase: number }> }>([["4.4", { addr: "14.14.1.5.4.4", attrs: ["ColorRGB_R"], value: 100 }], ["1.11", { addr: "14.14.1.5.1.11", attrs: ["Dimmer"], value: 100 }], ["21.5", { addr: "14.14.1.5.21.5", attrs: ["Dimmer", "ColorRGB_R"], value: 100 }]]);
   matricks = new Set([12]);
   /** MAtricks objects with properties (display text, as the objects op reads them). */
   matricksObjects = new Map<number, Record<string, string>>();
   /** A console whose cook ignores the lines' MAtricks select. */
   ignoreSelect = false;
+  /** The phase the cook gives a subfixture (a line's own phase range); otherwise the phaser preset's. */
+  cookPhase = new Map<number, number>();
   /** Filter 7: Dimmer only (made from a preset, APPLYTOFIXTURES No). */
   filters = new Map<number, FFilter>([[7, { name: "F DIM", attrs: ["Dimmer"] }]]);
   /** A console whose cook ignores the lines' filters. */
@@ -164,7 +166,10 @@ class Console {
       const grid = [...(this.groups.get(l.group) ?? [])].map((m, i) => ({ m, at: m.x ?? i })).sort((a, b) => a.at - b.at).map((e) => e.m);
       const members = grid.filter((_, i) => !(x >= 1) || (groups ? Math.floor(i / block) % groups : Math.floor(i / block)) === x - 1);
       const f = l.filterNo !== undefined && !this.ignoreFilter ? this.filters.get(l.filterNo) : undefined;
-      for (const m of members) for (const a of p.attrs) if (!f || f.attrs.includes(a)) out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true });
+      for (const m of members) for (const a of p.attrs) if (!f || f.attrs.includes(a)) {
+        const ph = p.phaser?.find((x) => x.sfIndex === m.sfIndex);
+        out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true, ...(p.phaser ? { stepCount: 2, phase: this.cookPhase.get(m.sfIndex) ?? ph?.phase ?? 0 } : {}) });
+      }
     }
     return out;
   }
@@ -259,6 +264,8 @@ class Console {
         const typesFor = (args.typesFor as number[] | undefined) ?? [];
         return { ref, class: "Preset", addr: p.addr, pool: { no: pool }, no, rows: p.attrs.map((a) => ({ fixture: "T1", sfIndex: 0, attribute: a, mode: "global", fixtureType: "T1", value: p.value })), dependencies: [], types: Object.fromEntries(typesFor.map((sf) => [String(sf), "T1"])) };
       }
+      // A phaser preset stores selective rows per fixture, each with its 2 steps and phase.
+      if (p.phaser) return { ref, class: "Preset", addr: p.addr, pool: { no: pool }, no, rows: p.phaser.flatMap((x) => p.attrs.map((a) => ({ fixture: x.fixture, sfIndex: x.sfIndex, attribute: a, mode: "selective", value: p.value, stepCount: 2, phase: x.phase }))), dependencies: [], types: {} };
       return { ref, class: "Preset", addr: p.addr, pool: { no: pool }, no, rows: p.attrs.map((a) => ({ fixture: "Generic 1", sfIndex: 0, attribute: a, mode: "universal", value: p.value })), dependencies: [], types: {} };
     });
     h.fake.on("fixtureAttributes", (args) => {
@@ -977,6 +984,64 @@ test("a line with its own select and a MAtricks object, or an unverified setting
   assert.equal(read.result.lines[2].notPredicted, undefined);
   assert.equal(read.result.lines[2].selected, undefined);
   assert.equal(read.result.expectedPairs, 4);
+});
+
+// Phaser presets on Group 9001 as the bench holds them: 21.9032 spreads 0 / 120 / 240 / 359.9 (Chase), 21.9072 has no phase.
+const phaser = (phases: number[]) => G9001.map((m) => ({ fixture: m.fixture, sfIndex: m.sfIndex, phase: phases[m.x!] }));
+
+test("a select on a line calling a phaser preset that spreads its phase: the warning says the kept fixtures keep their phases, and the cooked phases are checked", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.presets.set("21.9032", { addr: "14.14.1.5.21.9032", attrs: ["Dimmer"], value: 100, phaser: phaser([0, 119.9666, 239.9333, 359.9]) });
+  con.matricksObjects.set(9009, { X: "1", XGroup: "2" });
+  con.cue(9060, 1);
+  const { result } = await store({ mode: "append", cook: "merge_low_priority", cues: [{ cue: 1, lines: [line(9001, "21.9032", { matricks: 9009 })] }] });
+  assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched"], JSON.stringify(result.cook));
+  const w = result.warnings.find((x: string) => /does not narrow the phase spread/.test(x));
+  assert.match(w, /keeps 251, 253 of the 4 fixtures of Group 9001, and it does not narrow the phase spread: Preset 21\.9032 spreads its phase over its own line's group, and the kept fixtures keep the phases they have there: 251 0°, 253 239\.93°/);
+  const read = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 1 } });
+  assert.match(read.result.lines[0].phaseNote, /251 0°, 253 239\.93°/);
+  // A cook that spreads the phase over the kept fixtures only (253 at 180) is a mismatch.
+  con.cookPhase.set(526, 180);
+  const c = await h.callJson("gma3_cook_recipes", { target: { sequence: 9060, cue: 1 }, mode: "merge_low_priority" });
+  assert.equal(c.result.verification.status, "mismatched");
+  assert.match(c.result.verification.detail, /cooked phases other than predicted: 253 Dimmer 180° \(239\.93° predicted\)/);
+});
+
+test("a select with the line's own phase range on a phaser: spread over the whole group's positions, one block shares one phase", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.presets.set("21.9072", { addr: "14.14.1.5.21.9072", attrs: ["Dimmer", "Pan"], value: 50, phaser: phaser([0, 0, 0, 0]) });
+  con.presets.set("21.9032", { addr: "14.14.1.5.21.9032", attrs: ["Dimmer"], value: 100, phaser: phaser([0, 120, 240, 359.9]) });
+  for (const c of [1, 2, 3, 4]) con.cue(9060, c);
+  // Sequence 9033 cues 9 and 6 on the bench: 253 and 254 at 180 (2 blocks over 0-360), 253 alone at 180 (4 positions).
+  for (const sf of [526, 530]) con.cookPhase.set(sf, 180);
+  const { result } = await store({ mode: "append", cook: "merge_low_priority", cues: [
+    { cue: 1, lines: [line(9001, "21.9072", { x: { blocks: 2, select: 2, phase: { from: 0, to: 360 } } })] },
+    { cue: 2, lines: [line(9001, "21.9072", { x: { select: 3, phase: { from: 0, to: 360 } } })] },
+    // A static preset: no phase to speak of. A phaser preset with phases of its own and a range on the line: not predicted.
+    { cue: 3, lines: [line(9001, "1.11", { x: { select: 1, phase: { from: 0, to: 360 } } })] },
+    { cue: 4, lines: [line(9001, "21.9032", { x: { select: 1, phase: { from: 0, to: 90 } } })] },
+  ] });
+  assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched", "matched", "matched", "matched"], JSON.stringify(result.cook));
+  const notes = (cue: number) => result.warnings.filter((x: string) => x.includes(`Cue ${cue} Part 0`) && /phase spread/.test(x));
+  assert.match(notes(1)[0], /keeps 253, 254 .*the line's phase range \(X 0° to 360°\) is spread over the 2 X positions of the whole group in selection order, not over the kept fixtures; the kept fixtures share position 2 \(one block, group or wing pair\), so they all get 180°/);
+  assert.match(notes(2)[0], /keeps 253 .*spread over the 4 X positions .*; the kept fixture is at position 3 and gets 180°/);
+  assert.deepEqual(notes(3), []);
+  assert.match(notes(4)[0], /the phases were not predicted \(Preset 21\.9032 has phases of its own; how they add up with the line's is not verified\)/);
+  // A cook that spreads over the kept fixtures (253 at 0, 254 at 180) is a mismatch.
+  con.cookPhase.set(526, 0);
+  const c = await h.callJson("gma3_cook_recipes", { target: { sequence: 9060, cue: 1 }, mode: "merge_low_priority" });
+  assert.equal(c.result.verification.status, "mismatched");
+  assert.match(c.result.verification.detail, /253 Dimmer 0° \(180° predicted\), 253 Pan 0° \(180° predicted\)/);
+});
+
+test("a phaser line with a MAtricks select and a phase range gets the phase note (21.9048 on the bench: one block at 179.95)", async () => {
+  // Group 9005 of 12, stored 2..12 then 1 (x 0); MAtricks 9004: XBlock 4, X 2; the line's phase 0 to 359.9.
+  con.groups.set(9005, [...Array.from({ length: 11 }, (_, i) => ({ fixture: String(i + 2), sfIndex: i + 2, x: i + 1, y: 0, z: 0 })), { fixture: "1", sfIndex: 1, x: 0, y: 0, z: 0 }]);
+  con.matricksObjects.set(9004, { X: "2", XBlock: "4" });
+  con.targets.set("Preset 21.9048", { lines: [{ cls: "PhaserRecipe", group: 9005, preset: null, matricks: 9004, enabled: true, name: "", mode: "Strict", props: { PhaseFromX: "0", PhaseToX: "359.9" } }], rows: [] });
+  const read = await h.callJson("gma3_recipes", { target: { preset: "21.9048" } });
+  assert.match(read.result.lines[0].notPredicted, /PhaserRecipe lines are listed and kept/);
+  assert.match(read.result.lines[0].phaseNote, /keeps 5, 6, 7, 8 of the 12 fixtures of Group 9005, .*the line's phase range \(X 0° to 359\.9°\) is spread over the 3 X positions of the whole group in selection order; the kept fixtures share position 2, so they all get 179\.95°/);
 });
 
 test("axisSelection: a set X / Y / Z column, None and 0 select nothing, an inherited one counts", () => {

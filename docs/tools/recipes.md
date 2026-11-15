@@ -88,6 +88,8 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
     it comes from: `X 1, XGroup 2 (MAtricks 9009 "...")`), when an X select keeps part of the group;
   - `notPredicted` where coverage is not modelled (phaser lines, a filter of another shape, a MAtricks select outside
     the verified rules);
+  - `phaseNote` when a MAtricks select meets a phase spread ([below](#phase-and-a-matricks-select)): what the console
+    does with the phase, and the phases the kept fixtures get when they are predicted;
 - `coverage`: per fixture the attributes the target holds `cooked` (from recipes) and `uncooked` (stored directly);
 - `expectedPairs`, the number of fixture/attribute pairs the lines should cook;
 - `dependencyNotes`.
@@ -149,6 +151,28 @@ with a select; XWings that do not divide the group; a grid that is not one gap-f
 inactive MAtricks object; a line with its own select and a MAtricks object (or the object and its own columns, one of
 them with a select); a generator line with a select; a setting that cannot be read. Without a select, wings, blocks and
 groups only spread timing and phase: every member gets values.
+
+### Phase and a MAtricks select
+
+A select does not narrow the phase spread. Measured on onPC 2.5.1:
+
+- a phase range on the line itself (its own `PhaseFromX` / `PhaseToX`, its MAtricks object's, or a phaser line's
+  phase) is spread over the X positions of the **whole group** in selection order. The kept fixtures get the phase of
+  their position, and the fixtures of one position (a block, a group, a wing pair) share it: XBlock 2 with X 2 and
+  0 → 360 gives 253 and 254 both 180°; X 3 alone gives 253 180° (of 0 / 90 / 180 / 270); XGroup 2 with X 2 gives 252 and
+  254 both 180°;
+- a line without a range of its own that calls a phaser preset keeps the phases the preset spreads on its own line's
+  group: Group 9001 with XGroup 2, X 1 on 21.9032 (0 / 120 / 240 / 359.9) cooks 251 at 0° and 253 at 239.93°.
+
+So a standard line whose select keeps part of its group and whose values are a phaser gets a `phaseNote` (a warning in
+`gma3_cook_recipes` and in `gma3_store_recipe_cues`' cook) when the line has a phase range or the preset's phases differ
+across the group. It names the kept fixtures and says what the console does; in the two measured cases it gives the
+phases, and the cook's read-back then checks each kept fixture's cooked phase (`cooked phases other than predicted`).
+The phases are not predicted (the note says why) with a Y or Z range, more groups than positions, RelativePhase off, or
+a preset that has phases of its own under a range on the line (how they add up is not verified). A phaser line (in a
+preset or a cue) with a select and a phase range gets the same note in `gma3_recipes` and `gma3_cook_recipes`, with the
+shared phase; its coverage is not predicted, so that phase is not checked after a cook. A line whose select is itself
+not predicted gets no note.
 
 ## `gma3_store_recipe_cues`
 
@@ -644,6 +668,20 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   `ownNonCookedDataPresent: false`); played back, the output of 251 and 253 moved (251: Dimmer 7221–58939, Pan
   26440–39096 of 65535 over 4 s) while 252 and 254 stayed at Dimmer 0 and Pan 32768. XWings with a count that is not
   a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and multi-row grids were not run with a select.
+- Verified live for the phase note (same bench and day): Sequence 9033 cues 2, 6, 8, 9 and 10 cooked the phases the note
+  gives (251 0° / 253 239.93°; 253 180°; 253 239.93° / 254 359.9°; 253 and 254 180°; 252 and 254 180°), and the cook of
+  Sequence 9033 read back `matched` with the phase check on. `gma3_recipes` on the phaser presets 21.9048, 21.9049 and
+  21.9050 (Group 9005, MAtricks 9004, 9005, 9001, phase 0 → 359.9) gave 179.95°, 359.9° and 0°, the phases they hold.
+  Sequence 9035, built by `gma3_store_recipe_cues` and cooked (`matched`, `ownNonCookedDataPresent: false` on both
+  cues), with the warning on each:
+  - cue 1, Group 9001 + MAtricks 9009 + 21.9032 (a 10 s Chase): in the output, 251 lit from 0 to 2.5 s and again at
+    10.1 s, 253 from 6.3 to 8.8 s (240° later, within the 0.65 s sampling), 252 and 254 stayed at 0;
+  - cue 2, a reference line Group 9008 (251, 252) + 21.9072, and Group 9001 with its own XBlock 2, X 2 and 0 → 360 +
+    21.9072: the Dimmer of 253 and 254 moved together, opposite to 251 and 252 (minimum at 1.6 s against maximum, over
+    4 s), i.e. both at 180°.
+
+  Not run: a Y or Z phase range with a select, wings with a phase range on a cue line, a preset with phases of its own
+  under a range on the line.
 - Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not. How a column reads in the
   display role while a MAtricks reference supplies it (`<2>`) is not known (the typed read gives None).
 - Not covered:

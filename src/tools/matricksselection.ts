@@ -217,3 +217,42 @@ export function effectiveSettings(own: SelectionSettings | undefined, object: { 
   }
   return { settings: object.info.settings, source: `MAtricks ${object.no}${object.info.name ? ` "${object.info.name}"` : ""}` };
 }
+
+// ---------------------------------------------------------------------------
+// Phase and select (measured on onPC 2.5.1, 2026-11-15)
+// ---------------------------------------------------------------------------
+//
+// A select does not narrow the phase spread. A phase range on the line itself (its own PhaseFromX / PhaseToX, its
+// MAtricks object's, or a phaser line's phase) is spread over the X positions of the whole group, in selection order:
+// the kept fixtures get the phase of their position, and the fixtures of one position (a block, a group, a wing pair)
+// share it (Sequence 9033 cues 6, 9, 10; presets 21.9048-21.9050). A line without a range of its own that calls a phaser
+// preset keeps the phases the preset spreads on its own line's group (Sequence 9033 cues 2 and 8).
+
+/** The X phase range of settings (from and to set and different), or null. */
+export function phaseRangeOf(s: SelectionSettings | null | undefined): { from: number; to: number } | null {
+  const x = s?.axes.X;
+  return x && x.phaseFrom !== null && x.phaseTo !== null && x.phaseFrom !== x.phaseTo ? { from: x.phaseFrom, to: x.phaseTo } : null;
+}
+
+/** Whether a Y or Z phase range is set (not modelled with a select). */
+export function hasOtherPhaseRange(s: SelectionSettings | null | undefined): boolean {
+  return !!s && (["Y", "Z"] as const).some((a) => { const x = s.axes[a]; return x.phaseFrom !== null && x.phaseTo !== null && x.phaseFrom !== x.phaseTo; });
+}
+
+/**
+ * The phase of an X position when a range is spread over `positions` positions: a range of exactly 360 excludes its
+ * end (0 / 90 / 180 / 270 on 4), any other keeps both ends (0 / 179.95 / 359.9 on 3).
+ */
+export function phaseAt(range: { from: number; to: number }, position: number, positions: number): number {
+  if (positions <= 1) return range.from;
+  const span = range.to - range.from;
+  return range.from + (position * span) / (Math.abs(Math.abs(span) - 360) < 1e-9 ? positions : positions - 1);
+}
+
+/** Two phases in degrees are the same angle (within 0.05°). */
+export function samePhase(a: number, b: number): boolean {
+  const d = (((a - b) % 360) + 360) % 360;
+  return d < 0.05 || d > 359.95;
+}
+
+export const fmtPhase = (p: number) => `${Math.round(p * 100) / 100}°`;

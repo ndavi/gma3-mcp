@@ -53,7 +53,7 @@ import { cueRef, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
 import { readFilter, type FilterInfo } from "./filters.js";
 import { generatorAttributes, readGenerator, type GeneratorInfo } from "./generators.js";
-import { describeSelection, effectiveSettings, hasSelectionData, parseSelectionSettings, readMatricksSettings, selectMembers, selectionProps, type MatricksObjectInfo, type SelectionSettings } from "./matricksselection.js";
+import { describeSelection, effectiveSettings, fmtPhase, hasOtherPhaseRange, hasSelectionData, phaseAt, phaseRangeOf, samePhase, parseSelectionSettings, readMatricksSettings, selectMembers, selectionProps, type MatricksObjectInfo, type MemberSelection, type SelectionSettings } from "./matricksselection.js";
 import { MAX_BATCH_ITEMS, batchOptionShape, duplicates, hasUncertainStep, itemOk, runBatch } from "../batch.js";
 import { HeldLock } from "../mutations.js";
 import {
@@ -285,6 +285,8 @@ export interface LineReport extends Line {
   selected?: string[];
   /** The select that keeps them and where it comes from ("X 1, XGroup 2 (MAtricks 9009)"). */
   matricksSelect?: string;
+  /** A select on a line with a phase spread: what the console does with the phase (and the phases, when predicted). */
+  phaseNote?: string;
   /** The attributes the line's filter passes (when the filter was read and is modelled). */
   filterAttributes?: string[];
   /** The attributes the line's generator cooks (one per channel), when it was read. */
@@ -302,6 +304,8 @@ interface Expected {
   unknownReach: boolean;
   /** "sfIndex|attribute" pairs a line's preset holds but its filter keeps out: they must not be cooked by that line. */
   excluded?: Set<string>;
+  /** "sfIndex|attribute" -> the phase (degrees) the cook should give, where a select meets a phase spread. */
+  phases?: Map<string, number>;
 }
 
 /**
@@ -311,7 +315,7 @@ interface Expected {
  * the filter has the modelled shape (readFilter); otherwise it is not predicted. Phaser recipe lines are not predicted.
  */
 export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map(), generators: Map<number, GeneratorInfo> = new Map(), matricks: Map<number, MatricksObjectInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
-  const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set() };
+  const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set(), phases: new Map() };
   const dependencyNotes: string[] = [];
   const reports: LineReport[] = [];
   for (const l of lines) {
@@ -340,9 +344,17 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       // Fixtures the read could not identify are reached too: nothing about the target is known to be safe.
       if (g.unreadable || g.truncated) { expected.unknownReach = true; expected.unpredicted++; rep.notPredicted = `Group ${l.selection.group} was not read completely; its reach is unknown`; }
     }
-    if (l.class !== "StandardRecipe") { unpredictable(`${l.class} lines are listed and kept, not modelled by this release`, g); continue; }
+    if (l.class !== "StandardRecipe") {
+      unpredictable(`${l.class} lines are listed and kept, not modelled by this release`, g);
+      if (l.class === "PhaserRecipe" && g?.exists && g.members.length && (l.columns || l.matricks?.no !== undefined)) {
+        const note = await phaserLineNote(bridge, l, g, t, matricks);
+        if (note) rep.phaseNote = note;
+      }
+      continue;
+    }
     // An X select (the line's own columns or its MAtricks object) gives values to part of the group (matricksselection.ts).
     let kept: Set<number> | null = null;
+    let selected: { sel: Extract<MemberSelection<GroupInfo["members"][number]>, { kind: "subset" }>; settings: SelectionSettings } | null = null;
     if (g?.exists && g.members.length && (l.columns || l.matricks)) {
       const obj = l.matricks?.no !== undefined ? { no: l.matricks.no, info: await readMatricksSettings(bridge, l.matricks.no, t, matricks) } : null;
       if (l.matricks && l.matricks.no === undefined) { unpredictable("the line's MAtricks object could not be identified; coverage not predicted", g); continue; }
@@ -353,6 +365,7 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       if (sel.kind === "subset") {
         if (l.generator) { unpredictable(`a generator line with a MAtricks select (${describeSelection(eff.settings!)}, ${eff.source}) is not verified; coverage not predicted`, g); continue; }
         kept = new Set(sel.kept.map((m) => m.sfIndex));
+        selected = { sel, settings: eff.settings! };
         rep.selected = sel.kept.map((m) => m.fixture);
         rep.matricksSelect = `${describeSelection(eff.settings!)} (${eff.source})`;
         if (!sel.kept.length) rep.problems.push(`the MAtricks select (${rep.matricksSelect}) keeps none of the ${g.members.length} fixtures of Group ${l.selection?.group}: the line cooks nothing`);
@@ -439,8 +452,74 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       }
     }
     if (pass && passed === 0 && p.rows.length && (!kept || kept.size)) rep.problems.push(`the filter (${l.filter}: ${[...pass].join(", ") || "no attributes"}) passes none of the attributes of Preset ${rep.values.preset ?? ""}: the line cooks nothing`);
+    // A select on a line that calls a phaser does not narrow its phase spread (matricksselection.ts).
+    if (selected && selected.sel.kept.length) {
+      const note = phaseSelectNote(rep, g, p, selected.sel, selected.settings, pass, expected.phases!);
+      if (note) rep.phaseNote = note;
+    }
   }
   return { reports, expected, dependencyNotes };
+}
+
+const isPhaserRow = (r: PresetRow) => (r.stepCount ?? 1) > 1 || (r.steps?.length ?? 0) > 1;
+
+/**
+ * The phase note of a standard line whose MAtricks select keeps part of its group and whose values are a phaser: with a
+ * phase range on the line (its own columns or its object), the range spread over the whole group's X positions; without
+ * one, the phases the phaser preset gives the kept fixtures on its own line's group. The predicted phases go to `phases`
+ * (checked after the cook) only in the measured cases.
+ */
+function phaseSelectNote(rep: LineReport, g: GroupInfo, p: PresetRead, sel: Extract<MemberSelection<GroupInfo["members"][number]>, { kind: "subset" }>, settings: SelectionSettings, pass: Set<string> | null, phases: Map<string, number>): string | undefined {
+  const members = new Set(g.members.map((m) => m.sfIndex));
+  const rows = p.rows.filter((r) => isPhaserRow(r) && typeof r.sfIndex === "number" && members.has(r.sfIndex) && (!pass || pass.has(r.attribute)));
+  if (!rows.length && !p.rows.some(isPhaserRow)) return undefined;
+  const range = phaseRangeOf(settings);
+  const other = hasOtherPhaseRange(settings);
+  const presetSpread = new Set(rows.map((r) => Math.round((r.phase ?? 0) * 100))).size > 1;
+  const presetPhased = rows.some((r) => !samePhase(r.phase ?? 0, 0));
+  if (!range && !other && !presetSpread) return undefined;
+  const keptRows = rows.filter((r) => sel.kept.some((m) => m.sfIndex === r.sfIndex));
+  const head = `the MAtricks select (${rep.matricksSelect}) keeps ${sel.kept.map((m) => m.fixture).join(", ")} of the ${g.members.length} fixtures of Group ${rep.selection?.group}, and it does not narrow the phase spread:`;
+  if (range || other) {
+    const where = (n?: number | null) => `the line's phase range (${range ? `X ${fmtPhase(range.from)} to ${fmtPhase(range.to)}` : "Y or Z"}) is spread over the ${n ? `${n} ` : ""}X positions of the whole group in selection order, not over the kept fixtures`;
+    const why = other ? "a Y or Z phase range is not modelled" : sel.positions === null ? "the number of X positions is not known (more groups than positions)" : settings.relativePhase === false ? "RelativePhase is off" : presetPhased ? `Preset ${rep.values?.preset ?? ""} has phases of its own; how they add up with the line's is not verified` : !p.rows.every((r) => !isPhaserRow(r) || typeof r.sfIndex === "number") ? `Preset ${rep.values?.preset ?? ""} holds global or universal phaser values` : null;
+    if (why || !range) return `${head} ${where()}${sel.shared ? ", and the fixtures of one position (block, group or wing pair) share its phase" : ""}; the phases were not predicted (${why})`;
+    const phase = phaseAt(range, sel.position, sel.positions!);
+    for (const r of keptRows) phases.set(`${r.sfIndex}|${r.attribute}`, phase);
+    return `${head} ${where(sel.positions)}; ${sel.kept.length > 1 ? `the kept fixtures share position ${sel.position + 1} (one block, group or wing pair), so they all get` : `the kept fixture is at position ${sel.position + 1} and gets`} ${fmtPhase(phase)}`;
+  }
+  // No range of its own: the phaser preset's phases, spread on the preset line's group, are kept as they are.
+  if (!p.rows.filter(isPhaserRow).every((r) => typeof r.sfIndex === "number")) return `${head} Preset ${rep.values?.preset ?? ""} spreads its phase over its own line's group and the kept fixtures keep their phases there; the phases were not predicted (global or universal phaser values)`;
+  for (const r of keptRows) phases.set(`${r.sfIndex}|${r.attribute}`, r.phase ?? 0);
+  const per = new Map<string, Set<string>>();
+  for (const r of keptRows) per.set(r.fixture, (per.get(r.fixture) ?? new Set()).add(fmtPhase(r.phase ?? 0)));
+  return `${head} Preset ${rep.values?.preset ?? ""} spreads its phase over its own line's group, and the kept fixtures keep the phases they have there: ${[...per].map(([f, ph]) => `${f} ${[...ph].join(" / ")}`).join(", ")}`;
+}
+
+/**
+ * The phase note of a phaser line (in a preset or a cue) whose MAtricks select keeps part of its group: its phase range
+ * spreads over the whole group's X positions and the kept fixtures share their position's phase (presets 21.9048-21.9050).
+ * Its coverage is not predicted, so these phases are not checked after a cook.
+ */
+async function phaserLineNote(bridge: Gma3Bridge, l: Line, g: GroupInfo, t: number, cache: Map<number, MatricksObjectInfo>): Promise<string | undefined> {
+  // A phaser line's PhaseFromX / PhaseToX is its own phase, also with a MAtricks object; the select comes from one or the other.
+  const own = l.columns;
+  const ownSel = own ? { ...own, axes: Object.fromEntries(Object.entries(own.axes).map(([a, x]) => [a, { ...x, phaseFrom: null, phaseTo: null }])) as SelectionSettings["axes"] } : undefined;
+  const obj = l.matricks?.no !== undefined ? { no: l.matricks.no, info: await readMatricksSettings(bridge, l.matricks.no, t, cache) } : null;
+  const eff = effectiveSettings(ownSel, obj);
+  if ("why" in eff || !eff.settings) return undefined;
+  const range = phaseRangeOf(own) ?? phaseRangeOf(obj?.info.settings);
+  const other = hasOtherPhaseRange(own) || hasOtherPhaseRange(obj?.info.settings);
+  if (!range && !other) return undefined;
+  const sel = selectMembers(g.members, eff.settings);
+  if (sel.kind === "all") return undefined;
+  const at = `${describeSelection(eff.settings)} (${eff.source})`;
+  if (sel.kind === "unpredicted") return `the MAtricks select (${at}) keeps part of Group ${l.selection?.group} and does not narrow the phase spread: the phase is computed on the whole group's grid in selection order, and the fixtures of one block or group share one; the kept fixtures and their phases were not predicted (${sel.why})`;
+  const head = `the MAtricks select (${at}) keeps ${sel.kept.map((m) => m.fixture).join(", ") || "none"} of the ${g.members.length} fixtures of Group ${l.selection?.group}, and it does not narrow the phase spread: the line's phase range${range ? ` (X ${fmtPhase(range.from)} to ${fmtPhase(range.to)})` : ""} is spread over the ${sel.positions && range ? `${sel.positions} ` : ""}X positions of the whole group in selection order`;
+  if (!sel.kept.length) return `${head}; the line cooks nothing`;
+  if (other || !range || sel.positions === null || eff.settings.relativePhase === false) return `${head}${sel.shared ? ", and the fixtures of one position share its phase" : ""}; the phases were not predicted (${other ? "a Y or Z phase range is not modelled" : sel.positions === null ? "the number of X positions is not known" : "RelativePhase is off"})`;
+  const phase = phaseAt(range, sel.position, sel.positions);
+  return `${head}; ${sel.kept.length > 1 ? `the kept fixtures share position ${sel.position + 1}, so they all get` : `the kept fixture is at position ${sel.position + 1} and gets`} ${fmtPhase(phase)}`;
 }
 
 /** Everything a row stores that the read reports: value, relative, steps with their layers, phaser layers, references. */
@@ -471,6 +550,10 @@ export function verifyCoverage(input: { rows: Array<PresetRow & { cooked?: boole
     // A filter keeps the rest of its line's preset out: cooked there (and no other line explains it), the filter did not apply.
     const ex = input.expected.excluded;
     const keptOut = ex && !input.expected.unknownReach ? cooked.filter((r) => ex.has(key(r)) && !input.expected.pairs.has(key(r)) && !(typeof r.sfIndex === "number" && input.expected.uncertain.has(r.sfIndex))) : [];
+    // Where a select meets a phase spread, the cooked phase of each kept fixture is the predicted one.
+    const ph = input.expected.phases;
+    const offPhase = ph?.size ? cooked.filter((r) => ph.has(key(r)) && !samePhase(r.phase ?? 0, ph.get(key(r))!)) : [];
+    if (offPhase.length) out.push(`cooked phases other than predicted: ${offPhase.slice(0, 8).map((r) => `${r.fixture} ${r.attribute} ${fmtPhase(r.phase ?? 0)} (${fmtPhase(ph!.get(key(r))!)} predicted)`).join(", ")}${offPhase.length > 8 ? ` and ${offPhase.length - 8} more` : ""}`);
     if (keptOut.length) out.push(`cooked values a line's filter or MAtricks select keeps out: ${keptOut.slice(0, 8).map((r) => `${r.fixture} ${r.attribute}`).join(", ")}${keptOut.length > 8 ? ` and ${keptOut.length - 8} more` : ""}`);
   }
   // Uncooked data: kept by merge_low_priority and remove; merge may replace it only where the recipe writes; overwrite deletes it.
@@ -896,7 +979,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     ]);
     const describePlan = (p: Plan) => ({
       target: label(p.target),
-      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, ...(l.selected ? { selected: l.selected, matricksSelect: l.matricksSelect } : {}), values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), ...(l.generator ? { generator: `Generator ${l.generator.no}`, ...(l.generatorAttributes ? { generatorAttributes: l.generatorAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
+      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, ...(l.selected ? { selected: l.selected, matricksSelect: l.matricksSelect } : {}), values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), ...(l.generator ? { generator: `Generator ${l.generator.no}`, ...(l.generatorAttributes ? { generatorAttributes: l.generatorAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}), ...(l.phaseNote ? { phaseNote: l.phaseNote } : {}) })),
       coverageBefore: p.before ? coverageOf(p.before.rows) : null,
       expectedCooked: p.expected.pairs.size,
       ...(mode === "merge" && p.conflicts.length ? { replacedUncooked: p.conflicts } : {}),
@@ -923,6 +1006,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     const warnings: string[] = [];
     for (const p of plans) for (const l of p.lines) for (const pr of l.problems) warnings.push(`${label(p.target)} line ${l.line}: ${pr}`);
     for (const p of plans) for (const l of p.lines) if (l.notPredicted) warnings.push(`${label(p.target)} line ${l.line}: ${l.notPredicted}`);
+    for (const p of plans) for (const l of p.lines) if (l.phaseNote) warnings.push(`${label(p.target)} line ${l.line}: ${l.phaseNote}`);
     for (const p of plans) warnings.push(...p.notes.map((n) => `${label(p.target)} ${n}`));
     const needsAck = plans.filter((p) => (mode === "merge" && p.conflicts.length) || (mode === "overwrite" && p.losses.length));
     if (needsAck.length && raw.replace_uncooked !== true) {
@@ -1403,7 +1487,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Read the recipe lines of a preset or cue part",
       description:
         "Read-only. target: {preset: \"N.M\"} or {sequence, cue, part?} (part 0 by default). Returns every recipe line (standard and phaser) with its selection (group and its members), values (preset), MAtricks, filter, Enabled, SelectionMode, the console's last cooking state, and problems (missing or empty group, missing preset, disabled), " +
-        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); a generator line (generator in place of the values) on the generator's channel attributes (generatorAttributes) the members have; a line's MAtricks X select (its own columns or its MAtricks object, with XWings / XBlock / XGroup) on the fixtures it keeps (selected), in the group's grid order; lines whose coverage is not predicted (phaser recipes, other filters, other MAtricks selects) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
+        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); a generator line (generator in place of the values) on the generator's channel attributes (generatorAttributes) the members have; a line's MAtricks X select (its own columns or its MAtricks object, with XWings / XBlock / XGroup) on the fixtures it keeps (selected), in the group's grid order; lines whose coverage is not predicted (phaser recipes, other filters, other MAtricks selects) are flagged; a select that meets a phase spread gets a phaseNote (the phase is spread over the whole group, not the kept fixtures; the phases when predicted); presets that embed others are noted. Needs bridge 0.24.0.",
       inputSchema: { target: targetSchema.describe("Preset or cue part.") },
     },
     async (args) => {

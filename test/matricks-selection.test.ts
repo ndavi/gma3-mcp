@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { effectiveSettings, parseSelectionSettings, selectMembers, describeSelection, type GridMember } from "../src/tools/matricksselection.ts";
+import { effectiveSettings, parseSelectionSettings, selectMembers, describeSelection, phaseAt, phaseRangeOf, hasOtherPhaseRange, samePhase, type GridMember } from "../src/tools/matricksselection.ts";
 
 // The bench groups of onPC 2.5.1 ("Rescue", 2026-11-15), stored order and grid x as group.read gives them.
 // Group 9001: 252, 251, 253, 254 with x 1, 0, 2, 3. Group 9005: 2..12 with x 1..11, then 1 with x 0.
@@ -84,4 +84,17 @@ test("effectiveSettings: the object's settings, or not predicted when the line h
   const spread = effectiveSettings(parseSelectionSettings({ PhaseFromX: 0, PhaseToX: 90 }), { no: 9010, info: info({ XWings: "2" }) });
   assert.ok("settings" in spread && spread.settings === null, "both only spread: every member keeps its values");
   assert.ok("settings" in effectiveSettings(own, null));
+});
+
+test("phaseAt: the phase of a position, measured on the bench (a range of exactly 360 excludes its end)", () => {
+  assert.equal(phaseAt({ from: 0, to: 360 }, 2, 4), 180, "Sequence 9033 cue 6");
+  assert.equal(phaseAt({ from: 0, to: 360 }, 1, 2), 180, "cues 9 and 10");
+  assert.ok(Math.abs(phaseAt({ from: 0, to: 359.9 }, 1, 3) - 179.95) < 1e-9, "21.9048");
+  assert.equal(phaseAt({ from: 0, to: 359.9 }, 1, 2), 359.9, "21.9049");
+  assert.equal(phaseAt({ from: 0, to: -360 }, 1, 4), -90);
+  assert.equal(phaseAt({ from: 90, to: 270 }, 0, 1), 90);
+  assert.ok(samePhase(359.89998579, 359.9) && samePhase(-90, 270) && samePhase(0.01, 359.99) && !samePhase(0, 1));
+  assert.deepEqual(phaseRangeOf(parseSelectionSettings({ PhaseFromX: 0, PhaseToX: 360 })), { from: 0, to: 360 });
+  assert.equal(phaseRangeOf(parseSelectionSettings({ PhaseFromX: 90, PhaseToX: 90 })), null, "90 to 90 is no spread");
+  assert.equal(hasOtherPhaseRange(parseSelectionSettings({ PhaseFromY: 0, PhaseToY: 60 })), true);
 });
