@@ -3,7 +3,7 @@
  *
  *   gma3_recipes        read-only: the recipe lines of a preset or cue part (selection, values, MAtricks, filter, state,
  *                       dangling references) and what the target holds cooked and uncooked per fixture
- *   gma3_edit_recipe    add, set, move or remove one standard recipe line (the definition)
+ *   gma3_edit_recipe    add, set, move or remove one standard recipe line (the definition), with its filter
  *   gma3_store_recipe_cues  the standard lines of many cue parts in one call (replace or append), with the per-line
  *                       MAtricks columns, the cue's name and note; references checked once, a compact read-back (#101)
  *   gma3_cook_recipes   cook a preset, a cue part, a cue or a whole sequence with an explicit option, after showing every
@@ -18,8 +18,10 @@
  * Remove options, and the list of affected targets beforehand.
  *
  * First release: standard recipe lines with a group selection, a preset as values, a MAtricks reference, Enabled, Name and
- * SelectionMode. Phaser recipe lines, filters, worlds, shapes and SelectionFromValue are listed and kept but not edited,
- * and their coverage is not predicted (reported as not predicted). The per-line MAtricks columns (XBlock, X, FadeFromX,
+ * SelectionMode, and a filter (gma3_store_filter creates one). Phaser recipe lines, worlds, shapes and SelectionFromValue
+ * are listed and kept but not edited, and their coverage is not predicted (reported as not predicted). A filtered line is
+ * predicted on the filter's attributes when the filter has the shape verified on the console (filters.ts readFilter);
+ * the preset's other attributes are `excluded` and the cook's read-back checks that none of them was cooked. The per-line MAtricks columns (XBlock, X, FadeFromX,
  * ...) are written only by gma3_store_recipe_cues (not verified on a console: the #101 build set them from Lua).
  *
  * Console facts this module relies on (onPC 2.5.1, docs/probes/sb-05-recipes-macos-2.5.1.md):
@@ -34,6 +36,9 @@
  *     option opens a pop-up, so an option is always sent.
  *   - A deleted group or preset leaves the line with an empty Selection or Values; an empty group cooks nothing
  *     (FailedCookedPart "Group", EmptyLastCooking Yes).
+ *   - `Assign Filter N At <line>` sets a line's filter and `set Filter ""` clears it (each re-cooks the line); with a
+ *     filter only its attributes are cooked, a phaser preset keeps its phaser on them and a RELEASE preset releases
+ *     only them (2026-11-15). `Assign Filter <missing> At <line>` answers OK and changes nothing.
  */
 import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
@@ -41,6 +46,7 @@ import { json, operation, type RegisterTools, type ToolContext } from "./context
 import { presetId, type PresetRead, type PresetRow } from "./presets.js";
 import { cueRef, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
+import { readFilter, type FilterInfo } from "./filters.js";
 import { MAX_BATCH_ITEMS, batchOptionShape, duplicates, hasUncertainStep, itemOk, runBatch } from "../batch.js";
 import { HeldLock } from "../mutations.js";
 import {
@@ -130,6 +136,8 @@ export interface Line {
   values: { addr?: string; name?: string; preset?: string } | null;
   matricks: { no?: number; name?: string } | null;
   filter: string | null;
+  /** The filter's pool number (read by index; the name alone is not unique). */
+  filterNo?: number;
   selectionMode?: string;
   selectionFromValue?: boolean | null;
   /** The line's own X / Y / Z column when it is set ("X 1"): only part of the group gets values (#101). */
@@ -193,6 +201,7 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
       values: val && val.class === "Preset" ? { addr: val.addr, name: val.name } : null,
       matricks: mtx && mtx.class === "MAtrick" ? { no: mtx.index, name: mtx.name } : null,
       filter: flt ? flt.name ?? "?" : null,
+      ...(flt && flt.class === "Filter" && typeof flt.index === "number" ? { filterNo: flt.index } : {}),
       selectionMode: typeof f.SelectionMode === "string" ? f.SelectionMode : undefined,
       selectionFromValue: bool(f.SelectionFromValue),
       ...(axisSelection(f) ? { axisSelect: axisSelection(f) } : {}),
@@ -254,6 +263,8 @@ export interface LineReport extends Line {
   /** Why the coverage of this line is not predicted (phaser recipe, filter, MAtricks...). */
   notPredicted?: string;
   members?: string[];
+  /** The attributes the line's filter passes (when the filter was read and is modelled). */
+  filterAttributes?: string[];
 }
 
 interface Expected {
@@ -265,15 +276,18 @@ interface Expected {
   /** Subfixtures lines with unpredicted coverage may write to; `unknownReach` when even that is not known. */
   uncertain: Set<number>;
   unknownReach: boolean;
+  /** "sfIndex|attribute" pairs a line's preset holds but its filter keeps out: they must not be cooked by that line. */
+  excluded?: Set<string>;
 }
 
 /**
  * Check every line's references and predict the coverage: each enabled standard line with a group and a preset gives its
  * group's fixtures the preset's attributes (a selective row for that fixture, a global row of its type, or a universal
- * row). Lines with a filter or a phaser recipe are not predicted.
+ * row). A line with a filter gives only the preset's attributes the filter passes (the others are `excluded`), when
+ * the filter has the modelled shape (readFilter); otherwise it is not predicted. Phaser recipe lines are not predicted.
  */
-export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
-  const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false };
+export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
+  const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set() };
   const dependencyNotes: string[] = [];
   const reports: LineReport[] = [];
   for (const l of lines) {
@@ -306,7 +320,16 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
     // The X / Y / Z column gives values to only part of the group (one element, one block): which part is not modelled.
     if (l.axisSelect) { unpredictable(`the line's MAtricks selects part of its group (${l.axisSelect}); coverage not predicted`, g); continue; }
     if (!l.values) { rep.problems.push("no values: the preset is missing (deleted?) or was never assigned"); continue; }
-    if (l.filter) { unpredictable(`a filter (${l.filter}) limits the attributes; coverage not predicted`, g); continue; }
+    // A filter passes only its attributes: modelled for the filter shape verified on the console (readFilter).
+    let pass: Set<string> | null = null;
+    if (l.filter) {
+      if (l.filterNo === undefined) { unpredictable(`a filter (${l.filter}) limits the attributes; it could not be identified, so coverage is not predicted`, g); continue; }
+      const f = await readFilter(bridge, l.filterNo, t, filters);
+      if (!f.exists) { unpredictable(`Filter ${l.filterNo} (${l.filter}) could not be read; coverage not predicted`, g); continue; }
+      if (f.notPredictable || !f.attributes) { unpredictable(`the filter (Filter ${l.filterNo} ${f.name ?? ""}) is not modelled: ${f.notPredictable ?? "its attributes could not be read"}; coverage not predicted`, g); continue; }
+      pass = new Set(f.attributes);
+      rep.filterAttributes = f.attributes;
+    }
     if (!g || !g.exists || !g.members.length) continue;
     // The fixture types come with the read, for this group's members: the cache key includes them.
     const key = `${l.values.addr ?? l.values.name ?? "?"}|${g.members.map((m) => m.sfIndex).sort((a, b) => a - b).join(",")}`;
@@ -323,6 +346,7 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
     if (l.matricks) rep.notPredicted = undefined; // MAtricks spreads values and timing; the fixtures and attributes covered do not change
     const types = p.types ?? {};
     const hasGlobal = p.rows.some((r) => r.mode === "global");
+    let passed = 0;
     // A member whose prediction rests on a failed or incomplete read is uncertain: the guard applies to it.
     const uncertainMember = (m: { fixture: string; sfIndex: number }, why: string) => {
       expected.uncertain.add(m.sfIndex);
@@ -343,8 +367,12 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
         for (const r of universal) if (has.has(r.attribute)) attrs.add(r.attribute);
         if (!fa || !listComplete({ ...fa, items: fa.attributes })) uncertainMember(m, `the attributes of ${m.fixture} could not be read${fa ? " completely" : ""}, so universal values were not predicted for it`);
       }
-      for (const a of attrs) expected.pairs.add(`${m.sfIndex}|${a}`);
+      for (const a of attrs) {
+        if (pass && !pass.has(a)) expected.excluded!.add(`${m.sfIndex}|${a}`);
+        else { expected.pairs.add(`${m.sfIndex}|${a}`); passed++; }
+      }
     }
+    if (pass && passed === 0 && p.rows.length) rep.problems.push(`the filter (${l.filter}: ${[...pass].join(", ") || "no attributes"}) passes none of the attributes of Preset ${rep.values.preset ?? ""}: the line cooks nothing`);
   }
   return { reports, expected, dependencyNotes };
 }
@@ -374,6 +402,10 @@ export function verifyCoverage(input: { rows: Array<PresetRow & { cooked?: boole
     if (realMissing.length) out.push(`expected cooked values missing: ${realMissing.slice(0, 8).join(", ")}${realMissing.length > 8 ? ` and ${realMissing.length - 8} more` : ""} (subfixture|attribute)`);
     const stray = input.expected.unknownReach ? [] : cooked.filter((r) => typeof r.sfIndex === "number" && !input.expected.touched.has(r.sfIndex));
     if (stray.length) out.push(`cooked values on fixtures no line selects: ${[...new Set(stray.map((r) => r.fixture))].join(", ")}`);
+    // A filter keeps the rest of its line's preset out: cooked there (and no other line explains it), the filter did not apply.
+    const ex = input.expected.excluded;
+    const keptOut = ex && !input.expected.unknownReach ? cooked.filter((r) => ex.has(key(r)) && !input.expected.pairs.has(key(r)) && !(typeof r.sfIndex === "number" && input.expected.uncertain.has(r.sfIndex))) : [];
+    if (keptOut.length) out.push(`cooked values a line's filter keeps out: ${keptOut.slice(0, 8).map((r) => `${r.fixture} ${r.attribute}`).join(", ")}${keptOut.length > 8 ? ` and ${keptOut.length - 8} more` : ""}`);
   }
   // Uncooked data: kept by merge_low_priority and remove; merge may replace it only where the recipe writes; overwrite deletes it.
   const uncookedBefore = input.before.filter((r) => !r.cooked);
@@ -432,6 +464,7 @@ interface EditArgs {
   selection?: number;
   values?: string | number | null;
   matricks?: number;
+  filter?: number | null;
   enabled?: boolean;
   name?: string;
   selection_mode?: "strict" | "normal";
@@ -455,12 +488,14 @@ export function valuesPreset(field: string, value: unknown): { pool: number; num
 }
 
 function sameLine(a: Line, b: Line): boolean {
-  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && (a.filter ?? null) === (b.filter ?? null);
+  return a.class === b.class && (a.selection?.group ?? null) === (b.selection?.group ?? null) && (a.values?.addr ?? null) === (b.values?.addr ?? null) && (a.matricks?.no ?? null) === (b.matricks?.no ?? null) && a.enabled === b.enabled && (a.name ?? "") === (b.name ?? "") && (a.selectionMode ?? "").toLowerCase() === (b.selectionMode ?? "").toLowerCase() && (a.filter ?? null) === (b.filter ?? null) && (a.filterNo ?? null) === (b.filterNo ?? null);
 }
 
 /** Every requested field of a line, compared per property. */
-export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; enabled?: boolean; name?: string; selectionMode?: string }): string[] {
+export function checkLineFields(l: Line, n: number, f: { selection?: number; valuesAddr?: string | null; matricks?: number; filter?: number | null; enabled?: boolean; name?: string; selectionMode?: string }): string[] {
   const out: string[] = [];
+  if (f.filter === null && l.filter) out.push(`line ${n} still has a filter (${l.filter})`);
+  if (typeof f.filter === "number" && l.filterNo !== f.filter) out.push(`line ${n} filter reads ${l.filter ? `${l.filter}${l.filterNo !== undefined ? ` (Filter ${l.filterNo})` : ""}` : "none"}`);
   if (f.selection !== undefined && l.selection?.group !== f.selection) out.push(`line ${n} selection reads ${l.selection ? `Group ${l.selection.group}` : "none"}`);
   if (f.valuesAddr === null && l.values) out.push(`line ${n} still has values`);
   if (typeof f.valuesAddr === "string" && l.values?.addr !== f.valuesAddr) out.push(`line ${n} values read ${l.values?.name ?? "none"}`);
@@ -489,15 +524,17 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
   const selection = raw.selection === undefined ? undefined : v.check(() => objectNumber("selection", raw.selection, { max: 9999 }));
   const values = raw.values === undefined || raw.values === null ? raw.values : v.check(() => valuesPreset("values", raw.values));
   const matricks = raw.matricks === undefined ? undefined : v.check(() => objectNumber("matricks", raw.matricks, { max: 9999 }));
+  const filter = raw.filter === undefined || raw.filter === null ? raw.filter : v.check(() => objectNumber("filter", raw.filter, { max: 9999 }));
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") v.fail("enabled must be true or false");
   if (raw.selection_mode !== undefined && !(raw.selection_mode in SELECTION_MODES)) v.fail("selection_mode must be strict or normal");
-  const fields = { selection, values, matricks, enabled: raw.enabled, name, selection_mode: raw.selection_mode };
+  const fields = { selection, values, matricks, filter, enabled: raw.enabled, name, selection_mode: raw.selection_mode };
   const anyField = Object.values(fields).some((x) => x !== undefined);
   // Only for a missing field: an invalid one has its own error.
   if (action === "add" && (raw.selection === undefined || raw.values === undefined || raw.values === null)) v.fail("add needs selection (a group) and values (a preset): a line without both cooks nothing");
   if ((action === "set" || action === "move" || action === "remove") && line === undefined) v.fail(`${action} needs line`);
-  if (action === "set" && !anyField) v.fail("set needs at least one of selection, values, matricks, enabled, name, selection_mode");
+  if (action === "set" && !anyField) v.fail("set needs at least one of selection, values, matricks, filter, enabled, name, selection_mode");
+  if (action === "add" && raw.filter === null) v.fail("filter: null clears a line's filter (set); a new line has none");
   if (action === "move" && to === undefined) v.fail("move needs to");
   if ((action === "move" || action === "remove") && anyField) v.fail(`${action} takes no line fields`);
   const target: Record<string, unknown> = { target: raw.target, action };
@@ -542,6 +579,8 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
               const m = (await bridge.request("objects", { ref: `MAtricks ${matricks}`, fields: [], limit: 1 }, tm).catch((err: unknown) => (notFound(err) ? null : Promise.reject(err)))) as { items?: unknown[] } | null;
               if (!m?.items?.length) missing.push(`MAtricks ${matricks}`);
             }
+            // `Assign Filter <missing> At <line>` answers OK and changes nothing (onPC 2.5.1.1).
+            if (typeof filter === "number" && !(await readFilter(bridge, filter, tm)).exists) missing.push(`Filter ${filter}`);
           } catch (err) {
             return asRead(stepFromError("check_references", err, { op: "objects" }));
           }
@@ -575,6 +614,9 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
       if (selection !== undefined) commands.push({ name: "assign_selection", command: `Assign Group ${selection} At ${ref}` });
       // A disabled line is switched off before its values, so it never cooks.
       if (raw.enabled === false) commands.push({ name: "set_enabled", set: { property: "Enabled", value: "No" } });
+      // The filter goes before the values, so the line is never cooked unfiltered.
+      if (typeof filter === "number") commands.push({ name: "assign_filter", command: `Assign Filter ${filter} At ${ref}` });
+      if (filter === null) commands.push({ name: "clear_filter", set: { property: "Filter", value: "" } });
       if (values) commands.push({ name: "assign_values", command: `Assign Preset ${values.pool}.${values.number} At ${ref}` });
       if (values === null) commands.push({ name: "clear_values", set: { property: "Values", value: "" } });
       if (matricks !== undefined) commands.push({ name: "assign_matricks", command: `Assign MAtricks ${matricks} At ${ref}` });
@@ -619,7 +661,7 @@ export async function editRecipe(ctx: ToolContext, raw: EditArgs): Promise<Opera
       const a = after ?? [];
       const problems: string[] = [];
       const valuesAddr = values ? (await readData(bridge, `Preset ${values.pool}.${values.number}`, tm))?.addr ?? "?" : values === null ? null : undefined;
-      const want = { selection, valuesAddr, matricks, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
+      const want = { selection, valuesAddr, matricks, filter, enabled: raw.enabled, name, selectionMode: raw.selection_mode ? SELECTION_MODES[raw.selection_mode] : undefined };
       if (action === "add") {
         if (a.length !== b.length + 1) problems.push(`${a.length} line(s) after adding to ${b.length}`);
         const l = a[n - 1];
@@ -766,7 +808,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     ]);
     const describePlan = (p: Plan) => ({
       target: label(p.target),
-      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
+      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
       coverageBefore: p.before ? coverageOf(p.before.rows) : null,
       expectedCooked: p.expected.pairs.size,
       ...(mode === "merge" && p.conflicts.length ? { replacedUncooked: p.conflicts } : {}),
@@ -850,6 +892,7 @@ interface RecipeLineSpec {
   selection: number;
   values: { pool: number; number: number };
   matricks?: number;
+  filter?: number;
   name?: string;
   enabled?: boolean;
   selectionMode?: string;
@@ -863,7 +906,7 @@ interface RecipeCueSpec {
   lines: RecipeLineSpec[];
 }
 
-const LINE_KEYS = ["selection", "values", "matricks", "name", "enabled", "selection_mode", "x", "y", "z"];
+const LINE_KEYS = ["selection", "values", "matricks", "filter", "name", "enabled", "selection_mode", "x", "y", "z"];
 const CUE_KEYS = ["cue", "part", "name", "note", "lines"];
 const AXES = ["x", "y", "z"] as const;
 const presetKey = (p: { pool: number; number: number }) => `${p.pool}.${p.number}`;
@@ -904,6 +947,7 @@ function parseRecipeLine(v: Validator, raw: unknown, path: string): RecipeLineSp
   const selection = v.check(() => objectNumber(`${path}.selection`, r.selection, { max: 9999 }));
   const values = v.check(() => valuesPreset(`${path}.values`, r.values));
   const matricks = r.matricks === undefined ? undefined : v.check(() => objectNumber(`${path}.matricks`, r.matricks, { max: 9999 }));
+  const filter = r.filter === undefined ? undefined : v.check(() => objectNumber(`${path}.filter`, r.filter, { max: 9999 }));
   const name = v.check(() => objectName(`${path}.name`, r.name, { optional: true }));
   if (r.enabled !== undefined && typeof r.enabled !== "boolean") v.fail(`${path}.enabled must be true or false`);
   const mode = r.selection_mode;
@@ -915,7 +959,7 @@ function parseRecipeLine(v: Validator, raw: unknown, path: string): RecipeLineSp
     if (w) columns.push(...w);
   }
   if (selection === undefined || !values) return undefined;
-  return { selection, values, matricks, name, enabled: r.enabled as boolean | undefined, selectionMode: typeof mode === "string" && Object.hasOwn(SELECTION_MODES, mode) ? SELECTION_MODES[mode as keyof typeof SELECTION_MODES] : undefined, columns };
+  return { selection, values, matricks, filter, name, enabled: r.enabled as boolean | undefined, selectionMode: typeof mode === "string" && Object.hasOwn(SELECTION_MODES, mode) ? SELECTION_MODES[mode as keyof typeof SELECTION_MODES] : undefined, columns };
 }
 
 function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknown): RecipeCueSpec[] {
@@ -1040,7 +1084,7 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
           cues.forEach((c, ci) =>
             c.lines.forEach((l, li) => {
               const at = `cues[${ci}].lines[${li}]`;
-              for (const ref of [`Group ${l.selection}`, `Preset ${presetKey(l.values)}`, ...(l.matricks !== undefined ? [`MAtricks ${l.matricks}`] : [])]) if (!firstUse.has(ref)) firstUse.set(ref, at);
+              for (const ref of [`Group ${l.selection}`, `Preset ${presetKey(l.values)}`, ...(l.matricks !== undefined ? [`MAtricks ${l.matricks}`] : []), ...(l.filter !== undefined ? [`Filter ${l.filter}`] : [])]) if (!firstUse.has(ref)) firstUse.set(ref, at);
             }),
           );
           const missing: string[] = [];
@@ -1058,6 +1102,9 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
                 const p = await readData(bridge, ref, t);
                 if (!p) missing.push(`${ref} (first used by ${firstUse.get(ref)})`);
                 else presetAddr.set(no, p.addr ?? "?");
+              } else if (kind === "Filter") {
+                // `Assign Filter <missing> At <line>` answers OK and changes nothing (onPC 2.5.1.1).
+                if (!(await readFilter(bridge, Number(no), t)).exists) missing.push(`${ref} (first used by ${firstUse.get(ref)})`);
               } else {
                 const m = (await bridge.request("objects", { ref, fields: [], limit: 1 }, t).catch((err: unknown) => (notFound(err) ? null : Promise.reject(err)))) as { items?: unknown[] } | null;
                 if (!m?.items?.length) missing.push(`${ref} (first used by ${firstUse.get(ref)})`);
@@ -1104,6 +1151,8 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
         cmd(`${p}selection`, `Assign Group ${l.selection} At ${ref}`);
         // A disabled line is switched off before its values, so it never cooks.
         if (l.enabled === false) set(`${p}disable`, ref, "Enabled", "No", (got) => setReplyMatches("Enabled", "No", got));
+        // The filter goes before the values, so the line is never cooked unfiltered.
+        if (l.filter !== undefined) cmd(`${p}filter`, `Assign Filter ${l.filter} At ${ref}`);
         cmd(`${p}values`, `Assign Preset ${presetKey(l.values)} At ${ref}`);
         if (l.matricks !== undefined) cmd(`${p}matricks`, `Assign MAtricks ${l.matricks} At ${ref}`);
         if (l.selectionMode) set(`${p}selection_mode`, ref, "SelectionMode", l.selectionMode, (got) => setReplyMatches("SelectionMode", l.selectionMode!, got));
@@ -1164,7 +1213,7 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
           const n = p.base + i + 1;
           const got = after[n - 1];
           if (!got) return void mismatches.push(`line ${n} is missing`);
-          mismatches.push(...checkLineFields(got, n, { selection: l.selection, valuesAddr: presetAddr.get(presetKey(l.values)) ?? "?", matricks: l.matricks, enabled: l.enabled, name: l.name, selectionMode: l.selectionMode }));
+          mismatches.push(...checkLineFields(got, n, { selection: l.selection, valuesAddr: presetAddr.get(presetKey(l.values)) ?? "?", matricks: l.matricks, filter: l.filter, enabled: l.enabled, name: l.name, selectionMode: l.selectionMode }));
           if (got.class !== "StandardRecipe") mismatches.push(`line ${n} is a ${got.class}`);
           for (const c of l.columns) {
             const value = columns.get(n)?.[c.property];
@@ -1266,7 +1315,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Read the recipe lines of a preset or cue part",
       description:
         "Read-only. target: {preset: \"N.M\"} or {sequence, cue, part?} (part 0 by default). Returns every recipe line (standard and phaser) with its selection (group and its members), values (preset), MAtricks, filter, Enabled, SelectionMode, the console's last cooking state, and problems (missing or empty group, missing preset, disabled), " +
-        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. Lines whose coverage is not predicted (phaser recipes, filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
+        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, Used In Object rules with APPLYTOFIXTURES No, every layer on); lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
       inputSchema: { target: targetSchema.describe("Preset or cue part.") },
     },
     async (args) => {
@@ -1283,9 +1332,9 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
     {
       title: "Add, change, move or remove a recipe line",
       description:
-        "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset, matricks?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
+        "Edit one standard recipe line of a preset or cue part (the target must exist). action add {selection: group, values: \"N.M\" preset, matricks?, filter?, name?, enabled?, selection_mode?} appends a line; set {line, ...fields} changes it (values: null clears the values); move {line, to} reorders; remove {line} deletes it. " +
         "References are checked first; the result reads every line back (the edited one and that the others are unchanged or moved as asked). The console re-cooks an edited line by itself (MergeLowPriority) and a removed line's output disappears: the result shows the target's coverage before and after (autoCooked). " +
-        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. Phaser lines, filters and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
+        "The console also re-cooks a group or preset change by itself a moment later (in the background); gma3_cook_recipes cooks at once, verifies, and offers Merge, Overwrite and Remove. enabled: false switches a new line off before it gets values, so it never cooks. filter: N limits the line to the filter's attributes (assigned before the values; null clears it in set); the filter must exist (gma3_store_filter). Phaser lines and the per-line MAtricks columns are not edited by this tool (many cues at once, with the columns: gma3_store_recipe_cues). values is the plain string \"4.2\", never a number. preview: true returns the planned commands.",
       inputSchema: {
         target: targetSchema.describe("Preset or cue part."),
         action: z.enum(["add", "set", "move", "remove"]),
@@ -1296,6 +1345,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
         // THK migration docs/phaser-recipes.md §3), which the handler then has to refuse.
         values: z.string().nullable().optional().describe('Preset as the plain string "N.M" ("4.2"; 4.20 and 4.2 are different presets); null clears it.'),
         matricks: z.number().optional().describe("MAtricks pool number."),
+        filter: z.number().nullable().optional().describe("Filter pool number (Assign Filter N At the line, before the values): the line cooks only the filter's attributes. null clears it (set). gma3_store_filter creates one from a preset."),
         enabled: z.boolean().optional(),
         name: z.string().optional(),
         selection_mode: z.enum(["strict", "normal"]).optional().describe("Strict: values only on the selected fixtures; Normal: passed down to sub-fixtures."),
@@ -1310,6 +1360,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       selection: z.number().describe("Group number."),
       values: z.union([z.string(), z.number()]).describe('Preset as the plain string "N.M" ("4.2"; a number is refused: 4.20 and 4.2 are the same number).'),
       matricks: z.number().optional().describe("MAtricks pool number (a reference)."),
+      filter: z.number().optional().describe("Filter pool number: the line cooks only the filter's attributes (gma3_store_filter creates one from a preset)."),
       name: z.string().optional(),
       enabled: z.boolean().optional().describe("false: the line is switched off before it gets values, so it never cooks."),
       selection_mode: z.enum(["strict", "normal"]).optional(),
@@ -1330,9 +1381,9 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
     {
       title: "Write the recipe lines of many cues",
       description:
-        `Write the standard recipe lines of up to ${MAX_BATCH_ITEMS} cue parts of one sequence in one call (at most ${MAX_RECIPE_LINES_PER_CUE} lines per part, ${MAX_RECIPE_LINES_PER_CALL} per call; a larger build is several calls). cues: [{cue, part? (default 0), name?, note?, lines: [{selection: group, values: "N.M" preset, matricks?, name?, enabled?, selection_mode?, x?/y?/z?: {wings, blocks, groups, width, shift, shuffle, select, fade/delay/phase/speed: {from, to}}}]}]. ` +
+        `Write the standard recipe lines of up to ${MAX_BATCH_ITEMS} cue parts of one sequence in one call (at most ${MAX_RECIPE_LINES_PER_CUE} lines per part, ${MAX_RECIPE_LINES_PER_CALL} per call; a larger build is several calls). cues: [{cue, part? (default 0), name?, note?, lines: [{selection: group, values: "N.M" preset, matricks?, filter?, name?, enabled?, selection_mode?, x?/y?/z?: {wings, blocks, groups, width, shift, shuffle, select, fade/delay/phase/speed: {from, to}}}]}]. ` +
         "mode is required: replace deletes every line of the part first (refused while the part holds phaser lines), append adds after the existing ones. The cues must exist (gma3_store_cues creates them); name is the cue's name (Part 0), note its Note. " +
-        "Once for the whole call, before anything is sent: every cue part is read and every group, preset and MAtricks a line names must be in the show. Each line is written as gma3_edit_recipe adds one (Assign Group, Preset and MAtricks At the line, set for the other fields and the per-line MAtricks columns), and every reply is checked. " +
+        "Once for the whole call, before anything is sent: every cue part is read and every group, preset, MAtricks and filter a line names must be in the show. Each line is written as gma3_edit_recipe adds one (Assign Group, Filter, Preset and MAtricks At the line, set for the other fields and the per-line MAtricks columns), and every reply is checked. " +
         "Batch form: each cue part is an item: its steps stop at its first failure, the parts already written stay (nothing is undone or retried), an unknown outcome stops the rest, and its read-back is compact: the line count, then only mismatches (every field written, earlier lines unchanged on append, name, note). " +
         "The console cooks each written line by itself (merge low priority). cook: a gma3_cook_recipes mode cooks every part afterwards, only when every part was written and matched (replace_uncooked and verify_cook as in gma3_cook_recipes). preview: true checks and returns the plan (detail: true every request). Phaser recipe lines are not written. Needs bridge 0.24.0.",
       inputSchema: {
@@ -1368,7 +1419,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       description:
         "Cook the recipes of a preset, a cue part, a cue (all its parts) or a whole sequence, at once and verified (the console also re-cooks group and preset changes by itself in the background a moment later, with merge low priority). mode is required: merge_low_priority (replaces cooked data, keeps every uncooked value), merge (also replaces uncooked values on the recipes' own fixtures and attributes), overwrite (deletes every uncooked value), remove (removes cooked data). " +
         "First every affected target is listed with its lines, their problems (missing or empty group, missing preset), the coverage before and the cooked coverage the lines should give; merge and overwrite are refused while they would replace or delete uncooked values unless replace_uncooked: true. preview: true stops there. " +
-        "After `Cook <target> /<Option>` (verify, default true) each target is read back: every predicted fixture and attribute cooked, no cooked values on fixtures no line selects, uncooked values unchanged (merge_low_priority, remove) or changed only where allowed. Lines that are not predicted (phaser recipes, filters) are named; presets that embed other presets are noted (their recipes are not re-cooked). Needs bridge 0.24.0.",
+        "After `Cook <target> /<Option>` (verify, default true) each target is read back: every predicted fixture and attribute cooked, no cooked values on fixtures no line selects, none on the attributes a line's filter keeps out, uncooked values unchanged (merge_low_priority, remove) or changed only where allowed. Lines that are not predicted (phaser recipes, filters of another shape) are named; presets that embed other presets are noted (their recipes are not re-cooked). Needs bridge 0.24.0.",
       inputSchema: {
         target: targetSchema.describe("Preset, or sequence with optional cue and part."),
         mode: z.enum(["merge_low_priority", "merge", "overwrite", "remove"]),

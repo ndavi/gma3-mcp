@@ -22,14 +22,14 @@ export const TASK_TOOLS: ReadonlyArray<{ task: string; tools: readonly string[] 
   { task: "chases", tools: ["gma3_build_chase"] },
   { task: "executors and sequence playback", tools: ["gma3_assign_to_executor", "gma3_configure_executor", "gma3_configure_sequence", "gma3_playback", "gma3_goto_cue", "gma3_set_fader"] },
   { task: "speed masters and tempo", tools: ["gma3_configure_speed_master", "gma3_speed_master_action", "gma3_speed_masters"] },
-  { task: "recipes, many cues per call", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_store_recipe_cues", "gma3_cook_recipes", "gma3_edit_phaser_recipe"] },
+  { task: "recipes, many cues per call", tools: ["gma3_recipes", "gma3_edit_recipe", "gma3_store_recipe_cues", "gma3_cook_recipes", "gma3_edit_phaser_recipe", "gma3_store_filter"] },
   { task: "macros and their dialogs", tools: ["gma3_store_macro", "gma3_edit_macro_line", "gma3_run_macro", "gma3_macros", "gma3_dialog"] },
   { task: "console variables ($name in macros, cue commands)", tools: ["gma3_variables", "gma3_set_variable"] },
   { task: "tags: tagging, kill types, which objects carry a tag", tools: ["gma3_tags", "gma3_assign_tag", "gma3_store_tag", "gma3_delete_tag", "gma3_configure_tag", "gma3_playback"] },
   { task: "timecode shows", tools: ["gma3_build_timecode", "gma3_timecode_transport", "gma3_timecodes"] },
   { task: "DMX output (universes, grants, Art-Net, sACN; missing output)", tools: ["gma3_dmx_output", "gma3_configure_dmx_output", "gma3_dmx", "gma3_fixture_output"] },
   { task: "OSC input and output", tools: ["gma3_osc", "gma3_configure_osc", "gma3_test_osc_input"] },
-  { task: "save the show (current or new name), list show files", tools: ["gma3_save_show", "gma3_show_files"] },
+  { task: "save the show (current or new name), list shows", tools: ["gma3_save_show", "gma3_show_files"] },
   { task: "tempo-sync plugin: status, config, phaser ReSync", tools: ["gma3_tempo_sync_status", "gma3_configure_tempo_sync", "gma3_playback"] },
   { task: "show analysis: preset usage, cue diff, tracking leaks", tools: ["gma3_preset_usage", "gma3_cue_diff", "gma3_tracking_leaks"] },
   { task: "read show data and live state", tools: ["gma3_objects", "gma3_get_object", "gma3_list_children", "gma3_programmer", "gma3_fixture_attributes", "gma3_cues", "gma3_sequences", "gma3_pool_usage"] },
@@ -60,7 +60,7 @@ export const BATCH_TOOLS: ReadonlyArray<{ tool: string; list: string }> = [
   { tool: "gma3_configure_tag", list: "tags" },
 ];
 
-const BATCH_NOTE = `Many objects at once: ${BATCH_TOOLS.map((b) => `${b.tool} (${b.list})`).join(", ")} take a list per call (per-item checks, read-back, one line each); never loop over them in Lua.`;
+const BATCH_NOTE = `Many objects at once: ${BATCH_TOOLS.map((b) => `${b.tool} (${b.list})`).join(", ")} take a list per call (checks and read-back per item); never loop over them in Lua.`;
 
 const OBSERVE_NOTE = `Watching over time: ${OBSERVING_TOOLS.map((o) => `${o.tool} (${o.what})`).join(", ")}. They sample server-side; never write a Lua waiting or polling loop (gma3_lua has a 5 s budget).`;
 
@@ -69,7 +69,7 @@ export function serverInstructions(staleWarning?: string): string {
   const map = TASK_TOOLS.map((t) => `- ${t.task}: ${t.tools.join(", ")}`).join("\n");
   return [
     ...(staleWarning ? [staleWarning, ""] : []),
-    "gma3-mcp controls a grandMA3 console. Use the structured tools for show work: they check first, never retry, report each step and read back. Map from task to tools:",
+    "gma3-mcp controls a grandMA3 console. Use the structured tools for show work: they check first, never retry, report each step, read back. Map from task to tools:",
     map,
     BATCH_NOTE,
     OBSERVE_NOTE,

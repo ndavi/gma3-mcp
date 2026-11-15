@@ -79,14 +79,20 @@ test("set replies are compared per property", () => {
 // Fake console
 // ---------------------------------------------------------------------------
 
-interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; props?: Record<string, string> }
+interface FLine { cls: string; group: number | null; preset: string | null; matricks: number | null; enabled: boolean; name: string; mode: string; filter?: string; filterNo?: number; props?: Record<string, string> }
+/** A filter as the console reads it: its attribute mask, rules and layer flags. */
+interface FFilter { name: string; attrs: string[]; rules?: Array<{ cls: string; applyToFixtures?: boolean; invert?: boolean }>; layers?: Partial<Record<"ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING", boolean>> }
 interface FRow { fixture: string; sfIndex: number; attribute: string; value: number; cooked: boolean }
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
 class Console {
   groups = new Map<number, Array<{ fixture: string; sfIndex: number }>>([[908, [{ fixture: "401", sfIndex: 63 }, { fixture: "402", sfIndex: 64 }]], [909, []]]);
-  presets = new Map<string, { addr: string; attrs: string[]; value: number }>([["4.4", { addr: "14.14.1.5.4.4", attrs: ["ColorRGB_R"], value: 100 }], ["1.11", { addr: "14.14.1.5.1.11", attrs: ["Dimmer"], value: 100 }]]);
+  presets = new Map<string, { addr: string; attrs: string[]; value: number }>([["4.4", { addr: "14.14.1.5.4.4", attrs: ["ColorRGB_R"], value: 100 }], ["1.11", { addr: "14.14.1.5.1.11", attrs: ["Dimmer"], value: 100 }], ["21.5", { addr: "14.14.1.5.21.5", attrs: ["Dimmer", "ColorRGB_R"], value: 100 }]]);
   matricks = new Set([12]);
+  /** Filter 7: Dimmer only (made from a preset, APPLYTOFIXTURES No). */
+  filters = new Map<number, FFilter>([[7, { name: "F DIM", attrs: ["Dimmer"] }]]);
+  /** A console whose cook ignores the lines' filters. */
+  ignoreFilter = false;
   targets = new Map<string, FTarget>();
   commands: string[] = [];
   /** An Assign that leaves an extra empty line behind (seen with Assign Shape on 2.5.1). */
@@ -141,7 +147,8 @@ class Console {
       const x = Number(l.props?.X);
       const block = Number(l.props?.XBlock) || 1;
       const members = (this.groups.get(l.group) ?? []).filter((_, i) => !(x >= 1) || Math.floor(i / block) === x - 1);
-      for (const m of members) for (const a of p.attrs) out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true });
+      const f = l.filterNo !== undefined && !this.ignoreFilter ? this.filters.get(l.filterNo) : undefined;
+      for (const m of members) for (const a of p.attrs) if (!f || f.attrs.includes(a)) out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true });
     }
     return out;
   }
@@ -172,6 +179,12 @@ class Console {
     h.fake.on("children", (args) => {
       const ref = String(args.ref);
       let m: RegExpMatchArray | null;
+      if ((m = ref.match(/^Filter (\d+)\.1\.1$/))) {
+        const f = this.filters.get(Number(m[1]));
+        if (!f) throw new Error(`no object found for '${ref}'`);
+        const rules = f.rules ?? [{ cls: "FilterRuleUsedInObject", applyToFixtures: false }];
+        return { total: rules.length, offset: 0, count: rules.length, items: rules.map((r, i) => ({ class: r.cls, index: i + 1, fields: { APPLYTOFIXTURES: r.applyToFixtures ?? false, INVERT: r.invert ?? false, OBJECT: { class: "Preset", name: "P", index: 1 } } })) };
+      }
       if ((m = ref.match(/^Sequence (\d+)$/))) {
         const cues = [...new Set([...this.targets.keys()].map((k) => k.match(/^Sequence (\d+) Cue (\d+)/)).filter((x) => x && x[1] === m![1]).map((x) => x![2]))];
         return { items: [{ fields: { No: "" } }, { fields: { No: "0" } }, ...cues.map((c) => ({ fields: { No: c } }))] };
@@ -194,7 +207,7 @@ class Console {
             Selection: l.group !== null ? { name: `Group ${l.group}`, class: "Group", index: l.group, addr: `g.${l.group}` } : "",
             Values: l.preset ? { name: this.presetOf(l.preset)?.[0] ?? "?", class: "Preset", addr: l.preset } : "",
             MAtricks: l.matricks !== null ? { name: `M${l.matricks}`, class: "MAtrick", index: l.matricks } : "",
-            Filter: l.filter ? { name: l.filter, class: "Filter" } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
+            Filter: l.filter ? { name: l.filter, class: "Filter", ...(l.filterNo !== undefined ? { index: l.filterNo } : {}) } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
             X: l.props?.X ?? "None", Y: l.props?.Y ?? "None", Z: l.props?.Z ?? "None",
           },
         })),
@@ -229,6 +242,13 @@ class Console {
       return { total: 2, offset: 0, count: 2, attributes: [{ attribute: "ColorRGB_R" }, { attribute: "Dimmer" }] };
     });
     h.fake.on("objects", (args) => {
+      const fm = String(args.ref).match(/^Filter (\d+)$/);
+      if (fm) {
+        const f = this.filters.get(Number(fm[1]));
+        if (!f) return { total: 0, count: 0, items: [] };
+        const layer = (k: "ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING") => f.layers?.[k] ?? true;
+        return { total: 1, count: 1, items: [{ class: "Filter", index: Number(fm[1]), name: f.name, childCount: 1, fields: { Name: f.name, ATTRIBUTES: f.attrs.map((a) => ({ obj: { class: "Attribute", name: a }, name: a })), ABSOLUTE: layer("ABSOLUTE"), RELATIVE: layer("RELATIVE"), PHASER: layer("PHASER"), TIMING: layer("TIMING"), HASDYNAMICFILTERRULES: false, HASANYMATRICKSDATA: false, HASACTIVEATTRIBUTEFILTER: f.attrs.length > 0 } }] };
+      }
       const c = this.cues.get(String(args.ref));
       if (c) return { items: [{ name: c.name, fields: { Name: c.name, Note: this.noteRead ? this.noteRead(c.note) : c.note } }] };
       if (/^Sequence /.test(String(args.ref))) return { items: [] };
@@ -251,22 +271,23 @@ class Console {
       const f = this.find(ref)!;
       const l = f.t.lines[f.line! - 1];
       // The per-line MAtricks columns (#101) read in the edit role: seconds with two decimals, integers, None.
-      const column = !["Name", "Enabled", "SelectionMode", "Values"].includes(prop);
+      const column = !["Name", "Enabled", "SelectionMode", "Values", "Filter"].includes(prop);
       if (this.ignoreSet.has(prop)) return { value: prop === "Enabled" ? l.enabled : prop === "Name" ? l.name : prop === "SelectionMode" ? l.mode : column ? l.props?.[prop] ?? "None" : "" };
       if (prop === "Name") l.name = String(args.value);
       if (prop === "Enabled") l.enabled = args.value === "Yes";
       if (prop === "SelectionMode") l.mode = String(args.value);
       if (prop === "Values") l.preset = null;
+      if (prop === "Filter") { l.filter = undefined; l.filterNo = undefined; }
       if (column) (l.props ??= {})[prop] = args.value === "None" ? "None" : /^(Fade|Delay)/.test(prop) ? Number(args.value).toFixed(2) : String(Number(args.value));
       this.cook(f.t, "/MergeLowPriority");
-      return { value: prop === "Enabled" ? l.enabled : prop === "Values" ? "" : prop === "Name" ? l.name : column ? l.props![prop] : l.mode };
+      return { value: prop === "Enabled" ? l.enabled : prop === "Values" || prop === "Filter" ? "" : prop === "Name" ? l.name : column ? l.props![prop] : l.mode };
     });
     h.fake.on("cmd", (args) => {
       const c = String(args.command);
       this.commands.push(c);
       if (this.reject?.test(c)) return { feedback: "Illegal object" };
       let m: RegExpMatchArray | null;
-      if ((m = c.match(/^Assign (Group|Preset|MAtricks) (\S+) At (.+)$/))) {
+      if ((m = c.match(/^Assign (Group|Preset|MAtricks|Filter) (\S+) At (.+)$/))) {
         const f = this.find(m[3]);
         if (!f) return { feedback: "Illegal object" };
         let l = f.t.lines[f.line! - 1];
@@ -275,6 +296,8 @@ class Console {
         if (m[1] === "Group") l.group = Number(m[2]);
         if (m[1] === "Preset") l.preset = this.presets.get(m[2])!.addr;
         if (m[1] === "MAtricks") l.matricks = Number(m[2]);
+        // As on 2.5.1.1: a missing filter answers OK and changes nothing.
+        if (m[1] === "Filter" && this.filters.has(Number(m[2]))) { l.filterNo = Number(m[2]); l.filter = this.filters.get(l.filterNo)!.name; }
         this.cook(f.t, "/MergeLowPriority");
         return { feedback: "OK" };
       }
@@ -872,4 +895,130 @@ test("axisSelection: a set X / Y / Z column, None and 0 select nothing, an inher
   assert.equal(axisSelection({}), undefined);
   assert.equal(axisSelection({ X: 2 }), "X 2");
   assert.equal(axisSelection({ X: "<3>", Z: "1" }), "X 3, Z 1");
+});
+
+// ---------------------------------------------------------------------------
+// Filters on recipe lines
+// ---------------------------------------------------------------------------
+
+test("add with a filter: Assign Filter goes before the values, the line reads back filtered and cooks only the filter's attributes", async () => {
+  const t = con.part(9060, 1);
+  const { result, isError } = await edit({ action: "add", selection: 908, values: "21.5", filter: 7 });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  assert.deepEqual(con.commands, ["Assign Group 908 At Sequence 9060 Cue 1 Part 0.1", "Assign Filter 7 At Sequence 9060 Cue 1 Part 0.1", "Assign Preset 21.5 At Sequence 9060 Cue 1 Part 0.1"]);
+  assert.equal(t.lines[0].filterNo, 7);
+  assert.deepEqual(result.coverage.after.cooked, [{ fixture: "401", attributes: ["Dimmer"] }, { fixture: "402", attributes: ["Dimmer"] }]);
+  const rd = await h.callJson("gma3_recipes", { target: T });
+  assert.deepEqual(rd.result.lines[0].filterAttributes, ["Dimmer"]);
+  assert.equal(rd.result.lines[0].notPredicted, undefined);
+  assert.equal(rd.result.expectedPairs, 2);
+});
+
+test("a missing filter is refused before anything is sent (the console would answer OK and do nothing)", async () => {
+  con.part(9060, 1);
+  const { result, isError } = await edit({ action: "add", selection: 908, values: "21.5", filter: 99 });
+  assert.equal(isError, true);
+  assert.match(stepError(result, "check_references"), /not in the show: Filter 99/);
+  assert.equal(con.commands.length, 0);
+});
+
+test("a filter the console ignores is a mismatch in the edit's read-back", async () => {
+  con.part(9060, 1);
+  con.filters.set(8, { name: "F GHOST", attrs: ["Dimmer"] });
+  con.ignoreAssign.add("Filter");
+  const { result } = await edit({ action: "add", selection: 908, values: "21.5", filter: 8 });
+  assert.equal(result.verification.status, "mismatched");
+  assert.match(result.verification.detail, /line 1 filter reads none/);
+});
+
+test("set filter: null clears it with set Filter \"\"; the other lines are compared with their filters", async () => {
+  const t = con.part(9060, 1);
+  t.lines = [
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.21.5", matricks: null, enabled: true, name: "", mode: "Strict", filter: "F DIM", filterNo: 7 },
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.4.4", matricks: null, enabled: true, name: "", mode: "Strict", filter: "F DIM", filterNo: 7 },
+  ];
+  const { result, isError } = await edit({ action: "set", line: 1, filter: null });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  assert.deepEqual(sets(), ["Sequence 9060 Cue 1 Part 0.1 Filter="]);
+  assert.equal(t.lines[0].filterNo, undefined);
+  assert.equal(t.lines[1].filterNo, 7);
+  const add = await edit({ action: "add", selection: 908, values: "4.4", filter: null });
+  assert.match(add.result.summary, /filter: null clears a line's filter/);
+});
+
+test("the cook predicts a filtered line on the filter's attributes and flags an attribute the filter should keep out", async () => {
+  const t = con.part(9060, 1);
+  t.lines = [{ cls: "StandardRecipe", group: 908, preset: "14.14.1.5.21.5", matricks: null, enabled: true, name: "", mode: "Strict", filter: "F DIM", filterNo: 7 }];
+  const pv = await cook({ mode: "merge_low_priority", preview: true });
+  assert.equal(pv.result.affected[0].expectedCooked, 2, JSON.stringify(pv.result.affected));
+  assert.deepEqual(pv.result.affected[0].lines[0].filterAttributes, ["Dimmer"]);
+  assert.equal(pv.result.affected[0].lines[0].filter, "Filter 7 F DIM");
+  assert.doesNotMatch((pv.result.warnings ?? []).join(), /not predicted/);
+  const ok = await cook({ mode: "merge_low_priority" });
+  assert.equal(ok.result.verification.status, "matched", JSON.stringify(ok.result.verification));
+  assert.doesNotMatch(ok.result.verification.checked, /not predicted/);
+  // A console that cooks the whole preset despite the filter.
+  con.ignoreFilter = true;
+  const bad = await cook({ mode: "merge_low_priority" });
+  assert.equal(bad.result.verification.status, "mismatched");
+  assert.match(bad.result.verification.detail, /cooked values a line's filter keeps out: 401 ColorRGB_R, 402 ColorRGB_R/);
+});
+
+test("an attribute kept out by one line's filter but given by another line is not flagged", async () => {
+  const t = con.part(9060, 1);
+  t.lines = [
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.21.5", matricks: null, enabled: true, name: "", mode: "Strict", filter: "F DIM", filterNo: 7 },
+    { cls: "StandardRecipe", group: 908, preset: "14.14.1.5.4.4", matricks: null, enabled: true, name: "", mode: "Strict" },
+  ];
+  const ok = await cook({ mode: "merge_low_priority" });
+  assert.equal(ok.result.verification.status, "matched", JSON.stringify(ok.result.verification));
+  assert.equal(ok.result.affected[0].expectedCooked, 4);
+});
+
+test("filters of another shape stay not predicted, with the reason; a filter that passes none of the preset is a problem", async () => {
+  const t = con.part(9060, 1);
+  const lineWith = (filterNo: number) => [{ cls: "StandardRecipe", group: 908, preset: "14.14.1.5.21.5", matricks: null, enabled: true, name: "", mode: "Strict", filter: `F${filterNo}`, filterNo }];
+  const cases: Array<[FFilter, RegExp]> = [
+    [{ name: "F FIX", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleUsedInObject", applyToFixtures: true }] }, /APPLYTOFIXTURES Yes: it also limits the fixtures/],
+    [{ name: "F INV", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleAttributes", invert: true }] }, /inverted/],
+    [{ name: "F PH", attrs: ["Dimmer"], layers: { PHASER: false } }, /layer flag\(s\) PHASER are not Yes/],
+    [{ name: "F FT", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleFixtureType" }] }, /FilterRuleFixtureType rule is not modelled/],
+  ];
+  let n = 20;
+  for (const [f, why] of cases) {
+    con.filters.set(++n, f);
+    t.lines = lineWith(n) as FLine[];
+    const rd = await h.callJson("gma3_recipes", { target: T });
+    assert.match(rd.result.lines[0].notPredicted, why, f.name);
+    assert.equal(rd.result.expectedPairs, 0, f.name);
+  }
+  con.filters.set(30, { name: "F TILT", attrs: ["Tilt"] });
+  t.lines = lineWith(30) as FLine[];
+  const none = await h.callJson("gma3_recipes", { target: T });
+  assert.match(none.result.lines[0].problems.join(), /passes none of the attributes of Preset 21.5: the line cooks nothing/);
+});
+
+test("store_recipe_cues writes a line's filter before its values, checks it exists, reads it back and cooks it", async () => {
+  const c1 = con.cue(9060, 1);
+  const { result, isError } = await store({ mode: "replace", cues: [{ cue: 1, lines: [line(908, "4.4"), line(908, "21.5", { filter: 7 })] }], cook: "merge_low_priority" });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  assert.deepEqual(con.commands.slice(0, 5), [
+    "Assign Group 908 At Sequence 9060 Cue 1 Part 0.1",
+    "Assign Preset 4.4 At Sequence 9060 Cue 1 Part 0.1",
+    "Assign Group 908 At Sequence 9060 Cue 1 Part 0.2",
+    "Assign Filter 7 At Sequence 9060 Cue 1 Part 0.2",
+    "Assign Preset 21.5 At Sequence 9060 Cue 1 Part 0.2",
+  ]);
+  assert.equal(c1.lines[1].filterNo, 7);
+  assert.equal(result.cook[0].verification, "matched");
+  const missing = await store({ mode: "append", cues: [{ cue: 1, lines: [line(908, "21.5", { filter: 99 })] }] });
+  assert.equal(missing.isError, true);
+  assert.match(stepError(missing.result, "check_references"), /Filter 99 \(first used by cues\[0\]\.lines\[0\]\)/);
+  con.ignoreAssign.add("Filter");
+  const ignored = await store({ mode: "append", cues: [{ cue: 1, lines: [line(908, "21.5", { filter: 7 })] }] });
+  assert.equal(ignored.result.verification.status, "mismatched");
+  assert.match(JSON.stringify(ignored.result.items[0]), /line 3 filter reads none/);
 });
