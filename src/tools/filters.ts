@@ -62,8 +62,8 @@ export function filterAttributes(v: unknown): string[] | null {
 /**
  * Read a filter: its attributes, rules and layer flags, and whether a line's cook can be predicted from the
  * attributes alone. Only the shape verified on the console is predictable: an attribute mask, no dynamic rules or
- * MAtricks data, every layer on, and rules that are attribute rules or Used In Object rules with APPLYTOFIXTURES No,
- * none inverted. Cached per call.
+ * MAtricks data, every layer on, and one rule: an attribute rule or a Used In Object rule with APPLYTOFIXTURES No, not
+ * inverted. Cached per call.
  */
 export async function readFilter(bridge: Gma3Bridge, no: number, t: number, cache?: Map<number, FilterInfo>): Promise<FilterInfo> {
   const hit = cache?.get(no);
@@ -105,7 +105,8 @@ async function readFilterUncached(bridge: Gma3Bridge, no: number, t: number): Pr
       const o = obj && typeof obj === "object" ? (obj as { name?: string; addr?: string }) : null;
       return { class: String(r.class ?? "?"), ...(o ? { object: o.name ?? o.addr } : {}), applyToFixtures: bool(r.fields?.APPLYTOFIXTURES), invert: bool(r.fields?.INVERT ?? "") };
     });
-    if (!info.rules.length) why.push("it has no rules");
+    // Every filter read on the console had one rule; how ATTRIBUTES combines several is not verified.
+    if (info.rules.length !== 1) why.push(info.rules.length ? `it has ${info.rules.length} rules (only a single rule is modelled)` : "it has no rules");
     for (const r of info.rules) {
       if (r.class !== "FilterRuleAttributes" && r.class !== "FilterRuleUsedInObject") why.push(`a ${r.class} rule is not modelled`);
       else if (r.invert !== false) why.push(`a ${r.class} rule is inverted (or its INVERT could not be read)`);

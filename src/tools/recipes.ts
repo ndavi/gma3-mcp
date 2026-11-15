@@ -754,6 +754,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
   const body = async (): Promise<OperationResult> => {
     const groups = new Map<number, GroupInfo>();
     const presets = new Map<string, PresetRead | null>();
+    const filters = new Map<number, FilterInfo>();
     type Plan = { target: Target; lines: LineReport[]; expected: Expected; before: PresetRead | null; conflicts: string[]; losses: string[]; notes: string[] };
     const plans: Plan[] = [];
     let truncated = false;
@@ -780,7 +781,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
                 continue;
               }
               if (!lines.length) continue;
-              const an = await analyzeLines(bridge, lines, t, groups, presets);
+              const an = await analyzeLines(bridge, lines, t, groups, presets, filters);
               let before: PresetRead | null;
               try {
                 before = await readData(bridge, targetRef(tg), t);
@@ -1315,7 +1316,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Read the recipe lines of a preset or cue part",
       description:
         "Read-only. target: {preset: \"N.M\"} or {sequence, cue, part?} (part 0 by default). Returns every recipe line (standard and phaser) with its selection (group and its members), values (preset), MAtricks, filter, Enabled, SelectionMode, the console's last cooking state, and problems (missing or empty group, missing preset, disabled), " +
-        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, Used In Object rules with APPLYTOFIXTURES No, every layer on); lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
+        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
       inputSchema: { target: targetSchema.describe("Preset or cue part.") },
     },
     async (args) => {

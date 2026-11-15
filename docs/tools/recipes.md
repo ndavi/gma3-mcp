@@ -212,8 +212,10 @@ The prediction reads the filter (`Filter F` with asText false: ATTRIBUTES is the
 its rules `Filter F.1.1.*`) and is made only for the shape verified on the console:
 - an attribute mask (HASACTIVEATTRIBUTEFILTER Yes), no dynamic rules, no MAtricks data;
 - every layer flag on (ABSOLUTE, RELATIVE, PHASER, TIMING Yes): a filter that drops a layer is not modelled;
-- one rule collection whose rules are FilterRuleAttributes, or FilterRuleUsedInObject with **APPLYTOFIXTURES No**, none
-  inverted. A Used In Object rule with APPLYTOFIXTURES Yes also limits the line to the fixtures of its object.
+- one rule collection with **one** rule: FilterRuleAttributes, or FilterRuleUsedInObject with **APPLYTOFIXTURES No**,
+  not inverted. A Used In Object rule with APPLYTOFIXTURES Yes also limits the line to the fixtures of its object.
+  Every filter read on the console had one rule; how ATTRIBUTES combines several is not verified, so a filter with
+  several rules is not predicted.
 
 Any other filter (or one that cannot be read) leaves the line not predicted, with the reason in `notPredicted`, as
 before. A modelled filter that passes none of the preset's attributes is a problem ("the line cooks nothing"). On the
@@ -517,7 +519,7 @@ read-back tells cooked values apart by their step presets.
   - value sources on attributes other than Dimmer, Tilt and Pan (shapes other than Flyout 19 / 20 with several
     sources); per-source curves (a curve applies to every source of its step);
   - worlds; filters of another shape than the one modelled (attribute rules and Used In Object rules with
-    APPLYTOFIXTURES No, every layer on) — they stay not predicted;
+    APPLYTOFIXTURES No, one rule, every layer on) — they stay not predicted;
   - recipe templates;
   - the Edit Recipe mode outside `gma3_edit_phaser_recipe`.
 - Verified live for `gma3_edit_phaser_recipe` (onPC 2.5.1, bridge 0.52.0, 2026-11-14): a Dimmer phaser (8 fixtures,
@@ -631,8 +633,8 @@ read-back tells cooked values apart by their step presets.
     time (Dimmer came from 21.9072, 2 steps, then from 1.9010 again); `gma3_cook_recipes` of the sequence matched (8 + 4).
 - Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
   a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
-  (the check would report it as kept out); filters with a layer off, inverted rules or APPLYTOFIXTURES Yes (left not
-  predicted). The cook check is per fixture and attribute, not per line: in Cue 1 above, a filter that the console
+  (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES
+  Yes (left not predicted). The cook check is per fixture and attribute, not per line: in Cue 1 above, a filter that the console
   ignored would still have read back matched, because line 1 also predicts the Dimmer pair.
 
 ## Live test

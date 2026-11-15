@@ -985,6 +985,7 @@ test("filters of another shape stay not predicted, with the reason; a filter tha
     [{ name: "F INV", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleAttributes", invert: true }] }, /inverted/],
     [{ name: "F PH", attrs: ["Dimmer"], layers: { PHASER: false } }, /layer flag\(s\) PHASER are not Yes/],
     [{ name: "F FT", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleFixtureType" }] }, /FilterRuleFixtureType rule is not modelled/],
+    [{ name: "F 2R", attrs: ["Dimmer"], rules: [{ cls: "FilterRuleAttributes" }, { cls: "FilterRuleUsedInObject" }] }, /it has 2 rules \(only a single rule is modelled\)/],
   ];
   let n = 20;
   for (const [f, why] of cases) {
