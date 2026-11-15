@@ -17,6 +17,9 @@
  *   - PreferredIP picks Interface (192.168.0.0/16 -> en0, 127.0.0.0/8 -> lo0).
  *   - EnableInput off closes the socket and on opens it. A line's port change takes effect only when input goes off
  *     and on again, so the tool re-enables input after such a change.
+ *   - EnableInput reading on does not prove the socket is bound (bench 2026-11-15, onPC 2.5.1): input on, a Receive
+ *     Command line on 8000, nothing bound on UDP 8000; off and on bound it again. Cause unknown. So gma3_osc and a
+ *     failed gma3_test_osc_input look for the socket (oscsocket.ts) and name the re-bind: rebind_input: true.
  *   - ReceiveCommand runs /cmd; Receive (faders, keys) is not needed for commands. A prefix makes the address
  *     /<prefix>/cmd and the plain /cmd is then ignored.
  *   - Send on a line with EnableOutput sends playback changes (e.g. /14.14.1.7.1 FaderMaster) to DestinationIP:Port.
@@ -27,6 +30,7 @@ import { OscSender } from "../osc.js";
 import { asRead, buildResult, notRequested, stepFromError, unavailable, validationFailure, type OperationResult, type StepResult, type Verification } from "../results.js";
 import { Validator, finiteNumber } from "../validate.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
+import { receivingPorts, type OscSocketCheck } from "../oscsocket.js";
 
 export interface OscLine {
   index: number;
@@ -61,6 +65,34 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Time between input off and on so the console closes and re-opens its socket (live: 400 ms is enough). */
 const REBIND_MS = 400;
 const MARKER = "McpOscTest";
+/** The one call that re-binds input (off, 0.4 s, on) without changing anything else. */
+export const REBIND_CALL = 'gma3_configure_osc {"rebind_input": true, "exclusive": true}';
+
+/** Whether the console holds the input sockets of the receiving lines (all of them, or `only` these lines). */
+export async function checkSockets(ctx: ToolContext, s: OscState, only?: number[]): Promise<OscSocketCheck> {
+  const none = (reason: string): OscSocketCheck => ({ status: "not_checked", method: "none", reason, ports: [] });
+  if (!ctx.oscSocketCheck) return none("this server has no socket checker");
+  if (s.enableInput !== true) return none("input is off: no socket is expected");
+  try {
+    return await ctx.oscSocketCheck(receivingPorts(s, only));
+  } catch (err) {
+    return none(`the socket check failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/** The socket finding in words, with the fix when there is one. */
+export function socketFinding(c: OscSocketCheck): { text: string; fix?: string } {
+  const where = (st: string) => c.ports.filter((p) => p.status === st).map((p) => `UDP ${p.port} (line ${p.lines.join(", ")})`).join(", ");
+  const holders = c.ports.flatMap((p) => (p.others ?? []).map((o) => `${o.command} (pid ${o.pid}) on ${p.port}`)).join(", ");
+  if (c.status === "not_listening")
+    return {
+      text: `input reads on, but the console (${c.console?.command} pid ${c.console?.pid}) holds no socket on ${where("not_listening")}: it is not receiving there. Switching input off and on re-binds the port`,
+      fix: REBIND_CALL,
+    };
+  if (c.status === "held_by_other") return { text: `the console holds no socket on ${where("held_by_other")}; ${holders} holds it: free the port, then re-bind input`, fix: REBIND_CALL };
+  if (c.status === "listening") return { text: `the console (${c.console?.command} pid ${c.console?.pid}) holds a socket on ${c.ports.map((p) => `UDP ${p.port}`).join(", ")}` };
+  return { text: `whether the console holds its input socket was not checked: ${c.reason}` };
+}
 
 export async function readOsc(bridge: Gma3Bridge, t: number): Promise<OscState> {
   try {
@@ -94,13 +126,17 @@ function unreadableFlags(s: OscState): string[] {
 const address = (l: OscLine) => `${l.prefix ? `/${l.prefix}` : ""}/cmd`;
 
 /** What the configuration means, in words and flags. */
-export function explainOsc(s: OscState, sender?: { host: string; port: number; prefix?: string }) {
+export function explainOsc(s: OscState, sender?: { host: string; port: number; prefix?: string }, socket?: OscSocketCheck) {
   const cmd = commandLines(s);
   const nets = networkIps(s);
   const known = reachKnown(s);
   const out = sendingLines(s);
   const unknownCmd = s.enableInput !== false ? s.lines.filter((l) => typeof l.receiveCommand !== "boolean") : [];
-  const accepts = cmd.length > 0 ? true : typeof s.enableInput !== "boolean" || unknownCmd.length ? null : false;
+  // A conclusive socket check overrides the settings: a command line whose port the console does not hold runs nothing.
+  const conclusive = socket && socket.status !== "not_checked";
+  const deaf = conclusive ? cmd.filter((l) => socket.ports.some((p) => p.port === l.port && p.status !== "listening")) : [];
+  const accepts = cmd.length > deaf.length ? true : cmd.length ? false : typeof s.enableInput !== "boolean" || unknownCmd.length ? null : false;
+  const finding = socket ? socketFinding(socket) : undefined;
   const matching = sender ? cmd.find((l) => l.port === sender.port && (l.prefix || "") === (sender.prefix || "")) : undefined;
   const reach = nets.length ? `, so anyone who can reach ${nets.join(", ")}${known ? "" : " (and possibly other networks: the interface scan was incomplete)"} can run commands on this console` : known ? "; this machine has no address outside loopback right now" : "; whether it is reachable from a network is unknown (the interface scan was incomplete)";
   return {
@@ -110,8 +146,10 @@ export function explainOsc(s: OscState, sender?: { host: string; port: number; p
       commandLines: cmd.map((l) => ({ line: l.index, name: l.name, port: l.port, address: address(l) })),
       ...(unknownCmd.length ? { unreadableLines: unknownCmd.map((l) => l.index) } : {}),
       reachableFrom: cmd.length || accepts === null ? ["loopback", ...nets, ...(known ? [] : ["unknown: the interface scan was incomplete"])] : [],
-      explanation:
-        typeof s.enableInput !== "boolean"
+      ...(socket ? { listening: { ...socket, finding: finding!.text, ...(finding!.fix ? { fix: finding!.fix } : {}) } } : {}),
+      explanation: deaf.length
+        ? `${finding!.text}. Until then OSC commands sent to ${deaf.map((l) => `UDP ${l.port} (${address(l)})`).join(", ")} are lost. Fix: ${finding!.fix}`
+        : typeof s.enableInput !== "boolean"
           ? "whether input is on could not be read"
           : !s.enableInput
             ? "input is off: the console accepts no OSC"
@@ -192,6 +230,8 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
   const bool = (k: string) => (raw[k] === undefined ? undefined : typeof raw[k] === "boolean" ? (raw[k] as boolean) : (v.fail(`${k} must be true or false`), undefined));
   const enableInput = bool("enable_input");
   const enableOutput = bool("enable_output");
+  const rebindInput = bool("rebind_input") === true;
+  if (rebindInput && enableInput === false) v.fail("rebind_input switches input off and on again; it cannot be combined with enable_input: false");
   let preferredIp: string | undefined;
   if (raw.preferred_ip !== undefined) {
     const m = typeof raw.preferred_ip === "string" ? raw.preferred_ip.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/) : null;
@@ -220,10 +260,10 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
     const known = new Set(["line", "add", "remove", ...LINE_PROPS.map((x) => x.key)]);
     for (const k of Object.keys(l)) if (!known.has(k)) v.fail(`${p}: unknown field ${k} (mode is not configurable: lines are UDP)`);
   });
-  if (enableInput === undefined && enableOutput === undefined && preferredIp === undefined && !specs.length) v.fail("nothing to change: give enable_input, enable_output, preferred_ip and/or lines");
+  if (enableInput === undefined && enableOutput === undefined && preferredIp === undefined && !specs.length && !rebindInput) v.fail("nothing to change: give enable_input, enable_output, preferred_ip, lines and/or rebind_input");
   const preview = raw.preview === true;
   if (!preview && raw.exclusive !== true) v.fail("exclusive must be true: the console's OSC configuration is changed (no undo; the result carries the previous values). preview: true needs no acknowledgement");
-  const target = { enable_input: enableInput, enable_output: enableOutput, preferred_ip: preferredIp, lines: raw.lines };
+  const target = { enable_input: enableInput, enable_output: enableOutput, preferred_ip: preferredIp, lines: raw.lines, ...(rebindInput ? { rebind_input: true } : {}) };
   if (!v.ok) return validationFailure(op, target, v.errors);
 
   return ctx.mutations.run(async () => {
@@ -245,6 +285,8 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
     // Nothing is judged from values the console did not report: an unreadable flag is never taken for off.
     const unreadable = unreadableFlags(before);
     if (unreadable.length) return refuse(`the console did not report ${unreadable.join(", ")}: whether commands or output reach the network cannot be judged`);
+    // Input that is off has no socket to re-bind; switching it on binds the ports (enable_input: true).
+    if (rebindInput && before.enableInput !== true && enableInput !== true) return refuse("rebind_input: OSC input reads off, so there is no socket to re-bind; enable_input: true switches it on and binds the ports");
 
     // The configuration after the change, from the console's values plus the request.
     const after: OscState = { ...before, lines: before.lines.map((l) => ({ ...l })) };
@@ -321,7 +363,8 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
     const inputOnBefore = before.enableInput === true;
     const inputOnAfter = after.enableInput === true;
     // A port change on an existing line, or a new line that receives; a send-only line needs no input socket.
-    const rebind = inputOnBefore && inputOnAfter && effective.some((e) => (e.add === undefined && e.changed.some((p) => p.key === "port")) || (e.add !== undefined && (e.after.receive || e.after.receiveCommand)));
+    // rebind_input asks for it outright (input on but its socket not bound: bench 2026-11-15); it opens no new port.
+    const rebind = inputOnBefore && inputOnAfter && (rebindInput || effective.some((e) => (e.add === undefined && e.changed.some((p) => p.key === "port")) || (e.add !== undefined && (e.after.receive || e.after.receiveCommand))));
     if (rebind) {
       plan.push({ kind: "set", name: "EnableInput off (re-bind)", target: "base", property: "EnableInput", value: "No" });
       plan.push({ kind: "wait", name: "wait for the socket to close", ms: REBIND_MS });
@@ -333,7 +376,7 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
     const previewOut = {
       plan: plan.map((s) => ({ step: s.name, ...(s.kind === "set" ? { value: s.value } : {}) })),
       ...(networkNotes.length ? { networkNote: networkNotes.join("; ") } : {}),
-      ...(rebind ? { rebindNote: "a line's port only takes effect when input goes off and on: input is switched off for about 0.4 s and on again" } : {}),
+      ...(rebind ? { rebindNote: rebindInput && !effective.some((e) => e.changed.some((p) => p.key === "port")) ? "input is switched off for about 0.4 s and on again, so the console closes and re-opens its input sockets" : "a line's port only takes effect when input goes off and on: input is switched off for about 0.4 s and on again" } : {}),
     };
     if (!plan.length) return buildResult({ operation: op, target, steps, verification: { status: "matched", checked: "the configuration already reads as requested" }, summary: "Nothing to change: the OSC configuration already reads as requested.", extra: { ...previewOut, current: explainOsc(before, ctx.osc) } });
     if (preview) return buildResult({ operation: op, target, steps, verification: notRequested(), summary: `Preview only; nothing was sent. ${plan.length} step(s).${previewOut.networkNote ? ` ${previewOut.networkNote}.` : ""}`, extra: { ...previewOut, wouldBe: explainOsc(after, ctx.osc) } });
@@ -397,6 +440,7 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
     let verification: Verification = notRequested();
     const readBack: StepResult[] = [];
     let now: OscState | undefined;
+    let socket: OscSocketCheck | undefined;
     if (raw.verify !== false || stopped) {
       try {
         now = await readOsc(ctx.bridge, t);
@@ -405,6 +449,7 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
         if (enableInput !== undefined && now.enableInput !== enableInput) mism.push(`input reads ${now.enableInput ? "on" : "off"}`);
         if (enableOutput !== undefined && now.enableOutput !== enableOutput) mism.push(`output reads ${now.enableOutput ? "on" : "off"}`);
         if (preferredIp !== undefined && now.preferredIp !== preferredIp) mism.push(`PreferredIP reads ${now.preferredIp}`);
+        if (rebindInput && enableInput === undefined && now.enableInput !== true) mism.push(`input reads ${now.enableInput === false ? "off" : "unknown"} after the re-bind`);
         const removedBelow = (i: number) => removes.filter((r) => r < i).length;
         for (const e of effective) {
           const idx = e.add !== undefined ? addIndex[e.add] : (e.index as number);
@@ -426,7 +471,16 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
         }
         const expectCount = before.lines.length + addIndex.filter((x) => x !== undefined).length - steps.filter((x) => x.op === "osc.removeLine" && x.status === "succeeded").length;
         if (now.lines.length !== expectCount) mism.push(`${now.lines.length} line(s), expected ${expectCount}`);
-        const checked = "the input and output switches, the preferred IP, every named line property and the line count, read back";
+        // After a re-bind, the sockets themselves (when this machine can see them): a port still not bound is a mismatch.
+        if (rebindOn && now.enableInput === true) {
+          socket = await checkSockets(ctx, now);
+          if (socket.status === "not_listening" || socket.status === "held_by_other") {
+            await sleep(REBIND_MS);
+            socket = await checkSockets(ctx, now);
+          }
+          if (socket.status === "not_listening" || socket.status === "held_by_other") mism.push(`after the re-bind: ${socketFinding(socket).text.replace(/\. Switching input off and on re-binds the port$/, "")}`);
+        }
+        const checked = `the input and output switches, the preferred IP, every named line property and the line count, read back${socket && socket.status !== "not_checked" ? ", and the input sockets (lsof)" : ""}`;
         verification = mism.length ? { status: "mismatched", checked, detail: mism.join("; ") } : { status: "matched", checked };
       } catch (err) {
         readBack.push(asRead(stepFromError("read_back", err, { op: "osc.read" })));
@@ -448,7 +502,7 @@ export async function configureOsc(ctx: ToolContext, raw: Record<string, unknown
           ? [now ? (now.enableInput === false ? "input was switched off for the re-bind and reads off now: OSC input is closed; switch it on with gma3_configure_osc enable_input: true" : `input reads ${now.enableInput === true ? "on" : "unknown"} after the re-bind's uncertain "on"`) : "input was switched off for the re-bind and its state could not be read back"]
           : []),
       ],
-      extra: { ...previewOut, previous: before, ...(now ? { now: { ...now, meaning: explainOsc(now, ctx.osc) } } : {}), testWith: "gma3_test_osc_input proves that a command line receives" },
+      extra: { ...previewOut, previous: before, ...(now ? { now: { ...now, meaning: explainOsc(now, ctx.osc, socket) } } : {}), ...(socket ? { socketCheck: socket } : {}), testWith: "gma3_test_osc_input proves that a command line receives" },
     });
     result.steps.push(...readBack);
     // outcomeOf ignores skipped steps; an unfinished plan is never a success.
@@ -575,14 +629,23 @@ export async function testOscInput(ctx: ToolContext, raw: Record<string, unknown
     const notSeen = results.filter((r) => r.received === false && !r.sendFailed);
     const unsent = results.filter((r) => r.sendFailed);
     const blind = results.filter((r) => r.received === null);
+    // A failure: does the console hold the failing lines' sockets? (bench 2026-11-15: input on, nothing bound.)
+    const socket = notSeen.length || unsent.length ? await checkSockets(ctx, s, [...notSeen, ...unsent].map((r) => r.line)) : undefined;
+    const finding = socket ? socketFinding(socket) : undefined;
+    const cause =
+      !socket || socket.status === "not_checked"
+        ? `likely causes: input not bound (switch it off and on: ${REBIND_CALL}), a port change without a re-bind, a firewall, another program on the port${socket ? `; ${finding!.text}` : ""}`
+        : socket.status === "listening"
+          ? `${finding!.text}, so the socket is bound: look at the prefix, a firewall, or the console's command line`
+          : `${finding!.text}; fix: ${finding!.fix}`;
     const checked = `the marker variable ${MARKER} holds each test's nonce within ${timeoutMs} ms`;
     const verification: Verification = unsent.length
-      ? { status: "mismatched", checked, detail: `the test message could not be sent to ${unsent.map((r) => `line ${r.line} (port ${r.port})`).join(", ")}` }
+      ? { status: "mismatched", checked, detail: `the test message could not be sent to ${unsent.map((r) => `line ${r.line} (port ${r.port})`).join(", ")} (${cause})` }
       : notSeen.length
       ? {
           status: "mismatched",
           checked,
-          detail: `not observed within ${timeoutMs} ms on ${notSeen.map((r) => `line ${r.line} (port ${r.port})`).join(", ")}: the marker was read but never held the nonce (likely causes: input not re-bound after a port change, a firewall, another program on the port)${blind.length ? `; receipt could not be observed on ${blind.map((r) => `line ${r.line}`).join(", ")}` : ""}`,
+          detail: `not observed within ${timeoutMs} ms on ${notSeen.map((r) => `line ${r.line} (port ${r.port})`).join(", ")}: the marker was read but never held the nonce (${cause})${blind.length ? `; receipt could not be observed on ${blind.map((r) => `line ${r.line}`).join(", ")}` : ""}`,
         }
       : blind.length
         ? unavailable(`receipt could not be observed on ${blind.map((r) => `line ${r.line} (port ${r.port})`).join(", ")}: every read of the marker failed`, checked)
@@ -597,7 +660,7 @@ export async function testOscInput(ctx: ToolContext, raw: Record<string, unknown
           ? `OSC input works: the console ran the loopback test command on ${results.map((r) => `line ${r.line} (port ${r.port})`).join(", ")}.`
           : `OSC input test: ${results.filter((r) => r.received === true).length} of ${results.length} line(s) observed receiving${notSeen.length ? `, ${notSeen.length} not observed within ${timeoutMs} ms` : ""}${blind.length ? `, ${blind.length} unobservable` : ""}; marker ${cleanup}.`,
       ...(cleanup !== "deleted" ? { warnings: [cleanup === "remains" ? `the marker ${MARKER} remains (it blocks the next test); ${cleanupHint}` : `the marker's deletion could not be confirmed; ${cleanupHint} if it is still there`] } : {}),
-      extra: { results, markerCleanup: cleanup, meaning: explainOsc(s, ctx.osc), note: "loopback proves the console receives; it listens on every interface, so a sender on the network reaches the same port unless a firewall stops it" },
+      extra: { results, markerCleanup: cleanup, ...(socket ? { socketCheck: { ...socket, finding: finding!.text, ...(finding!.fix ? { fix: finding!.fix } : {}) } } : {}), meaning: explainOsc(s, ctx.osc, socket), note: "loopback proves the console receives; it listens on every interface, so a sender on the network reaches the same port unless a firewall stops it" },
     });
   });
 }
@@ -616,13 +679,14 @@ export const registerOscTools: RegisterTools = (server, ctx) => {
     {
       title: "Read the OSC input and output configuration",
       description:
-        "Read-only. The console's OSC input and output: EnableInput / EnableOutput, Interface and PreferredIP, every OSC line (port, prefix, Receive, Receive Command, Send, Send Command, destination IP), the network interfaces, and what it means: whether commands are accepted and from where (the console listens on every interface whatever Interface and PreferredIP say), where output goes, and whether this server's own OSC sender (gma3_command via osc, gma3_start_bridge) reaches a line. Needs bridge 0.33.0.",
+        "Read-only. The console's OSC input and output: EnableInput / EnableOutput, Interface and PreferredIP, every OSC line (port, prefix, Receive, Receive Command, Send, Send Command, destination IP), the network interfaces, and what it means: whether commands are accepted and from where (the console listens on every interface whatever Interface and PreferredIP say), where output goes, and whether this server's own OSC sender (gma3_command via osc, gma3_start_bridge) reaches a line. When the console runs on this machine, meaning.input.listening says whether it really holds each receiving line's UDP socket (lsof; input can read on with nothing bound) and names the fix (rebind_input). Needs bridge 0.33.0.",
       inputSchema: {},
     },
     async () => {
       try {
         const s = await readOsc(ctx.bridge, ctx.requestTimeoutMs);
-        return json({ tool: "gma3_osc", meaning: explainOsc(s, ctx.osc), ...s, notes: ["a line's port change takes effect only when input goes off and on (gma3_configure_osc does this)", "gma3_test_osc_input proves that input works"] });
+        const socket = s.enableInput === true ? await checkSockets(ctx, s) : undefined;
+        return json({ tool: "gma3_osc", meaning: explainOsc(s, ctx.osc, socket), ...s, notes: ["a line's port change takes effect only when input goes off and on (gma3_configure_osc does this)", `input reading on does not prove the socket is bound: meaning.input.listening checks this machine's sockets (lsof); the fix when it is not is ${REBIND_CALL}`, "gma3_test_osc_input proves that input works"] });
       } catch (err) {
         return { content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }], isError: true };
       }
@@ -634,11 +698,12 @@ export const registerOscTools: RegisterTools = (server, ctx) => {
     {
       title: "Configure OSC input and output",
       description:
-        "Switch OSC input / output, set the preferred IP, and add, edit or remove OSC lines (name, port, prefix, destination_ip, receive, receive_command, send, send_command, echo_input, echo_output, note). Lines are UDP. Validated first; every write is read back. A port change on a receiving line re-binds input (input off for about 0.4 s and on). " +
+        "Switch OSC input / output, set the preferred IP, and add, edit or remove OSC lines (name, port, prefix, destination_ip, receive, receive_command, send, send_command, echo_input, echo_output, note). Lines are UDP. Validated first; every write is read back. A port change on a receiving line re-binds input (input off for about 0.4 s and on); rebind_input: true does only that, for input that reads on with its socket not bound (no network: true needed: it opens no new port). " +
         "network: true is required when the change opens a port that runs OSC commands while this machine has an address beyond loopback: the console listens on every interface, so anyone who can reach this machine can then run commands. It is also required for new output to an address outside loopback. Requires exclusive: true; preview: true shows the plan. No undo: previous holds the values before. Test with gma3_test_osc_input. Needs bridge 0.33.0.",
       inputSchema: {
         enable_input: z.boolean().optional(),
         enable_output: z.boolean().optional(),
+        rebind_input: z.boolean().optional().describe("Switch input off and on again (0.4 s) so the console re-opens its input sockets; needs input on."),
         preferred_ip: z.string().optional().describe('IPv4 network that picks the interface, e.g. "127.0.0.0/8". It does not limit who can send.'),
         lines: z
           .array(
@@ -674,7 +739,7 @@ export const registerOscTools: RegisterTools = (server, ctx) => {
     {
       title: "Test that OSC input works",
       description:
-        "Proves that the console receives OSC commands, with no shell: sends /[prefix/]cmd SetUserVariable \"McpOscTest\" \"<nonce>\" to 127.0.0.1 on the port of each line with Receive Command (or `line`), then reads the variable back through the bridge. Matched when the console ran it. The variable is deleted afterwards; refused when it already exists or input is off. Needs bridge 0.33.0 (and 0.31.0's variable ops).",
+        "Proves that the console receives OSC commands, with no shell: sends /[prefix/]cmd SetUserVariable \"McpOscTest\" \"<nonce>\" to 127.0.0.1 on the port of each line with Receive Command (or `line`), then reads the variable back through the bridge. Matched when the console ran it. On a failure it checks whether the console holds the port's socket (lsof, console on this machine) and names the fix. The variable is deleted afterwards; refused when it already exists or input is off. Needs bridge 0.33.0 (and 0.31.0's variable ops).",
       inputSchema: {
         line: z.number().optional().describe("Only this OSC line (default: every line with Receive Command)."),
         timeout_ms: z.number().optional().describe("How long to wait for each command (200-5000, default 1500)."),

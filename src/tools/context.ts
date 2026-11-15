@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Gma3Bridge } from "../bridge.js";
 import type { MutationLock } from "../mutations.js";
 import type { OscOptions } from "../osc.js";
+import type { OscSocketChecker } from "../oscsocket.js";
 import type { OperationResult, ToolResult } from "../results.js";
 import { toToolResult } from "../results.js";
 
@@ -16,6 +17,8 @@ export interface ToolContext {
   luaToolAllowed: boolean;
   /** The server's own OSC sender (GMA3_OSC_HOST / _PORT / _PREFIX), for gma3_osc's report. */
   osc?: OscOptions;
+  /** Looks for the console's bound OSC input sockets on this machine (lsof); absent: the check is not done. */
+  oscSocketCheck?: OscSocketChecker;
 }
 
 export type RegisterTools = (server: McpServer, ctx: ToolContext) => void;

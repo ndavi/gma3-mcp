@@ -775,6 +775,9 @@ on macOS onPC 2.5.1).
   change alone does not take effect. A port that newly runs commands on a networked machine needs `network: true`
   and a plain statement.
 - `gma3_test_osc_input` sends a loopback `/cmd` that sets a marker variable and reads it back.
+- Input can read on with nothing bound (migration bench, 15 Nov 2026). When the console runs on the same machine,
+  `gma3_osc` and a failed `gma3_test_osc_input` check its UDP sockets with lsof and name the fix,
+  `gma3_configure_osc {"rebind_input": true, "exclusive": true}` ([socket check](docs/tools/osc.md#socket-check)).
 - The field test's drop-until-PreferredIP-changed did not reproduce: PreferredIP only picks Interface.
 
 ## SU-19 — Fixture-type data: cell order and wheels

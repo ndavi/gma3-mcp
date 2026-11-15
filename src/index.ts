@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { Gma3Bridge, BridgeError, BridgeUnreachableError } from "./bridge.js";
 import { OscSender } from "./osc.js";
+import { createOscSocketChecker } from "./oscsocket.js";
 import { helpDir, helpVersion, listHelpPages, lookupHelp } from "./help.js";
 import { CHEATSHEET } from "./cheatsheet.js";
 import { MutationLock } from "./mutations.js";
@@ -48,9 +49,11 @@ import { registerPoolUsageTools, shapeListing } from "./tools/poolusage.js";
 import { registerAnalysisTools } from "./tools/analysis.js";
 
 const env = process.env;
+const bridgeHost = env.GMA3_BRIDGE_HOST ?? "127.0.0.1";
+const bridgePort = Number(env.GMA3_BRIDGE_PORT ?? 9800);
 const bridge = new Gma3Bridge({
-  host: env.GMA3_BRIDGE_HOST ?? "127.0.0.1",
-  port: Number(env.GMA3_BRIDGE_PORT ?? 9800),
+  host: bridgeHost,
+  port: bridgePort,
   requestTimeoutMs: Number(env.GMA3_BRIDGE_TIMEOUT_MS ?? 15000),
 });
 const oscOptions = {
@@ -95,6 +98,7 @@ const toolContext: ToolContext = {
   requestTimeoutMs: Number(env.GMA3_BRIDGE_TIMEOUT_MS ?? 15000),
   luaToolAllowed: allowLuaTool,
   osc: oscOptions,
+  oscSocketCheck: createOscSocketChecker({ bridgeHost, bridgePort }),
 };
 
 type ToolResult = { content: Array<{ type: "text"; text: string }>; isError?: boolean };

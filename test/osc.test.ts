@@ -9,7 +9,8 @@
 import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import dgram from "node:dgram";
-import { configureOsc, explainOsc, registerOscTools, testOscInput, type OscState } from "../src/tools/osc.ts";
+import { configureOsc, explainOsc, registerOscTools, REBIND_CALL, testOscInput, type OscState } from "../src/tools/osc.ts";
+import { createOscSocketChecker, judgeSockets, parseLsof, type OscSocketChecker, type Runner, type SocketRow } from "../src/oscsocket.ts";
 import { MutationLock } from "../src/mutations.ts";
 import type { ToolContext } from "../src/tools/context.ts";
 import { startHarness, type Harness } from "./helpers/tool-harness.ts";
@@ -114,7 +115,19 @@ beforeEach(() => {
   h.fake.reset();
   osc = new FakeOsc();
   osc.install(h);
+  delete ctx.oscSocketCheck;
+  delete h.ctx.oscSocketCheck;
 });
+/** A socket check that sees the FakeOsc's bound ports as the console's (pid 4242, app_gma3) UDP sockets. */
+const consoleRows = (): SocketRow[] => [
+  { pid: 4242, command: "app_gma3", proto: "TCP", local: "127.0.0.1:9800", port: 9800 },
+  ...osc.bound.map((p) => ({ pid: 4242, command: "app_gma3", proto: "UDP", local: `*:${p}`, port: p })),
+];
+const fakeChecker: OscSocketChecker = async (ports) => judgeSockets(consoleRows(), 9800, ports, "fake lsof");
+const useChecker = (c: OscSocketChecker = fakeChecker) => {
+  ctx.oscSocketCheck = c;
+  h.ctx.oscSocketCheck = c;
+};
 const writes = () => h.fake.requests.filter((r) => r.op.startsWith("osc.") && r.op !== "osc.read").map((r) => (r.op === "osc.set" ? `${r.args.target}${r.args.index ? ` ${r.args.index}` : ""} ${r.args.property}=${r.args.value}` : `${r.op}${r.args.index ? ` ${r.args.index}` : ""}`));
 const fakeSend = (port: number, prefix: string | undefined, command: string) => {
   osc.receive(port, `${prefix ? `/${prefix}` : ""}/cmd`, command);
@@ -427,4 +440,157 @@ test("gma3_test_osc_input over real UDP: a socket playing the console decodes /c
   } finally {
     sock.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Socket check: input that reads on with nothing bound (bench 2026-11-15)
+// ---------------------------------------------------------------------------
+
+const LSOF_OUT = ["p4242", "capp_gma3", "f9", "PUDP", "n*:8005", "f10", "PTCP", "n127.0.0.1:9800", "f33", "PUDP", "n*:8000", "p77", "crapportd", "f19", "PUDP", "n127.0.0.1:5000->127.0.0.1:6000", ""].join("\n");
+
+test("socket check: lsof -F output is parsed; the console is the bridge listener; not listening only when the anchor is seen", async () => {
+  const rows = parseLsof(LSOF_OUT);
+  assert.deepEqual(rows.map((r) => `${r.command} ${r.proto} ${r.local} ${r.port}`), ["app_gma3 UDP *:8005 8005", "app_gma3 TCP 127.0.0.1:9800 9800", "app_gma3 UDP *:8000 8000", "rapportd UDP 127.0.0.1:5000 5000"]);
+  const ok = judgeSockets(rows, 9800, new Map([[8000, [1]]]), "m");
+  assert.equal(ok.status, "listening");
+  assert.deepEqual(ok.console, { pid: 4242, command: "app_gma3", bridgeListener: "127.0.0.1:9800", udpPorts: [8000, 8005] });
+  assert.deepEqual(ok.evidence, ["app_gma3 4242 TCP 127.0.0.1:9800", "app_gma3 4242 UDP *:8000"]);
+  const deaf = judgeSockets(rows, 9800, new Map([[8010, [2]]]), "m");
+  assert.equal(deaf.status, "not_listening");
+  assert.deepEqual(deaf.ports, [{ port: 8010, lines: [2], status: "not_listening" }]);
+  const other = judgeSockets(rows, 9800, new Map([[5000, [3]]]), "m");
+  assert.equal(other.status, "held_by_other");
+  assert.deepEqual(other.ports[0].others, [{ pid: 77, command: "rapportd", local: "127.0.0.1:5000" }]);
+  // No anchor (another user's process, no permission): never "not listening".
+  const blind = judgeSockets(parseLsof("p77\ncrapportd\nf19\nPUDP\nn*:3722\n"), 9800, new Map([[8000, [1]]]), "m");
+  assert.equal(blind.status, "not_checked");
+  assert.match(String(blind.reason), /no process listening on the bridge port TCP 9800/);
+  // A tunnel on the bridge port: the console is elsewhere.
+  const tunnel = judgeSockets(parseLsof("p55\ncssh\nf3\nPTCP\nn127.0.0.1:9800\n"), 9800, new Map([[8000, [1]]]), "m");
+  assert.equal(tunnel.status, "not_checked");
+  assert.match(String(tunnel.reason), /held by ssh \(pid 55\), not by grandMA3/);
+});
+
+test("socket check: skipped with a reason for a remote console, Windows, lsof missing, not permitted or timed out; falls back to /usr/sbin/lsof", async () => {
+  const ports = new Map([[8000, [1]]]);
+  const never: Runner = async () => assert.fail("lsof must not run");
+  const remote = await createOscSocketChecker({ bridgeHost: "2.0.23.101", bridgePort: 9800, run: never, local: () => new Set(["127.0.0.1", "192.168.1.112"]) })(ports);
+  assert.equal(remote.status, "not_checked");
+  assert.match(String(remote.reason), /not an address of this machine/);
+  const ownLan = await createOscSocketChecker({ bridgeHost: "192.168.1.112", bridgePort: 9800, run: async () => LSOF_OUT, local: () => new Set(["192.168.1.112"]) })(ports);
+  assert.equal(ownLan.status, "listening", "a bridge host that is one of this machine's addresses is local");
+  const win = await createOscSocketChecker({ bridgeHost: "127.0.0.1", bridgePort: 9800, run: never, platform: "win32" })(ports);
+  assert.match(String(win.reason), /not done on Windows/);
+  const errOf = (props: Record<string, unknown>) => Object.assign(new Error("x"), props);
+  const tried: string[] = [];
+  const missing = await createOscSocketChecker({ bridgeHost: "127.0.0.1", bridgePort: 9800, run: async (f) => (tried.push(f), Promise.reject(errOf({ code: "ENOENT" }))) })(ports);
+  assert.match(String(missing.reason), /lsof was not found/);
+  assert.deepEqual(tried, ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"]);
+  const fallback = await createOscSocketChecker({ bridgeHost: "127.0.0.1", bridgePort: 9800, run: async (f) => (f === "lsof" ? Promise.reject(errOf({ code: "ENOENT" })) : LSOF_OUT) })(ports);
+  assert.equal(fallback.status, "listening");
+  const denied = await createOscSocketChecker({ bridgeHost: "127.0.0.1", bridgePort: 9800, run: async () => Promise.reject(errOf({ code: "EACCES" })) })(ports);
+  assert.match(String(denied.reason), /not permitted/);
+  const slow = await createOscSocketChecker({ bridgeHost: "127.0.0.1", bridgePort: 9800, timeoutMs: 50, run: async () => Promise.reject(errOf({ killed: true, signal: "SIGTERM" })) })(ports);
+  assert.match(String(slow.reason), /did not answer within 50 ms/);
+  const args: string[][] = [];
+  await createOscSocketChecker({ bridgeHost: "localhost", bridgePort: 9811, run: async (_f, a, t) => (args.push([...a, String(t)]), "") })(ports);
+  assert.deepEqual(args, [["+c", "0", "-nP", "-w", "-F", "pcPn", "-iUDP", "-iTCP:9811", "-sTCP:LISTEN", "2000"]]);
+});
+
+test("gma3_osc: input on with nothing bound on the command port says so, no longer claims commands run, and names the re-bind", async () => {
+  osc.bound = []; // the bench state: EnableInput reads Yes, line 1 runs commands on 8000, no socket
+  useChecker();
+  const res = await h.callJson("gma3_osc", {});
+  assert.equal(res.isError, false, res.text);
+  const i = res.result.meaning.input;
+  assert.equal(i.enabled, true);
+  assert.equal(i.acceptsCommands, false);
+  assert.equal(i.listening.status, "not_listening");
+  assert.equal(i.listening.fix, REBIND_CALL);
+  assert.match(i.explanation, /holds no socket on UDP 8000 \(line 1\)/);
+  assert.match(i.explanation, /gma3_configure_osc \{"rebind_input": true, "exclusive": true\}/);
+  assert.doesNotMatch(i.explanation, /the console runs OSC commands/);
+
+  osc.bound = [8000];
+  const ok = await h.callJson("gma3_osc", {});
+  assert.equal(ok.result.meaning.input.acceptsCommands, true);
+  assert.equal(ok.result.meaning.input.listening.status, "listening");
+  assert.match(ok.result.meaning.input.explanation, /the console runs OSC commands sent to UDP port 8000/);
+
+  // No checker (or a remote console): the settings alone, and the listening block says it was not checked.
+  useChecker(async () => ({ status: "not_checked", method: "lsof", reason: "the bridge host 10.0.0.9 is not an address of this machine", ports: [] }));
+  osc.bound = [];
+  const remote = await h.callJson("gma3_osc", {});
+  assert.equal(remote.result.meaning.input.acceptsCommands, true);
+  assert.match(remote.result.meaning.input.listening.finding, /was not checked: the bridge host 10\.0\.0\.9/);
+  // Input off: nothing is checked.
+  osc.base.EnableInput = "No";
+  useChecker(async () => assert.fail("no check with input off"));
+  assert.equal((await h.callJson("gma3_osc", {})).result.meaning.input.listening, undefined);
+});
+
+test("configure_osc rebind_input: re-binds the bench state in one call (no network: true), checks the socket; refused when input is off", async () => {
+  osc.bound = [];
+  useChecker();
+  const preview = await configureOsc(ctx, { rebind_input: true, preview: true });
+  assert.deepEqual((preview.plan as Array<{ step: string }>).map((p) => p.step), ["EnableInput off (re-bind)", "wait for the socket to close", "EnableInput on (re-bind)"]);
+  const r = await configureOsc(ctx, { rebind_input: true, exclusive: true });
+  assert.equal(r.outcome, "succeeded", JSON.stringify(r.steps));
+  assert.equal(r.verification.status, "matched", JSON.stringify(r.verification));
+  assert.match(String(r.verification.checked), /input sockets \(lsof\)/);
+  assert.deepEqual(writes(), ["base EnableInput=No", "base EnableInput=Yes"]);
+  assert.deepEqual(osc.bound, [8000]);
+  assert.equal((r.socketCheck as { status: string }).status, "listening");
+
+  // The console takes the re-bind but still binds nothing: the read-back says so.
+  h.fake.reset();
+  osc.install(h);
+  const stuck = { ...ctx, oscSocketCheck: (async (ports) => judgeSockets(consoleRows().filter((x) => x.proto === "TCP"), 9800, ports, "fake")) as OscSocketChecker };
+  const r2 = await configureOsc(stuck, { rebind_input: true, exclusive: true });
+  assert.equal(r2.verification.status, "mismatched");
+  assert.match(String(r2.verification.detail), /after the re-bind: input reads on, but the console .* holds no socket on UDP 8000/);
+
+  assert.match((await configureOsc(ctx, { rebind_input: true, enable_input: false, exclusive: true })).validationErrors!.join(), /cannot be combined/);
+  osc.base.EnableInput = "No";
+  const off = await configureOsc(ctx, { rebind_input: true, exclusive: true });
+  assert.equal(off.outcome, "failed");
+  assert.match(String(off.steps.at(-1)!.error), /reads off, so there is no socket to re-bind; enable_input: true/);
+});
+
+test("configure_osc: the two-call re-bind (off, then on) works too, but its 'on' needs network: true on a networked machine", async () => {
+  osc.bound = [];
+  assert.equal((await configureOsc(ctx, { enable_input: false, exclusive: true })).outcome, "succeeded");
+  const on = await configureOsc(ctx, { enable_input: true, exclusive: true });
+  assert.equal(on.outcome, "failed");
+  assert.match(String(on.steps.at(-1)!.error), /network: true/);
+  assert.equal(osc.base.EnableInput, "No", "input stays off between the two calls");
+  assert.equal((await configureOsc(ctx, { enable_input: true, exclusive: true, network: true })).outcome, "succeeded");
+  assert.deepEqual(osc.bound, [8000]);
+});
+
+test("test_osc_input: a failure with input on and nothing bound reports the socket finding and the re-bind", async () => {
+  osc.bound = [];
+  useChecker();
+  const r = await testOscInput(ctx, { timeout_ms: 300 }, fakeSend);
+  assert.equal(r.verification.status, "mismatched");
+  assert.match(String(r.verification.detail), /not observed within 300 ms on line 1 \(port 8000\)/);
+  assert.match(String(r.verification.detail), /holds no socket on UDP 8000 \(line 1\).*fix: gma3_configure_osc \{"rebind_input": true, "exclusive": true\}/);
+  const sc = r.socketCheck as { status: string; fix: string };
+  assert.equal(sc.status, "not_listening");
+  assert.equal(sc.fix, REBIND_CALL);
+  assert.equal(osc.vars.has("McpOscTest"), false, "the marker is still cleaned up");
+
+  // The socket is bound but the command is not seen: the finding says the cause is elsewhere.
+  osc.bound = [8000];
+  const lost = async () => {}; // a sender whose datagrams never arrive
+  const r2 = await testOscInput(ctx, { timeout_ms: 300 }, lost);
+  assert.match(String(r2.verification.detail), /holds a socket on UDP 8000, so the socket is bound/);
+  // Not checked: the usual causes, the re-bind first, and why it was not checked.
+  useChecker(async () => ({ status: "not_checked", method: "lsof", reason: "lsof was not found", ports: [] }));
+  const r3 = await testOscInput(ctx, { timeout_ms: 300 }, lost);
+  assert.match(String(r3.verification.detail), /likely causes: input not bound \(switch it off and on: gma3_configure_osc/);
+  assert.match(String(r3.verification.detail), /was not checked: lsof was not found/);
+  // A success runs no check.
+  useChecker(async () => assert.fail("no check on success"));
+  assert.equal((await testOscInput(ctx, {}, fakeSend)).verification.status, "matched");
 });
