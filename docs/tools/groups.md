@@ -188,12 +188,15 @@ Apply a MAtricks to a selection with `Recall MAtricks <n>` (`Call MAtricks` answ
   read back. Value distributions: without wings the stored row ramps 0 → 100 along grid X; with `XWings 2` the
   transformed X is 0 1 2 3 3 2 1 0 and `At 100 Thru 0` is symmetric with the centre lowest.
 - **Not verifiable per fixture: MAtricks timing.** Fade, delay, phase and speed distributions are not baked into
-  programmer values or into a stored cue's channel data, so the tools verify the MAtricks object's settings; that a
-  delay reaches the centre first follows from the transformed positions, not from a measured fade.
+  programmer values or into the channel data of a cue stored from the programmer, so the tools verify the MAtricks
+  object's settings; that a delay reaches the centre first follows from the transformed positions, not from a
+  measured fade. A recipe line is different: its cook writes the fade and delay per fixture into the cue part (THK
+  migration bench, Sequence 9019, read 2026-11-15; see [recipes](recipes.md#what-is-and-is-not-verified)). The tools
+  do not compare those cooked values either.
 - Not qualified: the invert flags (`XInv`, `XInvW`, `InvertX`, ...) on their own did not change a value distribution in
   the probe, and they are not modelled. Their absence of effect holds for the flags alone, `InvertStyle` included,
-  and on phasers too. It does not hold for `PhaserTransform` Mirror: with XWings, Mirror switches XInvW on and runs
-  the second wing's phaser values the other way, on the attributes `InvertStyle` names (verified 2026-11-15; see
+  and on phasers too. It does not hold for `PhaserTransform` Mirror: with XWings, Mirror switches XInvW on and mirrors
+  the second wing's phaser values (absolute 100 − x, relative −x), on the attributes `InvertStyle` names (verified 2026-11-15; see
   [recipes](recipes.md), Transform (Mirror)). `gma3_configure_matricks` has no Transform setting (it only resets PhaserTransform to None on a new object); group-level MAtricks (the MAtricks properties a group object also has) are not touched;
   `Width`, `Shift` and `Shuffle` are written and read back but their distribution was not measured.
 - Not covered: groups and MAtricks of other data pools (the tools address the current one by number).

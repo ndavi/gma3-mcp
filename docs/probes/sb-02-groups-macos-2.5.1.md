@@ -79,6 +79,11 @@ A cue stored from the row with `Recall MAtricks` (XWings 2, DelayFromX 1, DelayT
 1 0 per channel (`GetPresetData` on the part) but no per-fixture delay; the programmer phaser data has none either.
 MAtricks timing can therefore only be verified as the object's settings.
 
+Later finding (THK migration bench, 2026-11-15, Sequence 9019, Group 9005 of 12 dimmers): a recipe line is different.
+Its cook writes the fade and delay per fixture into the cue part: own `XWINGS 2` with `FADEFROMX 0` / `FADETOX 3` cooked
+fade 0 on the outer fixtures up to 3 at the centre, and `DELAYFROMX 0` / `DELAYTOX 0.5` cooked 0 to 0.5 along the row
+(read with `preset.read`). See `docs/tools/recipes.md`, What is and is not verified.
+
 ## MAtricks objects
 
 | Write (`Set` on `MAtricks 900`, read in the display role) | Result |

@@ -65,11 +65,11 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | Capability | Supported |
 | --- | --- |
 | Standard lines: group selection, preset values, MAtricks reference, Enabled, Name, SelectionMode | read, add, set, move, remove; coverage predicted and verified |
-| Per-line MAtricks columns (XWings, XBlock, XGroup, XWidth, XShift, XShuffle, X, FadeFromX / FadeToX, DelayFromX / DelayToX, PhaseFromX / PhaseToX, SpeedFromX / SpeedToX, and the Y and Z ones) | written by `gma3_store_recipe_cues` and read back there; not edited by `gma3_edit_recipe`. A line whose X column is set gives values to only part of its group: the coverage is predicted on the fixtures that select keeps ([below](#matricks-select-on-a-line)), from the line's own columns or from its MAtricks object, and left not predicted (named) where the rule is not verified |
+| Per-line MAtricks columns (XWings, XBlock, XGroup, XWidth, XShift, XShuffle, X, FadeFromX / FadeToX, DelayFromX / DelayToX, PhaseFromX / PhaseToX, SpeedFromX / SpeedToX, and the Y and Z ones) | written by `gma3_store_recipe_cues` and read back there; not edited by `gma3_edit_recipe` (a phaser line's X / Y wings, blocks, groups and phase Y: `gma3_edit_phaser_recipe`). A line whose X column is set gives values to only part of its group: the coverage is predicted on the fixtures that select keeps ([below](#matricks-select-on-a-line)), from the line's own columns or from its MAtricks object, and left not predicted (named) where the rule is not verified |
 | A line's filter (`filter`: a Filter pool number) | written by `gma3_edit_recipe` (add, set; `null` clears) and `gma3_store_recipe_cues`, read back by number; coverage predicted on the filter's attributes for the filter shape described [below](#filters-on-a-line), otherwise not predicted (named) |
 | A preset line's generator (`generator`: a Generator pool number, in place of the values) | written by `gma3_edit_recipe` (add, set; `null` clears) on preset lines only, read back by number; coverage predicted on the generator's channel attributes ([below](#generators-on-a-preset-line)); not written by `gma3_store_recipe_cues` |
 | Standard lines with a world, SelectionFromValue | read and kept; not edited; coverage not predicted (named in the result; a merge treats what they reach as possibly replaced) |
-| Phaser recipe lines (PhaserRecipe), shapes | read and kept; not created or edited; coverage not predicted (likewise) |
+| Phaser recipe lines (PhaserRecipe), shapes | created in a free preset slot and edited (line settings, add or remove a line) by [`gma3_edit_phaser_recipe`](#gma3_edit_phaser_recipe), which reads its own lines back; read and kept by the other tools, never written by them; coverage not predicted by them (likewise) |
 | Targets | presets and cue parts (edit, read); a preset, cue part, cue or whole sequence (cook) |
 | Nested recipe presets (a line's preset embeds others) | noted; their own recipes are not re-cooked by this cook |
 
@@ -599,7 +599,7 @@ preset's lines, then `Cook Preset P.N /MergeLowPriority`.
   and `steps: [{preset? | sources?, curve?, trans?, width?}, ...]` (`{}` keeps a step; in `sources` a source not
   given is kept and `null` clears its preset with `set PRESET ""`, back to the shape's value). A new shape must have
   the line's value sources (Flyout and Flyout Inverted do). The line must be a PhaserRecipe of 2 steps whose values
-  can be told apart by their value sources' presets (a plain shape: each step from a preset).
+  can be told apart by their value sources (a plain shape: each step from a preset or from hard values).
 - `add_line` appends a copy of line 1 (`Copy Preset P.N.1 At Preset P.N.k`), retargeted with the given fields:
   `selection` and the steps (a preset or sources each) are required; shape, MAtricks, speed, phase and measure are
   line 1's unless given. Every step is reset to the shape's curve, then given its `curve` if any (a copy keeps line
@@ -631,8 +631,8 @@ Read back:
   outputs, before or after, is left out of that comparison: where two lines act on the same attribute of the same
   fixture, the later line's value wins, so another line's value may rightly appear or go.
 
-`add_line` and `remove_line` also need the line (line 1 for `add_line`) to be 2 steps from presets: the read-back
-tells cooked values apart by their step presets.
+`add_line` and `remove_line` also need the line (line 1 for `add_line`) to be 2 steps from presets or hard values:
+the read-back tells cooked values apart by their step presets or hard values.
 
 ### Re-cooking the calling cues: `recook`
 
@@ -701,6 +701,19 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   26440–39096 of 65535 over 4 s) while 252 and 254 stayed at Dimmer 0 and Pan 32768. XWings with a count that is not
   a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and grids with shared columns were not run with a select (cue 13, a 4 × 3 grid, cooked 1 and 5 for X 1: not
   modelled).
+- The line's own MAtricks columns and individual timing, from the THK migration bench (2026-11-15, 2nd series,
+  Sequence 9019, Group 9005 of 12 dimmers; the bench wrote the columns with `gma3_store_recipe_cues`, cooked them and
+  saw them in the output). Read again here (2026-11-15, `preset.read` on the cue parts, read only), every value
+  `cooked`:
+  - Cue 3, own `XWINGS 2`, `FADEFROMX 0` / `FADETOX 3` on 1.9031 (Dimmer 100): fade 0 on fixtures 1 and 12, then 0.6,
+    1.2, 1.8, 2.4 up to 3 on 6 and 7 (outer edges to the centre);
+  - Cue 4, own `FADEFROMX 2` / `FADETOX 2`, `DELAYFROMX 0` / `DELAYTOX 0.5` on 1.9032 (Dimmer 0): delay 0 on fixture 1
+    rising by 0.045 to 0.5 on 12, fade 2 on all;
+  - Cue 11, the same as cue 3 through MAtricks 9003 ("TEST B2 XWINGS2 FADE"): the same fades.
+
+  So the cook bakes a line's fade and delay per fixture into the cue part (a cue stored from the programmer with a
+  recalled MAtricks does not: [SB-02](../probes/sb-02-groups-macos-2.5.1.md)). Not verified by the tools: they write
+  and read back the columns, but they neither predict nor compare the per-fixture fade and delay a line cooks.
 - Verified live for the phase note (same bench and day): Sequence 9033 cues 2, 6, 8, 9 and 10 cooked the phases the note
   gives (251 0° / 253 239.93°; 253 180°; 253 239.93° / 254 359.9°; 253 and 254 180°; 252 and 254 180°), and the cook of
   Sequence 9033 read back `matched` with the phase check on. `gma3_recipes` on the phaser presets 21.9048, 21.9049 and
@@ -718,17 +731,6 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   under a range on the line.
 - Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not. How a column reads in the
   display role while a MAtricks reference supplies it (`<2>`) is not known (the typed read gives None).
-- Not covered:
-  - the background cook's exact timing (observed: not yet on an immediate read, done after 3 s);
-  - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, a value
-    source's 2 steps from different pools); a step from a preset and the other from hard values on one source (allowed,
-    not run on a console);
-  - value sources on attributes other than Dimmer, Tilt and Pan (shapes other than Flyout 19 / 20 with several
-    sources); per-source curves (a curve applies to every source of its step);
-  - worlds; filters of another shape than the one modelled (attribute rules and Used In Object rules with
-    APPLYTOFIXTURES No, one rule, every layer on) — they stay not predicted;
-  - recipe templates;
-  - the Edit Recipe mode outside `gma3_edit_phaser_recipe`.
 - Verified live for `gma3_edit_phaser_recipe` (onPC 2.5.1, bridge 0.52.0, 2026-11-14): a Dimmer phaser (8 fixtures,
   8/8 cooked, 2 Hz) and a colour phaser (4 fixtures, RGBW, 16/16 cooked, 0.5 Hz), built back to back, without a
   dialog; then a Dimmer line (Snap) and an RGBW line (Ease In) in the All preset 21.9002 (20/20 cooked, 2 Hz and
@@ -745,6 +747,12 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   - `add_line` twice (Ease In at 90 BPM, Swing at 30 BPM);
   - `remove_line` of a middle line;
   - a duplicate step pair and a missing line, refused.
+
+  Sequence 9000 Cue 11 (one standard line calling 21.9005) followed every one of these changes without a re-cook.
+  That is not the rule: other cues kept old values until re-cooked (see [`recook`](#re-cooking-the-calling-cues-recook)).
+  The order of `create` (curves after the copies) was verified live too: 21.9006, a Dimmer line with Snap on step 1
+  and an RGBW line without a curve, matched; line 2 kept the Sine curve (TRANS 100) instead of line 1's Snap. A copy
+  keeps line 1's Snap, and `Assign Preset` keeps it too.
 - Verified live for several value sources per step (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-14, Group
   9002 of 12 spots, scratch preset 21.9025, the code run directly against the bridge):
   - `create` on Flyout (19) with `sources` Dimmer 1.9020 / 1.9021 and Tilt 2.9020 / 2.9021 (relative), Pan left to
@@ -779,10 +787,6 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   - `set` on Chase lines: `adaptive_measure: true` (measure back to 4), `measure 2` (flag switched off first), a width
     without `adaptive_width: false` refused, with it 50 / 150, `adaptive_width: true` (25 / 75 again), MAtricks 9000
     under Adaptive Measure (measure 2, widths 50 / 50, not flagged).
-
-  The cue's own values followed every change. The new order of `create` (curves after the copies) was verified live
-  too: 21.9006, a Dimmer line with Snap on step 1 and an RGBW line without a curve, matched; line 2 kept the Sine
-  curve (TRANS 100) instead of line 1's Snap. A copy keeps line 1's Snap, and `Assign Preset` keeps it too.
 
 - Verified live for hard values (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-15, Group 9001 of 4 Daytona,
   the code run directly against the bridge), each read back matched:
@@ -837,7 +841,12 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     (not released), and Pan kept moving: a RELEASE does not stop a relative phaser (THK migration bench, series 1),
     so the released Pan is seen in the cooked data, not in the output. Sequence 9030 was switched off;
   - `gma3_edit_recipe set` line 2 `filter: null` then `filter: 9006`, both matched; the console re-cooked at once each
-    time (Dimmer came from 21.9072, 2 steps, then from 1.9010 again); `gma3_cook_recipes` of the sequence matched (8 + 4).
+    time (Dimmer came from 21.9072, 2 steps, then from 1.9010 again); `gma3_cook_recipes` of the sequence matched (8 + 4);
+  - not run on a console: the "keeps out" mismatch (fake bridge only: the console always applied the filter); a filter
+    on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too (the check
+    would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES Yes (left
+    not predicted). The cook check is per fixture and attribute, not per line: in Cue 1 above, a filter that the
+    console ignored would still have read back matched, because line 1 also predicts the Dimmer pair.
 - Verified live for `recook` (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-15, Group 9001 = Daytona
   251-254, the code run directly against the bridge):
   - `create` 21.9075 "TEST I4 RECOOK" (Sine, 6 BPM, Measure 1) first with 1.9031 / 1.9032: mismatched as it should
@@ -886,6 +895,20 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     generator line with a filter or MAtricks, a generator whose settings change while a cue plays it (whether the cue
     follows without a re-cook), the speed master multiplying the speed at another BPM than 60 (the bench notes say it does),
     `edit` appending a channel (fake bridge only), channels beyond 2, generator types other than Random.
+- Relative layers, from the THK migration bench (2026-11-15; not run through this repo's code, read again here with
+  `preset.read` and `gma3_recipes`, read only):
+  - a "relative only" preset: 2.9044 "TEST B4 PAN REL 0" (4th series) was stored with `gma3_store_preset` (`layers:
+    [relative]`, `attributes: [Pan]`) after `Attribute "Pan" At Relative 0` and `Off Attribute "Tilt"` in the
+    programmer. It holds 4 rows, Pan on 251-254, each `hasAbsolute: false`, `hasRelative: true`, `relative: 0`. A line
+    calling such a preset stops a relative phaser on its attributes (1st series, preset 2.9040; 2nd series, Sequence
+    9022), where neither the base preset, another absolute preset nor a RELEASE does. Not verified by the tools: a relative of 0 counts as no
+    layer in `gma3_store_preset`'s checks (`layers` is not needed for it), its read-back does not compare it, and
+    `gma3_preset` shows those rows without a value ([presets](presets.md#what-is-and-is-not-verified));
+  - a new relative phaser takes over an attribute's relative layer: Sequence 9025 Cue 1 = Group 9001 + 2.9032 (base)
+    and Group 9001 + 21.9054 (relative Pan + Tilt phaser A); Cue 2 = Group 9001 + 2.9044 (Pan relative 0) and Group
+    9001 + 21.9060 (relative Tilt phaser B). In Cue 2 the bench saw Pan held on the base and Tilt follow B alone
+    (B's amplitude and speed, nothing left of A). Both cues read 8 cooked values (Pan, Tilt on 251-254) and nothing
+    uncooked. Not tested: the same relay without the relative 0 on the attribute B does not set (Pan here).
 - Verified live for `phasersync` and `appearance` (onPC 2.5.1.1, show "Rescue", 2026-11-15, Group 9001 = Daytona
   251-254, the code run directly against the bridge):
   - by hand first, on Sequence 9036 (2 empty cues): the cue object has neither property, every part has both. Lua
@@ -916,11 +939,17 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     tool), a name shared by several appearances (fake bridge only), PhaserSync on a part above 0 through the tool (set
     by hand only), an entry without lines combined with `cook`, and the post-cook mismatch (the console kept both
     properties in every cook tried).
-- Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
-  a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
-  (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES
-  Yes (left not predicted). The cook check is per fixture and attribute, not per line: in Cue 1 above, a filter that the console
-  ignored would still have read back matched, because line 1 also predicts the Dimmer pair.
+- Not covered:
+  - the background cook's exact timing (observed: not yet on an immediate read, done after 3 s);
+  - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, a value
+    source's 2 steps from different pools); a step from a preset and the other from hard values on one source (allowed,
+    not run on a console);
+  - value sources on attributes other than Dimmer, Tilt and Pan (shapes other than Flyout 19 / 20 with several
+    sources); per-source curves (a curve applies to every source of its step);
+  - worlds; filters of another shape than the one modelled (attribute rules and Used In Object rules with
+    APPLYTOFIXTURES No, one rule, every layer on) — they stay not predicted;
+  - recipe templates;
+  - the Edit Recipe mode outside `gma3_edit_phaser_recipe`.
 
 ## Live test
 
