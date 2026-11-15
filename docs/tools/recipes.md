@@ -23,7 +23,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | --- | --- | --- |
 | `gma3_recipes` | nothing (read-only) | untouched |
 | `gma3_edit_recipe` | one recipe line of a preset or cue part; **the console cooks the edited line at once** | untouched |
-| `gma3_store_recipe_cues` | the recipe lines of up to 100 cue parts of one sequence, their cue names and notes; each written line is cooked at once, as above | untouched |
+| `gma3_store_recipe_cues` | the recipe lines of up to 100 cue parts of one sequence, their cue names and notes, a part's PhaserSync and the cue's appearance; each written line is cooked at once, as above | untouched |
 | `gma3_cook_recipes` | the cooked (and, with merge or overwrite, the uncooked) data of the affected targets | untouched |
 | `gma3_edit_phaser_recipe` | create: one preset with 1-8 PhaserRecipe lines, cooked; set / add_line / remove_line: one line of an existing phaser preset | create: **used** (must be empty first, cleared with ClearAll at the end); edits: untouched |
 | `gma3_store_filter` | one new filter in a free slot | untouched |
@@ -179,7 +179,7 @@ that is not predicted may reach it (a `dependencyNotes` entry says so).
 
 ## `gma3_store_recipe_cues`
 
-`{sequence, mode: "replace" | "append", cues: [{cue, part?, name?, note?, lines: [line, ...]}], cook?, replace_uncooked?,
+`{sequence, mode: "replace" | "append", cues: [{cue, part?, name?, note?, phasersync?, appearance?, lines: [line, ...]}], cook?, replace_uncooked?,
 verify_cook?, preview?, stop_on_failure?, detail?}`. A line is `{selection, values, matricks?, filter?, name?, enabled?,
 selection_mode?, x?, y?, z?}` with the fields of `gma3_edit_recipe` add. `x`, `y`, `z` are the line's own MAtricks columns:
 the axis settings of [`gma3_configure_matricks`](groups.md#gma3_matricks-and-gma3_configure_matricks) (`wings`, `blocks`,
@@ -192,6 +192,27 @@ of one target with its own reference checks, a read-back of every line and the c
 are 4,300 items and as many full reads. A recipe cue is written as a whole (its lines replaced or appended), the same
 groups and presets recur across hundreds of lines, and the build needs the per-line columns, the cue's name and note,
 and a cook at the end. This tool checks the references once, writes per cue part and reads back per cue part.
+
+The cue part's properties (they used to need `gma3_set_property` after the build; `gma3_store_cues` has no code for
+either):
+
+- `phasersync`: `true` sets `PhaserSync` = Yes on the entry's own part: a phaser that part starts locks onto the
+  phasers already running instead of starting from zero (the THK migration's bench, 14 Nov. 2026). `false` or `null`
+  clears it by writing `""`: the console refuses `"No"` (Lua `set` keeps the old value and replies with it; the command
+  line answers "Illegal value").
+- `appearance`: an Appearance pool number, or a name, resolved by `check_references` to exactly one appearance (names
+  compare case aside; a name shared by several is refused: give the number). `null` or `""` clears it. It is written on
+  the cue's **Part 0**, whatever the entry's part: the cue object has no Appearance, Part 0's is the cue's (the THK
+  migration bench; `Assign Appearance N At Sequence S Cue C` also lands on Part 0). Two entries of one cue that
+  ask for different appearances are refused. Parts 1 and above have an Appearance of their own, which this tool does
+  not write.
+- Both are written by Lua `set` (`PhaserSync` "Yes" / "", `Appearance` the number as text / ""), after the lines,
+  the name and the note, and are not cooked data (the part stays `ownNonCookedDataPresent: false`). Not the command
+  line: `Assign Appearance N At ...` creates Appearance N when it is missing. A missing number or name is refused
+  before anything is sent, because `set` with one clears the appearance there without an error.
+- In `append` mode an entry may leave out `lines` (or give `[]`) when it sets `name`, `note`, `phasersync` or
+  `appearance`: that updates an existing cue without touching its lines (e.g. `{cue: 1, phasersync: false}` clears
+  it). `replace` always needs lines. An omitted field sends nothing.
 
 1. Validated as a whole before anything is read: at most 100 cue parts (one sequence), 200 lines per part and 500 lines
    per call (each line is a few requests, so a larger build is several calls); a cue part listed twice, an unknown line
@@ -209,9 +230,12 @@ and a cook at the end. This tool checks the references once, writes per cue part
      (`None` for null) and `Enabled Yes`; every `set` reply is checked (a column by the value it reads, as
      `gma3_configure_matricks` checks it);
    - the cue's name on its Part 0, and its `Note` on the cue object;
+   - `set PhaserSync` on the part and `set Appearance` on Part 0 (each reply checked: "Yes" / "", the appearance's
+     name / "");
    - a read-back: the line count, every field written (the preset by its address, the filter by its number), the columns in the display role, the
-     lines that were there before unchanged (append), the name and the note (exactly). The item's line has the count and
-     only the mismatches.
+     lines that were there before unchanged (append), the name and the note (exactly), PhaserSync (display role) and
+     the appearance (its number from the raw role; once cleared it is absent there, so empty is confirmed as `""` in
+     the display role). The item's line has the count, the properties written and only the mismatches.
 
    A part's steps stop at its first failure; what was sent stays (nothing is undone or retried) and its summary says
    which step stopped it. Other parts go on unless `stop_on_failure: true`; a request without a reply stops the rest
@@ -219,6 +243,9 @@ and a cook at the end. This tool checks the references once, writes per cue part
 5. `cook` (a `gma3_cook_recipes` mode), only when every part was written and matched: each part is cooked with
    `gma3_cook_recipes` (its inspection, its `replace_uncooked` refusal and, unless `verify_cook: false`, its read-back),
    one after the other. A cook that does not succeed leaves the call `partial`; the parts stay written.
+6. `read_properties`, after a cook: the properties are read once more, so `properties` in the result (per part:
+   `phasersync: {ref, value}`, `appearance: {ref, value: {no, name} | null}`) is the state at the end of the call; a
+   change is a mismatch.
 
 `preview: true` runs steps 1–3 and returns the plan per part (lines before, deletions, lines, requests; `detail: true`
 every command and write). No `exclusive`: like `gma3_edit_recipe`, nothing goes through the programmer, the selection
@@ -859,6 +886,36 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     generator line with a filter or MAtricks, a generator whose settings change while a cue plays it (whether the cue
     follows without a re-cook), the speed master multiplying the speed at another BPM than 60 (the bench notes say it does),
     `edit` appending a channel (fake bridge only), channels beyond 2, generator types other than Random.
+- Verified live for `phasersync` and `appearance` (onPC 2.5.1.1, show "Rescue", 2026-11-15, Group 9001 = Daytona
+  251-254, the code run directly against the bridge):
+  - by hand first, on Sequence 9036 (2 empty cues): the cue object has neither property, every part has both. Lua
+    `set PhaserSync`: "Yes" and "1" set it (replies "Yes", raw `true`), `""` clears it (reply `""`, raw `false`);
+    "No", "On", `true` and `false` sent over Yes were kept, the reply being the old value (`true` and "On" sent over
+    `""` did not set it either). Command line `Set ... Property
+    "PhaserSync" "No"`: "Illegal value". Lua `set Appearance`: "9000" and "TEST RELEASE" assign Appearance 9000 (reply
+    the name, raw a handle with its index); `""`, "Appearance 9000", "#FF0000", "Red", a missing number "8999" or a
+    missing name, each sent over Appearance 9000, cleared it without an error. `Assign Appearance 9000 At Sequence 9036 Cue 2`
+    landed on Part 0; `Assign Appearance 8999 At ... Part 0` answered OK and **created** Appearance 8999 (deleted
+    afterwards). Part 1 took its own PhaserSync and Appearance. Line writes, `Cook ... /MergeLowPriority`, `Cook ...
+    /Overwrite` and `Store ... /Merge` (empty programmer) kept both;
+  - Sequence 9037 ("ITEM8 PROPS", 2 empty cues), `replace`, cook merge low priority: Cue 1 = Group 9001 + 1.9010 and
+    Group 9001 + 21.9072, `phasersync: true`, `appearance: "TEST RELEASE"` (resolved to 9000); Cue 2 = Group 9001 +
+    1.9010, `phasersync: false`. Matched, both cooks matched; `properties` after the cook: Cue 1 PhaserSync true,
+    Appearance 9000 "TEST RELEASE"; Cue 2 PhaserSync false. Read again by hand: Cue 1 Part 0 PhaserSync "Yes",
+    Appearance "TEST RELEASE", Cue 2 PhaserSync "" and Appearance ""; `ownNonCookedDataPresent: false` on both, and
+    `gma3_cue_contents` of Cue 1 listed 8 values, all `cooked: true`;
+  - `append` with `{cue: 1, phasersync: false}` (no lines): matched, PhaserSync "" , the 2 lines and the appearance
+    kept. `replace` of Cue 1 with the same lines and `phasersync: true`, cooked: the appearance survived the deletes and
+    the cook. Then `{cue: 1, phasersync: false}` and `{cue: 2, appearance: 9000}`, then `{cue: 2, appearance: null}`:
+    each matched and read back. `appearance: 8999` was refused by `check_references`, nothing sent, Appearance 8999
+    not created;
+  - output after `Goto Sequence 9037 Cue 1` (16-bit, sampled every 200 ms, about 420 ms resolution, 4 s): the Dimmers
+    of 251 and 252 swung between 6933 and 58939 (11 % to 90 %) with a period of about 2 s, Pan moved around its centre
+    (28022 to 39279), as preset 21.9072 does. Sequence 9037 was switched off;
+  - not run on a console: what PhaserSync does to a phaser (the migration bench of 14 Nov. 2026 measured it, not this
+    tool), a name shared by several appearances (fake bridge only), PhaserSync on a part above 0 through the tool (set
+    by hand only), an entry without lines combined with `cook`, and the post-cook mismatch (the console kept both
+    properties in every cook tried).
 - Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
   a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
   (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES

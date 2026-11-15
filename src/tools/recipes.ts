@@ -6,7 +6,8 @@
  *   gma3_edit_recipe    add, set, move or remove one standard recipe line (the definition), with its filter, or a
  *                       generator in place of the values (preset lines)
  *   gma3_store_recipe_cues  the standard lines of many cue parts in one call (replace or append), with the per-line
- *                       MAtricks columns, the cue's name and note; references checked once, a compact read-back (#101)
+ *                       MAtricks columns, the cue's name and note, a part's PhaserSync and the cue's Appearance;
+ *                       references checked once, a compact read-back (#101)
  *   gma3_cook_recipes   cook a preset, a cue part, a cue or a whole sequence with an explicit option, after showing every
  *                       affected target, the coverage it should get and what happens to uncooked data
  *
@@ -44,12 +45,20 @@
  *     the values back and clears it; `set Generator ""` clears it); the line cooks a token value on every member of
  *     its group that has a channel's attribute (generators.ts). `Assign Generator <missing>` answers OK and changes
  *     nothing (2026-11-15).
+ *   - A cue part's PHASERSYNC and APPEARANCE (2026-11-15, Rescue, sequence 9036): the cue object has neither, every
+ *     part has both; the cue's appearance is Part 0's (the THK migration bench; `Assign Appearance N At Sequence S Cue C`
+ *     lands on Part 0). `set PhaserSync "Yes"` sets it and `""` clears it (raw true / false); "No", "On", true and false
+ *     are silently kept over Yes (the reply is the old value) and do not set it, and the command line answers "Illegal value" to "No".
+ *     `set Appearance "<number>"` or `"<name>"` assigns it (the reply is the appearance's name) and `""` clears it; a
+ *     number or name that does not exist, "Appearance N" or a colour clears the one there without an error. The command
+ *     line `Assign Appearance N At ...` also works, but creates Appearance N when it is missing. Line writes, deletes,
+ *     Cook /MergeLowPriority and /Overwrite and Store /Merge keep both.
  */
 import { z } from "zod";
 import { BridgeError, type Gma3Bridge } from "../bridge.js";
 import { json, operation, type RegisterTools, type ToolContext } from "./context.js";
 import { presetId, type PresetRead, type PresetRow } from "./presets.js";
-import { cueRef, readObjects } from "./common.js";
+import { cueRef, readFields, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
 import { readFilter, type FilterInfo } from "./filters.js";
 import { generatorAttributes, readGenerator, type GeneratorInfo } from "./generators.js";
@@ -1102,15 +1111,22 @@ interface RecipeLineSpec {
   columns: ColumnWrite[];
 }
 
+/** A cue's appearance as asked: a pool number, a name (resolved to its number before anything is sent), or null (clear). */
+type AppearanceSpec = { no: number } | { name: string } | null;
+
 interface RecipeCueSpec {
   target: Extract<Target, { kind: "part" }>;
   name?: string;
   note?: string;
+  /** PhaserSync of this part: "Yes", or "" to clear (the console refuses "No"). */
+  phasersync?: "Yes" | "";
+  /** Appearance of the cue's Part 0. */
+  appearance?: AppearanceSpec;
   lines: RecipeLineSpec[];
 }
 
 const LINE_KEYS = ["selection", "values", "matricks", "filter", "name", "enabled", "selection_mode", "x", "y", "z"];
-const CUE_KEYS = ["cue", "part", "name", "note", "lines"];
+const CUE_KEYS = ["cue", "part", "name", "note", "phasersync", "appearance", "lines"];
 const AXES = ["x", "y", "z"] as const;
 const presetKey = (p: { pool: number; number: number }) => `${p.pool}.${p.number}`;
 const nearValue = (a: number | null | undefined, b: number | null) => (a === null || b === null ? a === b : a !== undefined && Math.abs(a - b) < 1e-3);
@@ -1165,7 +1181,16 @@ function parseRecipeLine(v: Validator, raw: unknown, path: string): RecipeLineSp
   return { selection, values, matricks, filter, name, enabled: r.enabled as boolean | undefined, selectionMode: typeof mode === "string" && Object.hasOwn(SELECTION_MODES, mode) ? SELECTION_MODES[mode as keyof typeof SELECTION_MODES] : undefined, columns };
 }
 
-function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknown): RecipeCueSpec[] {
+const appearanceKey = (a: AppearanceSpec) => (a === null ? "none" : "no" in a ? `Appearance ${a.no}` : `Appearance "${a.name}"`);
+
+function parseAppearance(field: string, raw: unknown): AppearanceSpec {
+  if (raw === null || raw === "") return null;
+  if (typeof raw === "number") return { no: objectNumber(field, raw, { max: 10000 })! };
+  if (typeof raw === "string") return { name: objectName(field, raw)! };
+  throw new ValidationError(`${field} must be an appearance number, an appearance name, or null to clear it (got ${describe(raw)})`, field);
+}
+
+function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknown, mode?: "replace" | "append"): RecipeCueSpec[] {
   if (!Array.isArray(raw) || raw.length === 0) {
     v.fail("cues must be a non-empty list");
     return [];
@@ -1179,7 +1204,7 @@ function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknow
   raw.forEach((c, i) => {
     const path = `cues[${i}]`;
     if (!c || typeof c !== "object" || Array.isArray(c)) {
-      v.fail(`${path} must be {cue, part?, name?, note?, lines}`);
+      v.fail(`${path} must be {cue, part?, name?, note?, phasersync?, appearance?, lines}`);
       return;
     }
     const r = c as Record<string, unknown>;
@@ -1189,8 +1214,15 @@ function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknow
     const part = r.part === undefined ? 0 : v.check(() => partNumber(`${path}.part`, r.part));
     const name = v.check(() => objectName(`${path}.name`, r.name, { optional: true }));
     const note = v.check(() => noteText(`${path}.note`, r.note, { optional: true }));
+    if (r.phasersync !== undefined && r.phasersync !== null && typeof r.phasersync !== "boolean") v.fail(`${path}.phasersync must be true, false or null (false and null clear it)`);
+    const phasersync = r.phasersync === undefined ? undefined : r.phasersync === true ? "Yes" : "";
+    const appearance = r.appearance === undefined ? undefined : v.check(() => parseAppearance(`${path}.appearance`, r.appearance));
+    // An entry without lines only sets the cue's properties, in append mode (replace would delete every line).
+    const propsOnly = mode === "append" && [r.name, r.note, r.phasersync, r.appearance].some((x) => x !== undefined);
     const lines: RecipeLineSpec[] = [];
-    if (!Array.isArray(r.lines) || r.lines.length === 0) v.fail(`${path}.lines must be a non-empty list of recipe lines`);
+    if (propsOnly && (r.lines === undefined || (Array.isArray(r.lines) && r.lines.length === 0))) {
+      // nothing to parse
+    } else if (!Array.isArray(r.lines) || r.lines.length === 0) v.fail(`${path}.lines must be a non-empty list of recipe lines (an entry without lines only sets name, note, phasersync or appearance, in mode append)`);
     else if (r.lines.length > MAX_RECIPE_LINES_PER_CUE) v.fail(`${path}.lines: at most ${MAX_RECIPE_LINES_PER_CUE} lines per cue part (got ${r.lines.length})`);
     else
       r.lines.forEach((l, k) => {
@@ -1198,8 +1230,16 @@ function parseRecipeCues(v: Validator, sequence: number | undefined, raw: unknow
         if (s) lines.push(s);
       });
     total += Array.isArray(r.lines) ? r.lines.length : 0;
-    if (sequence !== undefined && cue !== undefined && part !== undefined) out.push({ target: { kind: "part", sequence, cue, part }, name, note, lines });
+    if (sequence !== undefined && cue !== undefined && part !== undefined) out.push({ target: { kind: "part", sequence, cue, part }, name, note, ...(phasersync !== undefined ? { phasersync } : {}), ...(appearance !== undefined ? { appearance } : {}), lines });
   });
+  // The appearance is the cue's (Part 0): two parts of one cue may not ask for different ones.
+  const asked = new Map<string, string>();
+  for (const c of out) {
+    if (c.appearance === undefined) continue;
+    const k = asked.get(c.target.cue);
+    if (k !== undefined && k !== appearanceKey(c.appearance)) v.fail(`cues: cue ${c.target.cue} is given two appearances (the appearance is the cue's, on Part 0)`);
+    asked.set(c.target.cue, appearanceKey(c.appearance));
+  }
   if (total > MAX_RECIPE_LINES_PER_CALL) v.fail(`at most ${MAX_RECIPE_LINES_PER_CALL} recipe lines per call (got ${total}); split the cues over several calls`);
   const dup = duplicates(out.map((c) => targetRef(c.target)));
   if (dup.length) v.fail(`cues: ${dup.join(", ")} ${dup.length === 1 ? "is" : "are"} listed more than once`);
@@ -1218,6 +1258,8 @@ interface CuePlan {
   lineEnd: number[];
   nameStep?: number;
   noteStep?: number;
+  phasersyncStep?: number;
+  appearanceStep?: number;
 }
 
 export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unknown>): Promise<OperationResult> {
@@ -1225,7 +1267,7 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
   const v = new Validator();
   const sequence = v.check(() => objectNumber("sequence", raw.sequence));
   const mode = v.check(() => oneOf("mode", raw.mode, ["replace", "append"] as const));
-  const cues = parseRecipeCues(v, sequence, raw.cues);
+  const cues = parseRecipeCues(v, sequence, raw.cues, mode);
   const cook = raw.cook === undefined ? undefined : v.check(() => oneOf("cook", raw.cook, Object.keys(COOK_OPTION) as CookMode[]));
   for (const k of ["replace_uncooked", "verify_cook", "preview", "stop_on_failure", "detail"]) if (raw[k] !== undefined && typeof raw[k] !== "boolean") v.fail(`${k} must be true or false`);
   if (raw.cook === undefined && (raw.replace_uncooked !== undefined || raw.verify_cook !== undefined)) v.fail("replace_uncooked and verify_cook go with cook");
@@ -1240,6 +1282,12 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
   const body = async (): Promise<OperationResult> => {
     const before = new Map<string, Line[]>();
     const presetAddr = new Map<string, string>();
+    /** Each asked appearance (number or name) resolved to the pool number and name it reads back as. */
+    const appearances = new Map<string, { no: number; name: string }>();
+    const ambiguous: string[] = [];
+    /** The properties each cue part read back after its writes (replaced by the read after the cook). */
+    const readProps = new Map<string, CueProperties>();
+    const wantedAppearance = (c: RecipeCueSpec) => (c.appearance === undefined ? undefined : c.appearance === null ? null : appearances.get(appearanceKey(c.appearance)));
     const warnings: string[] = [];
     // 1. Read-only, once for the whole call: every cue part exists and was read completely, and every group, preset
     // and MAtricks a line names is in the show. Nothing is sent when one of them fails.
@@ -1290,6 +1338,9 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
               for (const ref of [`Group ${l.selection}`, `Preset ${presetKey(l.values)}`, ...(l.matricks !== undefined ? [`MAtricks ${l.matricks}`] : []), ...(l.filter !== undefined ? [`Filter ${l.filter}`] : [])]) if (!firstUse.has(ref)) firstUse.set(ref, at);
             }),
           );
+          cues.forEach((c, ci) => {
+            if (c.appearance && !firstUse.has(appearanceKey(c.appearance))) firstUse.set(appearanceKey(c.appearance), `cues[${ci}].appearance`);
+          });
           const missing: string[] = [];
           const empty: string[] = [];
           const groups = new Map<number, GroupInfo>();
@@ -1297,6 +1348,16 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
           try {
             for (const ref of refs) {
               const [kind, no] = ref.split(" ");
+              if (kind === "Appearance") {
+                // A missing number or name would clear the appearance there without an error (set) or create it
+                // (Assign): it is resolved here, a name to exactly one appearance (names compare case aside).
+                const res = (await bridge.request("objects", { ref, fields: ["Name"], limit: 2 }, t).catch((err: unknown) => (notFound(err) ? null : Promise.reject(err)))) as { total?: number; items?: Array<{ index?: number; name?: string; invalid?: boolean }> } | null;
+                const items = (res?.items ?? []).filter((it) => !it.invalid && typeof it.index === "number");
+                if (!items.length) missing.push(`${ref} (first used by ${firstUse.get(ref)})`);
+                else if (items.length > 1 || (res?.total ?? 1) > 1) ambiguous.push(`${ref} names ${res?.total ?? items.length} appearances (${items.map((it) => it.index).join(", ")}${(res?.total ?? 0) > items.length ? ", ..." : ""}); give the number`);
+                else appearances.set(ref, { no: items[0].index!, name: String(items[0].name ?? "") });
+                continue;
+              }
               if (kind === "Group") {
                 const g = await readGroup(bridge, Number(no), t, groups);
                 if (!g.exists) missing.push(`${ref} (first used by ${firstUse.get(ref)})`);
@@ -1317,7 +1378,7 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
             return asRead(stepFromError("check_references", err, { op: "objects" }));
           }
           if (empty.length) warnings.push(`${empty.join(", ")} ${empty.length === 1 ? "is" : "are"} empty: the lines that select ${empty.length === 1 ? "it" : "them"} cook nothing`);
-          if (missing.length) return asRead({ name: "check_references", status: "failed", error: `not in the show: ${missing.join(", ")}` });
+          if (missing.length || ambiguous.length) return asRead({ name: "check_references", status: "failed", error: [missing.length ? `not in the show: ${missing.join(", ")}` : "", ...ambiguous].filter(Boolean).join("; ") });
           return asRead({ name: "check_references", status: "succeeded", detail: { references: refs.length } });
         },
       },
@@ -1373,6 +1434,18 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
         set("cue_note", cueRef(sequence, spec.target.cue), "Note", spec.note, (got) => String(got ?? "").trim() === spec.note);
         plan.noteStep = plan.steps.length - 1;
       }
+      // PhaserSync on this part, the appearance on the cue's Part 0, after the lines: neither is cooked data, and the
+      // console keeps both through line writes and cooks. Lua set ("Yes" / "", the appearance's number), never the
+      // command line's Assign, which creates a missing appearance.
+      if (spec.phasersync !== undefined) {
+        set("phasersync", cueRef(sequence, spec.target.cue, spec.target.part), "PhaserSync", spec.phasersync, (got) => setReplyMatches("PhaserSync", spec.phasersync!, got));
+        plan.phasersyncStep = plan.steps.length - 1;
+      }
+      if (spec.appearance !== undefined) {
+        const a = spec.appearance === null ? null : appearances.get(appearanceKey(spec.appearance))!;
+        set("appearance", cueRef(sequence, spec.target.cue, 0), "Appearance", a ? String(a.no) : "", (got) => setReplyMatches("Appearance", a ? a.name : "", got));
+        plan.appearanceStep = plan.steps.length - 1;
+      }
       return plan;
     });
     const requests = plans.reduce((n, p) => n + p.steps.length, 0);
@@ -1399,9 +1472,10 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
       const steps = [...main.steps];
       const complete = main.outcome === "succeeded";
       const written = (i: number) => steps[i]?.status === "succeeded";
-      const checked = `the recipe lines of ${ref} (count, every field written${mode === "append" ? ", the lines before unchanged" : ""})${spec.name !== undefined ? ", the cue's name" : ""}${spec.note !== undefined ? ", its note" : ""}`;
+      const checked = `the recipe lines of ${ref} (count, every field written${mode === "append" ? ", the lines before unchanged" : ""})${spec.name !== undefined ? ", the cue's name" : ""}${spec.note !== undefined ? ", its note" : ""}${spec.phasersync !== undefined ? ", the part's PhaserSync" : ""}${spec.appearance !== undefined ? ", the cue's appearance (Part 0)" : ""}`;
       const mismatches: string[] = [];
       let count: number | null = null;
+      let properties: CueProperties | undefined;
       let verification: Verification;
       try {
         const after = (await readLines(bridge, spec.target, t)) ?? [];
@@ -1431,6 +1505,13 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
           if (nameSent && String(f.Name ?? "").trim() !== spec.name) mismatches.push(`the cue's name reads ${JSON.stringify(f.Name ?? null)}`);
           if (noteSent && String(f.Note ?? "").trim() !== spec.note) mismatches.push(`the cue's note reads ${JSON.stringify(f.Note ?? null)}`);
         }
+        const propSpec = { ...spec, ...(p.phasersyncStep !== undefined && written(p.phasersyncStep) ? {} : { phasersync: undefined }), ...(p.appearanceStep !== undefined && written(p.appearanceStep) ? {} : { appearance: undefined }) };
+        if (propSpec.phasersync !== undefined || propSpec.appearance !== undefined) {
+          const r = await readCueProperties(bridge, sequence, propSpec, wantedAppearance(spec), t);
+          properties = r.properties;
+          readProps.set(ref, r.properties);
+          mismatches.push(...r.mismatches);
+        }
         steps.push(asRead({ name: "read_back", status: "succeeded", op: "children", detail: { lines: count } }));
         verification = mismatches.length ? { status: "mismatched", checked, detail: `${mismatches.slice(0, 10).join("; ")}${mismatches.length > 10 ? `; and ${mismatches.length - 10} more` : ""}` } : { status: "matched", checked };
       } catch (err) {
@@ -1439,11 +1520,12 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
         verification = unavailable(`read-back failed: ${s.error}`, checked);
       }
       const bad = main.steps.find((s) => s.status === "failed" || s.status === "unknown");
+      const props = [spec.phasersync !== undefined ? `PhaserSync ${spec.phasersync === "Yes" ? "Yes" : "cleared"}` : "", spec.appearance !== undefined ? (spec.appearance === null ? "appearance cleared" : `appearance ${wantedAppearance(spec)!.no}`) : ""].filter(Boolean).join(", ");
       const done = complete
-        ? `${spec.lines.length} line(s) ${mode === "replace" ? `written in place of ${p.before.length}` : `appended after ${p.base}`}`
+        ? `${spec.lines.length ? `${spec.lines.length} line(s) ${mode === "replace" ? `written in place of ${p.before.length}` : `appended after ${p.base}`}` : "no line written"}${props ? `, ${props}` : ""}`
         : `stopped at step '${bad?.name}' (${bad?.status}: ${bad?.error ?? ""}); ${main.steps.filter((s) => s.status === "succeeded").length} step(s) before it were sent and stay (nothing is undone or retried)`;
       const back = count === null ? "not read back" : `${count} line(s) read back${mismatches.length ? `, mismatched: ${mismatches.slice(0, 3).join("; ")}${mismatches.length > 3 ? `; and ${mismatches.length - 3} more` : ""}` : verification.status === "matched" ? ", matched" : ""}`;
-      return buildResult({ operation: op, target: { ref }, steps, verification, summary: `${ref}: ${done}; ${back}.`, extra: { lines: count, ...(mismatches.length ? { mismatches } : {}) } });
+      return buildResult({ operation: op, target: { ref }, steps, verification, summary: `${ref}: ${done}; ${back}.`, extra: { lines: count, ...(properties ? { properties } : {}), ...(mismatches.length ? { mismatches } : {}) } });
     };
     const batch = await runBatch(
       op,
@@ -1481,7 +1563,23 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
         }
       }
     }
-    const result: OperationResult = { ...batch, operation: op, target, steps: [...inspect.steps, ...batch.steps, ...cookSteps], ...(warnings.length || batch.warnings?.length || cookWarnings.length ? { warnings: [...warnings, ...(batch.warnings ?? []), ...cookWarnings] } : {}) };
+    // 5. After the cooks, the properties once more: what the result reports is the state at the end of the call.
+    const propSteps: StepResult[] = [];
+    const propMismatches: string[] = [];
+    const withProps = plans.filter((p) => readProps.has(label(p.spec.target)));
+    if (cooked.length && withProps.length) {
+      try {
+        for (const p of withProps) {
+          const r = await readCueProperties(bridge, sequence, p.spec, wantedAppearance(p.spec), t);
+          readProps.set(label(p.spec.target), r.properties);
+          propMismatches.push(...r.mismatches);
+        }
+        propSteps.push(asRead({ name: "read_properties", status: "succeeded", op: "objects", detail: { cueParts: withProps.length } }));
+      } catch (err) {
+        propSteps.push(asRead(stepFromError("read_properties", err, { op: "objects" })));
+      }
+    }
+    const result: OperationResult = { ...batch, operation: op, target, steps: [...inspect.steps, ...batch.steps, ...cookSteps, ...propSteps], ...(warnings.length || batch.warnings?.length || cookWarnings.length ? { warnings: [...warnings, ...(batch.warnings ?? []), ...cookWarnings] } : {}) };
     // The cue parts were written: a cook that did not succeed leaves the call partial.
     if (cookSteps.some((s) => s.name !== "cook" && s.status !== "succeeded") && result.outcome === "succeeded") result.outcome = "partial";
     const mismatchedCooks = cooked.filter((c) => c.verification === "mismatched").map((c) => c.target);
@@ -1493,10 +1591,51 @@ export async function storeRecipeCues(ctx: ToolContext, raw: Record<string, unkn
       : cookSteps[0]?.name === "cook"
         ? ` Not cooked: ${cookSteps[0].error?.replace(/^not attempted: /, "")}.`
         : ` Cook (${cook}): ${cookSteps.filter((s) => s.status === "succeeded").length} of ${plans.length} cue part(s) cooked${raw.verify_cook === false ? " (not verified)" : ""}.`;
-    result.summary = `${batch.summary}${cookNote}`;
-    return { ...result, mode, linesSent: lineCount, ...(cook ? { cook: cooked } : {}) };
+    if (propMismatches.length) result.verification = { status: "mismatched", checked: `${result.verification.checked ?? "each cue part's read-back"}; the properties after the cook`, detail: [result.verification.status === "mismatched" ? result.verification.detail : undefined, ...propMismatches.map((m) => `after the cook, ${m}`)].filter(Boolean).join("; ") };
+    else if (propSteps.some((s) => s.status !== "succeeded") && result.verification.status === "matched") result.verification = { status: "unavailable", checked: `${result.verification.checked}; the properties after the cook`, detail: `the properties could not be read after the cook: ${propSteps[0].error}` };
+    result.summary = `${batch.summary}${cookNote}${propMismatches.length ? ` After the cook: ${propMismatches.join("; ")}.` : ""}`;
+    const properties = plans.filter((p) => readProps.has(label(p.spec.target))).map((p) => ({ target: label(p.spec.target), ...readProps.get(label(p.spec.target)) }));
+    return { ...result, mode, linesSent: lineCount, ...(cook ? { cook: cooked } : {}), ...(properties.length ? { properties } : {}) };
   };
   return preview ? body() : ctx.mutations.run(body);
+}
+
+interface CueProperties {
+  phasersync?: { ref: string; value: boolean | null };
+  appearance?: { ref: string; value: { no: number; name: string } | null | undefined };
+}
+
+/**
+ * The PhaserSync of a cue part and the appearance of its cue (Part 0) that the entry asks for, as they read back, with
+ * what differs from the request. PhaserSync reads "Yes" or "" (display role). The appearance reads as a handle in the
+ * raw role and is absent there once cleared, as is a field whose read raised, so an absent one is confirmed empty ("")
+ * in the display role. A value that could not be read is null / undefined and a mismatch.
+ */
+async function readCueProperties(bridge: Gma3Bridge, sequence: number, spec: RecipeCueSpec, want: { no: number; name: string } | null | undefined, t: number): Promise<{ properties: CueProperties; mismatches: string[] }> {
+  const properties: CueProperties = {};
+  const mismatches: string[] = [];
+  if (spec.phasersync !== undefined) {
+    const ref = cueRef(sequence, spec.target.cue, spec.target.part);
+    const v = (await readFields(bridge, ref, ["PhaserSync"]))?.PhaserSync;
+    const value = typeof v === "string" ? /^yes$/i.test(v.trim()) : typeof v === "boolean" ? v : null;
+    properties.phasersync = { ref, value };
+    if (value === null) mismatches.push(`PhaserSync of ${ref} could not be read`);
+    else if (value !== (spec.phasersync === "Yes")) mismatches.push(`PhaserSync of ${ref} reads ${value ? "Yes" : "\"\" (off)"}`);
+  }
+  if (spec.appearance !== undefined) {
+    const ref = cueRef(sequence, spec.target.cue, 0);
+    const h = (await readFields(bridge, ref, ["Appearance"], { asText: false }))?.Appearance as { index?: unknown; name?: unknown } | undefined;
+    let value: { no: number; name: string } | null | undefined;
+    if (h && typeof h === "object" && !Array.isArray(h) && typeof h.index === "number") value = { no: h.index, name: String(h.name ?? "") };
+    else {
+      const d = (await readFields(bridge, ref, ["Appearance"]))?.Appearance;
+      value = d === "" ? null : undefined;
+    }
+    properties.appearance = { ref, value };
+    if (value === undefined) mismatches.push(`the appearance of ${ref} could not be read`);
+    else if ((value?.no ?? null) !== (want?.no ?? null)) mismatches.push(`the appearance of ${ref} reads ${value ? `Appearance ${value.no} "${value.name}"` : "none"}`);
+  }
+  return { properties, mismatches };
 }
 
 /** The per-line MAtricks columns of a cue part's lines, read in the display role (as gma3_matricks reads them), by line. */
@@ -1585,8 +1724,9 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
     {
       title: "Write the recipe lines of many cues",
       description:
-        `Write the standard recipe lines of up to ${MAX_BATCH_ITEMS} cue parts of one sequence in one call (at most ${MAX_RECIPE_LINES_PER_CUE} lines per part, ${MAX_RECIPE_LINES_PER_CALL} per call; a larger build is several calls). cues: [{cue, part? (default 0), name?, note?, lines: [{selection: group, values: "N.M" preset, matricks?, filter?, name?, enabled?, selection_mode?, x?/y?/z?: {wings, blocks, groups, width, shift, shuffle, select, fade/delay/phase/speed: {from, to}}}]}]. ` +
+        `Write the standard recipe lines of up to ${MAX_BATCH_ITEMS} cue parts of one sequence in one call (at most ${MAX_RECIPE_LINES_PER_CUE} lines per part, ${MAX_RECIPE_LINES_PER_CALL} per call; a larger build is several calls). cues: [{cue, part? (default 0), name?, note?, phasersync?, appearance?, lines: [{selection: group, values: "N.M" preset, matricks?, filter?, name?, enabled?, selection_mode?, x?/y?/z?: {wings, blocks, groups, width, shift, shuffle, select, fade/delay/phase/speed: {from, to}}}]}]. ` +
         "mode is required: replace deletes every line of the part first (refused while the part holds phaser lines), append adds after the existing ones. The cues must exist (gma3_store_cues creates them); name is the cue's name (Part 0), note its Note. " +
+        "phasersync: true sets PHASERSYNC = Yes on the entry's part (a phaser it starts locks onto the phasers already running), false or null clears it (the console refuses No). appearance: an appearance number or name (resolved to exactly one appearance first; a missing one would silently clear it), null or \"\" clears it; it goes on the cue's Part 0, whatever the entry's part. Both are written by Lua set after the lines, are not cooked data, and are read back (again after the cook). In append mode an entry may leave out lines to set only name, note, phasersync or appearance on an existing cue. " +
         "Once for the whole call, before anything is sent: every cue part is read and every group, preset, MAtricks and filter a line names must be in the show. Each line is written as gma3_edit_recipe adds one (Assign Group, Filter, Preset and MAtricks At the line, set for the other fields and the per-line MAtricks columns), and every reply is checked. " +
         "Batch form: each cue part is an item: its steps stop at its first failure, the parts already written stay (nothing is undone or retried), an unknown outcome stops the rest, and its read-back is compact: the line count, then only mismatches (every field written, earlier lines unchanged on append, name, note). " +
         "The console cooks each written line by itself (merge low priority). cook: a gma3_cook_recipes mode cooks every part afterwards, only when every part was written and matched (replace_uncooked and verify_cook as in gma3_cook_recipes). preview: true checks and returns the plan (detail: true every request). Phaser recipe lines are not written. Needs bridge 0.24.0.",
@@ -1601,7 +1741,9 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
                 part: z.number().optional().describe("Cue part (default 0)."),
                 name: z.string().optional().describe("The cue's name (set on Part 0)."),
                 note: z.string().optional().describe("The cue's Note (one line; trimmed; \"\" clears it)."),
-                lines: z.array(lineSchema),
+                phasersync: z.boolean().nullable().optional().describe("PHASERSYNC of this part: true = Yes, false or null clears it."),
+                appearance: z.union([z.number(), z.string()]).nullable().optional().describe("The cue's appearance (on Part 0): a number or a name; null or \"\" clears it."),
+                lines: z.array(lineSchema).optional().describe("Required, except in append mode for an entry that only sets name, note, phasersync or appearance."),
               })
               .passthrough(),
           )

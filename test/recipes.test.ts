@@ -126,6 +126,16 @@ class Console {
   silentSet?: RegExp;
   /** How the console reads a cue's note back (a console that changed it). */
   noteRead?: (note: string) => string;
+  /** A part's PhaserSync and Appearance (number), by part ref, and the show's appearances (as on 2.5.1, 2026-11-15). */
+  partProps = new Map<string, { phaserSync: boolean; appearance: number | null }>();
+  appearances = new Map<number, string>([[9000, "TEST RELEASE"], [12, "RELEASE"], [13, "Dup"], [14, "DUP"]]);
+  /** A cook that clears every part's appearance (a console that would). */
+  cookClearsAppearance = false;
+
+  props(ref: string) {
+    if (!this.partProps.has(ref)) this.partProps.set(ref, { phaserSync: false, appearance: null });
+    return this.partProps.get(ref)!;
+  }
 
   /** A cue with its Part 0 (and the cue object's name and note). */
   cue(seq: number, cue: number, part = 0): FTarget {
@@ -175,6 +185,7 @@ class Console {
   }
 
   cook(t: FTarget, mode: string): void {
+    if (this.cookClearsAppearance) for (const p of this.partProps.values()) p.appearance = null;
     if (this.truncateAfterCook) this.truncatedData.add(t);
     if (this.cookNoop) return;
     const out = this.output(t);
@@ -285,6 +296,25 @@ class Console {
         const layer = (k: "ABSOLUTE" | "RELATIVE" | "PHASER" | "TIMING") => f.layers?.[k] ?? true;
         return { total: 1, count: 1, items: [{ class: "Filter", index: Number(fm[1]), name: f.name, childCount: 1, fields: { Name: f.name, ATTRIBUTES: f.attrs.map((a) => ({ obj: { class: "Attribute", name: a }, name: a })), ABSOLUTE: layer("ABSOLUTE"), RELATIVE: layer("RELATIVE"), PHASER: layer("PHASER"), TIMING: layer("TIMING"), HASDYNAMICFILTERRULES: false, HASANYMATRICKSDATA: false, HASACTIVEATTRIBUTEFILTER: f.attrs.length > 0 } }] };
       }
+      const am = String(args.ref).match(/^Appearance (?:(\d+)|"(.*)")$/);
+      if (am) {
+        const hits = [...this.appearances.entries()].filter(([n, name]) => (am[1] ? n === Number(am[1]) : name.toLowerCase() === am[2].toLowerCase()));
+        return { total: hits.length, count: hits.length, items: hits.map(([n, name]) => ({ class: "Appearance", index: n, name, fields: { Name: name } })) };
+      }
+      const pm = String(args.ref).match(/^Sequence \d+ Cue [\d.]+ Part \d+$/);
+      if (pm && ((args.fields as string[]) ?? []).some((f) => f === "PhaserSync" || f === "Appearance")) {
+        if (!this.targets.has(String(args.ref))) return { total: 0, count: 0, items: [] };
+        const pr = this.props(String(args.ref));
+        const raw = args.asText === false;
+        const fields: Record<string, unknown> = {};
+        for (const f of args.fields as string[]) {
+          if (f === "PhaserSync") fields.PhaserSync = raw ? pr.phaserSync : pr.phaserSync ? "Yes" : "";
+          // Raw: a handle, or absent once cleared; display: the name, or "".
+          if (f === "Appearance" && raw && pr.appearance !== null) fields.Appearance = { class: "Appearance", index: pr.appearance, name: this.appearances.get(pr.appearance), addr: `14.4.${pr.appearance}` };
+          if (f === "Appearance" && !raw) fields.Appearance = pr.appearance !== null ? this.appearances.get(pr.appearance) : "";
+        }
+        return { total: 1, count: 1, items: [{ class: "Part", fields }] };
+      }
       const c = this.cues.get(String(args.ref));
       if (c) return { items: [{ name: c.name, fields: { Name: c.name, Note: this.noteRead ? this.noteRead(c.note) : c.note } }] };
       if (/^Sequence /.test(String(args.ref))) return { items: [] };
@@ -298,6 +328,22 @@ class Console {
       const ref = String(args.ref);
       const prop = String(args.property);
       if (this.silentSet?.test(`${ref} ${prop}`)) return SILENT;
+      if ((prop === "PhaserSync" || prop === "Appearance") && /^Sequence \d+ Cue [\d.]+ Part \d+$/.test(ref)) {
+        if (!this.targets.has(ref)) throw new Error(`no object found for '${ref}'`);
+        const pr = this.props(ref);
+        const v = String(args.value);
+        // As measured: PhaserSync takes "Yes" and "" (No, On, true, false are kept); an Appearance number or name that
+        // does not exist clears the one there.
+        if (prop === "PhaserSync") {
+          if (!this.ignoreSet.has(prop) && (v === "Yes" || v === "")) pr.phaserSync = v === "Yes";
+          return { readOk: true, value: pr.phaserSync ? "Yes" : "" };
+        }
+        if (!this.ignoreSet.has(prop)) {
+          const hit = [...this.appearances.entries()].find(([n, name]) => String(n) === v || name.toLowerCase() === v.toLowerCase());
+          pr.appearance = hit ? hit[0] : null;
+        }
+        return { readOk: true, value: pr.appearance !== null ? this.appearances.get(pr.appearance) : "" };
+      }
       const cm = ref.match(/^(Sequence \d+ Cue [\d.]+)( Part 0)?$/);
       if (cm) {
         const c = this.cues.get(cm[1]);
@@ -809,6 +855,80 @@ test("cue names and notes are written and read back exactly", async () => {
   assert.match(changed.result.items[0].summary, /the cue's note reads "BANK B"/);
 });
 
+test("phasersync and appearance: Lua set after the lines (PhaserSync on the part, Appearance on Part 0), read back, and again after the cook", async () => {
+  con.cue(9060, 1);
+  con.cue(9060, 2);
+  con.cue(9060, 2, 1);
+  const { result, isError } = await store({
+    mode: "append",
+    cook: "merge_low_priority",
+    cues: [
+      { cue: 1, phasersync: true, appearance: 9000, lines: [line(908, "4.4")] },
+      { cue: 2, part: 1, phasersync: true, appearance: "release", lines: [line(908, "1.11")] },
+    ],
+  });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  // After each part's lines; the appearance as its number, on Part 0 even for the entry of part 1.
+  assert.deepEqual(sets(), ["Sequence 9060 Cue 1 Part 0 PhaserSync=Yes", "Sequence 9060 Cue 1 Part 0 Appearance=9000", "Sequence 9060 Cue 2 Part 1 PhaserSync=Yes", "Sequence 9060 Cue 2 Part 0 Appearance=12"]);
+  assert.ok(!con.commands.some((c) => c.startsWith("Assign Appearance")), "never Assign (it creates a missing appearance)");
+  assert.deepEqual(con.props("Sequence 9060 Cue 2 Part 1"), { phaserSync: true, appearance: null });
+  assert.deepEqual(con.props("Sequence 9060 Cue 2 Part 0"), { phaserSync: false, appearance: 12 });
+  assert.deepEqual(result.properties[0], { target: "Sequence 9060 Cue 1 Part 0", phasersync: { ref: "Sequence 9060 Cue 1 Part 0", value: true }, appearance: { ref: "Sequence 9060 Cue 1 Part 0", value: { no: 9000, name: "TEST RELEASE" } } });
+  assert.match(result.items[1].summary, /1 line\(s\) appended after 0, PhaserSync Yes, appearance 12; 1 line\(s\) read back, matched/);
+  // Read once more after the cooks: the state at the end of the call.
+  assert.ok(result.steps.some((s: { name: string; status: string }) => s.name === "read_properties" && s.status === "succeeded"));
+  assert.deepEqual(result.properties.map((p: any) => `${p.target} ${p.phasersync.value} ${p.appearance.value?.no}`), ["Sequence 9060 Cue 1 Part 0 true 9000", "Sequence 9060 Cue 2 Part 1 true 12"]);
+
+  // An entry without lines (append) only changes the properties: false clears PhaserSync with "", null the appearance.
+  con.commands = [];
+  h.fake.requests.length = 0;
+  const clear = await store({ mode: "append", cues: [{ cue: 1, phasersync: false, appearance: null }, { cue: 2, part: 1, phasersync: null }] });
+  assert.equal(clear.isError, false, JSON.stringify(clear.result));
+  assert.equal(clear.result.verification.status, "matched", JSON.stringify(clear.result.verification));
+  assert.deepEqual(sets(), ["Sequence 9060 Cue 1 Part 0 PhaserSync=", "Sequence 9060 Cue 1 Part 0 Appearance=", "Sequence 9060 Cue 2 Part 1 PhaserSync="]);
+  assert.deepEqual(con.commands, [], "no line touched");
+  assert.deepEqual(con.props("Sequence 9060 Cue 1 Part 0"), { phaserSync: false, appearance: null });
+  assert.equal(con.part(9060, 1).lines.length, 1);
+  assert.match(clear.result.items[0].summary, /no line written, PhaserSync cleared, appearance cleared; 1 line\(s\) read back, matched/);
+  assert.deepEqual(clear.result.properties[0].appearance, { ref: "Sequence 9060 Cue 1 Part 0", value: null });
+  assert.equal(clear.result.properties[1].phasersync.value, false);
+  assert.ok(!clear.result.steps.some((s: { name: string }) => s.name === "read_properties"), "no cook, no second read");
+  // An omitted field sends nothing.
+  h.fake.requests.length = 0;
+  await store({ mode: "append", cues: [{ cue: 1, lines: [line(908, "4.4")] }] });
+  assert.ok(!sets().some((x) => /PhaserSync|Appearance/.test(x)));
+});
+
+test("an appearance that is missing or names several is refused before anything is sent; a kept PhaserSync fails; a cook that clears the appearance is a mismatch", async () => {
+  con.cue(9060, 1);
+  for (const [appearance, re] of [
+    [77, /not in the show: Appearance 77 \(first used by cues\[0\]\.appearance\)/],
+    ["NOPE", /not in the show: Appearance "NOPE"/],
+    ["dup", /Appearance "dup" names 2 appearances \(13, 14\); give the number/],
+  ] as const) {
+    const { result, isError } = await store({ mode: "append", cues: [{ cue: 1, appearance, lines: [line(908, "4.4")] }] });
+    assert.equal(isError, true);
+    assert.match(stepError(result, "check_references"), re);
+  }
+  assert.deepEqual(con.commands, []);
+  assert.deepEqual(sets(), []);
+
+  // A console that keeps the old PhaserSync: the step fails, nothing after it is sent.
+  con.ignoreSet.add("PhaserSync");
+  const kept = await store({ mode: "append", cues: [{ cue: 1, phasersync: true, appearance: 9000 }] });
+  assert.equal(kept.isError, true);
+  assert.match(kept.result.items[0].summary, /stopped at step 'phasersync' \(failed: PhaserSync reads "" after the write\)/);
+  assert.equal(con.props("Sequence 9060 Cue 1 Part 0").appearance, null);
+  con.ignoreSet.clear();
+
+  con.cookClearsAppearance = true;
+  const cleared = await store({ mode: "append", cook: "merge_low_priority", cues: [{ cue: 1, appearance: 9000, lines: [line(908, "4.4")] }] });
+  assert.equal(cleared.result.verification.status, "mismatched");
+  assert.match(cleared.result.verification.detail, /after the cook, the appearance of Sequence 9060 Cue 1 Part 0 reads none/);
+  assert.match(cleared.result.summary, /After the cook: the appearance of Sequence 9060 Cue 1 Part 0 reads none/);
+});
+
 test("a failure mid-batch reports what was written; an unanswered request stops the rest; nothing is retried or cooked", async () => {
   for (const c of [1, 2, 3]) con.cue(9060, c);
   con.reject = /^Assign Preset 1\.11 At Sequence 9060 Cue 2 Part 0\.2$/;
@@ -873,6 +993,10 @@ test("the call is validated as a whole before anything is read", async () => {
     [{ mode: "append", cues: [{ cue: 1, lines: [line(908, "4.4", { y: { select: -1 } })] }] }, /cues\[0\]\.lines\[0\]\.y\.select must be/],
     [{ mode: "append", cues: [{ cue: 1, lines: [line(908, "4.4")] }, { cue: 1, lines: [line(908, "4.4")] }] }, /Sequence 9060 Cue 1 Part 0 is listed more than once/],
     [{ mode: "append", cues: [{ cue: 1, lines: [] }] }, /cues\[0\]\.lines must be a non-empty list/],
+    [{ mode: "replace", cues: [{ cue: 1, phasersync: true }] }, /cues\[0\]\.lines must be a non-empty list .*in mode append/],
+    [{ mode: "append", cues: [{ cue: 1, phasersync: "Yes" }] }, /phasersync.*expected boolean/],
+    [{ mode: "append", cues: [{ cue: 1, appearance: 1.5 }] }, /cues\[0\]\.appearance must be an integer/],
+    [{ mode: "append", cues: [{ cue: 1, appearance: 12 }, { cue: 1, part: 1, appearance: "RELEASE" }] }, /cue 1 is given two appearances \(the appearance is the cue's, on Part 0\)/],
     [{ mode: "append", cues: [{ cue: 1, lines: [line(908, "4.4")] }], replace_uncooked: true }, /replace_uncooked and verify_cook go with cook/],
     [{ mode: "append", cues: [{ cue: 1, note: "a\nb", lines: [line(908, "4.4")] }] }, /cues\[0\]\.note must be one line/],
     [{ mode: "append", cues: Array.from({ length: 3 }, (_, i) => ({ cue: i + 1, lines: Array.from({ length: 200 }, () => line(908, "4.4")) })) }, /at most 500 recipe lines per call \(got 600\)/],
