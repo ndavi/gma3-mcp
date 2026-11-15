@@ -36,6 +36,8 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
   - Disabling a line removes its output, and deleting a line re-cooks the rest.
   - **A change of an ingredient (group membership, preset content) is re-cooked into the dependent targets a moment
     later**, in the background: an immediate read still shows the old coverage, and 3 s later it is updated.
+    A cue calling an edited **phaser preset** is not guaranteed to follow it: re-cook it (`gma3_edit_phaser_recipe`
+    `recook`, below).
 
   Editing a definition and cooking its output cannot be kept apart on the console. The edit tool therefore reports
   the coverage before and after (`autoCooked`), and the cook tool gives an immediate, verified cook with the option of
@@ -489,11 +491,42 @@ Read back:
   outputs, before or after, is left out of that comparison: where two lines act on the same attribute of the same
   fixture, the later line's value wins, so another line's value may rightly appear or go.
 
-**A cue that calls the preset with a standard line follows the change without being re-cooked**: verified live with
-Sequence 9000 Cue 11 on 21.9005 for a speed change, a new family, a step retarget and a removed line. That cue line
-had no Speed X of its own: a cue line's Speed X replaces the preset's speed, so a `speed_bpm` edit does not show in
-such a cue. `add_line` and `remove_line` also need the line (line 1 for `add_line`) to be 2 steps from presets: the
-read-back tells cooked values apart by their step presets.
+`add_line` and `remove_line` also need the line (line 1 for `add_line`) to be 2 steps from presets: the read-back
+tells cooked values apart by their step presets.
+
+### Re-cooking the calling cues: `recook`
+
+A cue that calls the preset with a standard line is **not guaranteed to follow the edit**. The THK migration bench
+(2026-11-15) saw a cue keep the old width and trans, and once the old speed, until it was re-cooked (Off then Goto was
+not enough). Other runs saw the cue follow at once: Sequence 9000 Cue 11 on 21.9005 (a speed, a new family, a step
+retarget, a removed line), and Sequence 9031 Cue 1 on 21.9075 (a width and a trans, in the cue's cooked data and in
+the output, even after a bare `Set ... Property "TRANSX"` with no Cook). The cause of the difference is not known, so
+the rule is to re-cook the calling cues after every change of a phaser preset.
+
+`recook: true` (every sequence) or `recook: {sequences: [...], mode: "merge_low_priority" | "merge"}` on `set`,
+`add_line` and `remove_line` (refused on `create`: a new preset has no caller):
+
+- Only after the preset's own edit cooked and read back matched; otherwise the callers are listed under `skipped`
+  with the reason, and nothing is cooked.
+- Callers: `gma3_preset_usage`'s scan (`presetUsage` with a sink, executors not scanned), over `sequences` or every
+  sequence, within 1000 cues and 120 s. An incomplete scan is reported (`recook.complete: false`, the reasons, a
+  warning). Not searched: presets that embed the preset, CueZero, OffCue. Give `sequences` on a large show.
+- Each cue part with a recipe line calling the preset is cooked with `gma3_cook_recipes` (its own inspection,
+  refusal of a merge over uncooked values, coverage read-back), **one part at a time**, never the whole cue: a
+  cue-wide MergeLowPriority cook empties part 0 where another part holds the same attributes (bench 2026-11-15). A
+  part whose values reference the preset with no recipe line calling it (stored values, or cooked from another preset
+  that calls it) is skipped with that reason.
+- Read back per cue: every cooked value of the part that references the preset (`absPreset` / `relPreset`) matches
+  the preset's value for the same fixture and attribute (step count, each step's preset, absolute / relative, accel,
+  decel, trans, width; phase, measure, speed master; speed unless the cue line has its own Speed X, `SPEEDFROMX` not
+  None, then warned); none is left where the preset no longer outputs; `OwnNonCookedDataPresent` No (Yes before and
+  after is a warning, not a mismatch); the cue's other parts unchanged. A problem makes the call's verification
+  `mismatched`; a failed cook makes it `partial`.
+- `recook` in the result: `recooked` (part, outcome, verification, values compared, OwnNonCookedDataPresent) and
+  `skipped` (part, reason). With `preview: true` the scan runs and `recook.wouldRecook` lists the parts.
+
+Without `recook`, the call warns that the calling cues were not re-cooked, with the console's reference count
+(`referencedBy`) and no scan (a scan reads every cue). No warning when the count is 0.
 
 ## What is and is not verified
 
@@ -631,6 +664,24 @@ read-back tells cooked values apart by their step presets.
     so the released Pan is seen in the cooked data, not in the output. Sequence 9030 was switched off;
   - `gma3_edit_recipe set` line 2 `filter: null` then `filter: 9006`, both matched; the console re-cooked at once each
     time (Dimmer came from 21.9072, 2 steps, then from 1.9010 again); `gma3_cook_recipes` of the sequence matched (8 + 4).
+- Verified live for `recook` (onPC 2.5.1.1, bridge 0.52.1, show "Rescue", 2026-11-15, Group 9001 = Daytona
+  251-254, the code run directly against the bridge):
+  - `create` 21.9075 "TEST I4 RECOOK" (Sine, 6 BPM, Measure 1) first with 1.9031 / 1.9032: mismatched as it should
+    be (those presets hold no value for 251-254, line 1 failed to cook); `set` to 1.9010 / 1.9011: matched, 4 / 4
+    cooked, no re-cook warning (`referencedBy` 0);
+  - Sequence 9031 Cue 1 = Group 9001 + 21.9075 (`gma3_store_recipe_cues`, cooked merge low priority):
+    `ownNonCookedDataPresent: false`; output on 251 (every 250 ms for 12 s) a 10 s sine, 5 s up, 5 s down;
+  - `set` step 1 `width: 160` without `recook`: matched, with the warning (2 objects reference the preset). The bench
+    finding was **not** reproduced: 13 s later the cue's cooked values read width 160 / 40 and the output was the
+    160 / 40 shape (about 2 s down, the rest up). `set` step 2 `trans: 50`: the cue read trans 50 at once; a bare
+    `Set Preset 21.9075.1.1.2.1 Property "TRANSX" "100"` (no Cook) reached the cue at once too;
+  - `set` step 1 `width: 120`, step 2 `trans: 50`, `recook: {sequences: [9031]}`: matched. Steps: Cook of the preset,
+    `find_callers` (complete), `Cook Sequence 9031 Cue 1 Part 0 /MergeLowPriority`, read-back: 4 values compared
+    (width 120 / 80, trans 100 / 50, presets 1.9010 / 1.9011, speed 0.1 Hz), `ownNonCookedDataPresent: false`.
+    Output on 251 (14 s): about 6 s up, 2 s down, 2 s at 0. Sequence 9031 was switched off;
+  - not run on a console: a cue that really kept old values (so a re-cook that changes them), `mode: "merge"`, a
+    skipped part, a cue line with its own Speed X, several parts in one cue, an incomplete scan (fake bridge only,
+    `test/phaser-recipes.test.ts`).
 - Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
   a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
   (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES

@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness } from "./helpers/tool-harness.js";
 import { BridgeReplyError } from "./helpers/fake-bridge.js";
-import { registerPhaserRecipeTools, numberMatches, parseSpeedMaster, yesNoOf } from "../src/tools/phaserrecipes.js";
+import { registerPhaserRecipeTools, editPhaserRecipe, numberMatches, parseSpeedMaster, yesNoOf } from "../src/tools/phaserrecipes.js";
+import { cookedDiff, parseRecook, type RecookDeps } from "../src/tools/phaserrecook.js";
+import { presetUsage } from "../src/tools/analysis.js";
 import { Validator } from "../src/validate.js";
 
 /**
@@ -401,12 +403,51 @@ const NAMED: Record<string, [number, number, number?]> = { Linear: [0, 0], "Ease
 const fstep = (preset: string, shape = 1): FStep => ({ preset, accel: SHAPE_CURVE[shape][0], decel: SHAPE_CURVE[shape][1], trans: 100, custom: false });
 const fline = (group: number, a: string, b: string, speedBpm: number): FLine => ({ group, shape: 1, matricks: 9000, speedHz: speedBpm / 60, phaseFrom: 0, phaseTo: 360, steps: [fstep(a), fstep(b)] });
 
+/** A cue part of the fake show (recook): its recipe lines calling a preset and its stored rows. */
+type FPart = { part: number; calls: boolean; rows: Array<Record<string, unknown>>; ownNonCooked?: boolean; ownSpeed?: boolean };
+type FCue = { seq: number; cue: number; parts: FPart[]; fail?: string };
+const P_ADDR = { addr: "14.14.1.5.21.9005", addrNative: "ShowData.DataPools.Default.PresetPools.All.TEST PH EDIT" };
+
 async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boolean } = {}) {
   const h = await startHarness(registerPhaserRecipeTools);
   const lines: FLine[] = structuredClone(initial);
   const cmds: string[] = [];
   const st = { name: "TEST PH EDIT", ignoreAssignPreset: false, assignGroupToLine1: false };
   const P = "Preset 21.9005";
+  /** The cues of the fake show (recook tests): read through ping / children / cueContents / preset.read on a part. */
+  const cues: FCue[] = [];
+  const cueOf = (ref: string) => {
+    const m = ref.match(/^Sequence (\d+) Cue ([\d.]+)(?: Part (\d+))?$/);
+    const c = m && cues.find((x) => x.seq === Number(m[1]) && x.cue === Number(m[2]));
+    return c ? { c, part: m![3] === undefined ? undefined : c.parts.find((p) => p.part === Number(m![3])) } : undefined;
+  };
+  const presetRows = () => {
+    const out = new Map<string, Record<string, unknown>>();
+    lines.forEach((l) => {
+      if (l.cls === "StandardRecipe") return;
+      for (const fixture of l.group === 9001 ? ["251", "252"] : ["101"]) {
+        const attribute = l.steps[0].preset.startsWith("4.") ? "ColorRGB_R" : "Dimmer";
+        const steps = l.steps.map((x, n) => ({ step: n + 1, accel: x.accel, decel: x.decel, trans: x.trans, integrated: { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]), addr: `14.14.1.5.${x.preset}` } }));
+        out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, steps }); // the later line wins
+      }
+    });
+    return [...out.values()];
+  };
+  /** What a cue part cooked from the preset holds: the preset's rows, each referencing it. */
+  const cookedFromPreset = () => presetRows().map((r) => ({ ...r, absPreset: { valid: true, pool: 21, no: 9005, ...P_ADDR } }));
+  h.fake.on("ping", () => ({ bridgeVersion: "0.52.1" }));
+  h.fake.on("cueContents", (args) => {
+    const f = cueOf(String(args.ref));
+    if (!f) throw new BridgeReplyError(`no object found for '${args.ref}'`);
+    if (f.c.fail) throw new BridgeReplyError(f.c.fail);
+    return {
+      ref: args.ref,
+      sequence: { name: `Sequence ${f.c.seq}`, tracking: "Yes" },
+      cue: { no: String(f.c.cue), name: "TEST" },
+      parts: f.c.parts.map((p) => ({ part: p.part, name: "TEST", timing: {}, command: {}, mib: {}, ownDataPresent: p.rows.length > 0, ownNonCookedDataPresent: p.ownNonCooked === true, recipes: p.calls ? [{ index: 1, preset: "TEST PH EDIT", presetRef: { name: "TEST PH EDIT", class: "Preset", ...P_ADDR }, presetResolved: true }] : [], otherChildren: [] })),
+      limitations: [],
+    };
+  });
   const addr = (cls: string, n: number, pool?: number) => ({ class: cls, index: n, addr: `14.14.1.${cls === "Preset" ? `5.${pool}` : 6}.${n}` });
   h.fake.on("recipe.editState", () => ({ environment: "Normal", editing: o.editing === true, partZeroLines: [], partZero: false, modal: o.modal ? UPDATE : false, lastCommand: "OK" }));
   h.fake.on("objects", (args) => {
@@ -419,6 +460,14 @@ async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boole
     const list = (items: unknown[]) => ({ total: items.length, offset: 0, count: items.length, items });
     const sh = shapeChildren(ref);
     if (sh) return sh;
+    if (ref === "DataPool.Sequences") return list([...new Set(cues.map((c) => c.seq))].map((n) => ({ name: `Sequence ${n}`, class: "Sequence", addr: `14.14.1.7.${n}`, index: n })));
+    if ((m = ref.match(/^Sequence (\d+)$/))) {
+      const mine = cues.filter((c) => c.seq === Number(m![1]));
+      if (!mine.length) throw new BridgeReplyError(`no object found for '${ref}'`);
+      return list([{ name: "OffCue", class: "Cue", index: 1, fields: { No: null } }, { name: "CueZero", class: "Cue", index: 2, fields: { No: 0 } }, ...mine.map((c, i) => ({ name: `Cue ${c.cue}`, class: "Cue", index: i + 3, fields: { No: Math.round(c.cue * 1000) } }))]);
+    }
+    const cp = cueOf(ref);
+    if (cp?.part) return list(cp.part.calls ? [{ class: "StandardRecipe", index: 1, fields: { SPEEDFROMX: cp.part.ownSpeed ? "2.000000" : "None" } }] : []);
     if (ref === P)
       return list(lines.map((l, i) => ({ class: l.cls ?? "PhaserRecipe", index: i + 1, name: `[${l.group}/${l.shape}]`, fields: { Selection: addr("Group", l.group), MAtricks: l.matricks ? { class: "MAtrick", index: l.matricks, addr: `14.14.1.11.${l.matricks}` } : null, SHAPE: { class: "Shape", index: l.shape, addr: `14.14.1.4.${l.shape}` }, SPEEDX: l.speedHz, PHASEFROMX: l.phaseFrom, PHASETOX: l.phaseTo, FailedCookedPart: "None" } })));
     if ((m = ref.match(/^Preset 21\.9005\.(\d+)\.1$/))) return list(lines[Number(m[1]) - 1].steps.map((_, n) => ({ class: "PhaserRecipeStep", index: n + 1 })));
@@ -432,17 +481,10 @@ async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boole
   h.fake.on("preset.read", (args) => {
     const ref = String(args.ref);
     if (/^Preset (1\.901[01]|4\.900[01])$/.test(ref)) return { ref, rows: [], dependencies: [] };
+    const cp = cueOf(ref);
+    if (cp?.part) return { ref, class: "Part", rows: cp.part.rows, dependencies: [], byFixtures: true, count: cp.part.rows.length };
     if (ref !== P) throw new BridgeReplyError(`no object found for '${ref}'`);
-    const out = new Map<string, unknown>();
-    lines.forEach((l) => {
-      if (l.cls === "StandardRecipe") return;
-      for (const fixture of l.group === 9001 ? ["251", "252"] : ["101"]) {
-        const attribute = l.steps[0].preset.startsWith("4.") ? "ColorRGB_R" : "Dimmer";
-        const steps = l.steps.map((x, n) => ({ step: n + 1, accel: x.accel, decel: x.decel, trans: x.trans, integrated: { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } }));
-        out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, steps }); // the later line wins
-      }
-    });
-    return { ref, name: st.name, referencedBy: 1, rows: [...out.values()], dependencies: [] };
+    return { ref, name: st.name, ...P_ADDR, referencedBy: 1, rows: presetRows(), dependencies: [] };
   });
   h.fake.on("set", (args) => {
     const m = String(args.ref).match(/^Preset 21\.9005\.(\d+)$/);
@@ -487,7 +529,7 @@ async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boole
     else if ((m = command.match(/^Delete Preset 21\.9005\.(\d+) \/NoConfirmation$/))) lines.splice(Number(m[1]) - 1, 1);
     return "OK";
   });
-  return { h, lines, cmds, st };
+  return { h, lines, cmds, st, cues, cookedFromPreset };
 }
 
 const DIM_COUL = [fline(9001, "1.9010", "1.9011", 120), fline(9001, "4.9000", "4.9001", 30)];
@@ -503,7 +545,8 @@ test("set: step presets, curve and speed on one line, sent as Assign / Set witho
     assert.ok(!h.fake.requests.some((r) => /^(programmer|recipe\.edit(Begin|End))$/.test(r.op)), "no programmer, no Edit Recipe mode");
     assert.equal(lines[1].steps[1].decel, 100);
     assert.equal(lines[1].steps[0].accel, 100);
-    assert.match(result.notes.join(" "), /cues that call Preset 21\.9005 .* follow the change/);
+    assert.match(result.warnings.join(" "), /cues that call Preset 21\.9005 were NOT re-cooked.*1 object\(s\) reference Preset 21\.9005/);
+    assert.ok(!h.fake.requests.some((r) => /^(cueContents|ping)$/.test(r.op)), "without recook no scan");
   } finally {
     await h.close();
   }
@@ -1561,4 +1604,147 @@ test("Transform and columns: refused before anything is sent", async () => {
       await h.close();
     }
   }
+});
+
+// ---- recook: the cue parts that call the edited preset, found with gma3_preset_usage's scan (the real one, against
+// editSetup's fake show) and cooked with gma3_cook_recipes (a stub here: it copies the preset's rows into the part,
+// as the console's cook does; recipes.test.ts covers the cook itself). A cue does not follow a phaser preset's width
+// or trans until it is re-cooked (THK bench 2026-11-15).
+
+/** A cook stub: records the command and, unless `noop`, gives the part the preset's cooked rows. */
+function cookStub(s: Awaited<ReturnType<typeof editSetup>>, o: { noop?: boolean; ownNonCooked?: boolean } = {}): RecookDeps {
+  return {
+    usage: presetUsage,
+    cook: async (_ctx, raw) => {
+      const t = raw.target as { sequence: number; cue: string; part: number };
+      const command = `Cook Sequence ${t.sequence} Cue ${t.cue} Part ${t.part} ${raw.mode === "merge" ? "/Merge" : "/MergeLowPriority"}`;
+      s.cmds.push(command);
+      const part = s.cues.find((c) => c.seq === t.sequence && String(c.cue) === t.cue)!.parts.find((p) => p.part === t.part)!;
+      if (!o.noop) part.rows = s.cookedFromPreset();
+      if (o.ownNonCooked) part.ownNonCooked = true;
+      return { operation: "cook_recipes", target: {}, outcome: "succeeded", verification: { status: "matched" }, steps: [{ name: "cook", status: "succeeded", command }], summary: "cooked", command };
+    },
+  };
+}
+const SET_LINE2 = { action: "set", preset: "21.9005", line: 2, steps: [{ preset: "4.9001" }, { preset: "4.9000", curve: "swing" }], speed_bpm: 45 };
+
+test("recook: the preset is cooked first, then each calling cue part; its cooked values read back as the preset's", async () => {
+  const s = await editSetup(DIM_COUL);
+  const { h, cmds, cues } = s;
+  try {
+    cues.push({ seq: 9031, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }] });
+    const r = await editPhaserRecipe(h.ctx, { ...SET_LINE2, recook: { sequences: [9031] } }, cookStub(s));
+    assert.equal(r.verification.status, "matched", JSON.stringify(r, null, 1));
+    assert.match(r.verification.checked ?? "", /1 calling cue part\(s\) in Sequence\(s\) 9031 re-cooked \(merge_low_priority\)/);
+    assert.deepEqual(cmds.slice(-2), ["Cook Preset 21.9005 /MergeLowPriority", "Cook Sequence 9031 Cue 1 Part 0 /MergeLowPriority"]);
+    const rep = r.recook as { complete: boolean; recooked: Array<{ part: string; compared: number; ownNonCookedDataPresent: boolean }>; skipped: unknown[] };
+    assert.equal(rep.complete, true);
+    assert.deepEqual(rep.recooked.map((x) => [x.part, x.compared, x.ownNonCookedDataPresent]), [["Sequence 9031 Cue 1 Part 0", 4, false]]);
+    assert.deepEqual(rep.skipped, []);
+    assert.ok(!(r.warnings ?? []).some((w) => /NOT re-cooked/.test(w)));
+  } finally {
+    await h.close();
+  }
+});
+
+test("recook: a cue that keeps the old values, or reads OwnNonCookedDataPresent Yes, is a mismatch", async () => {
+  for (const [o, re] of [
+    [{ noop: true }, /differ from the preset in (preset step 1|speed)/],
+    [{ ownNonCooked: true }, /OwnNonCookedDataPresent Yes after the cook/],
+  ] as const) {
+    const s = await editSetup(DIM_COUL);
+    try {
+      s.cues.push({ seq: 9031, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }] });
+      const r = await editPhaserRecipe(s.h.ctx, { ...SET_LINE2, recook: true }, cookStub(s, o));
+      assert.equal(r.verification.status, "mismatched");
+      assert.match(r.verification.detail ?? "", re);
+    } finally {
+      await s.h.close();
+    }
+  }
+});
+
+test("recook: a part whose values reference the preset without a recipe line calling it is skipped; other parts unchanged; sequences limit the scan", async () => {
+  const s = await editSetup(DIM_COUL);
+  try {
+    const stored = s.cookedFromPreset().map((r) => ({ ...r, cooked: false }));
+    s.cues.push({ seq: 9031, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }, { part: 1, calls: false, rows: [{ fixture: "301", attribute: "Dimmer", value: 50, cooked: true }] }] });
+    s.cues.push({ seq: 9032, cue: 2, parts: [{ part: 0, calls: false, rows: stored }] });
+    s.cues.push({ seq: 9033, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }] });
+    const r = await editPhaserRecipe(s.h.ctx, { ...SET_LINE2, recook: { sequences: [9031, 9032] } }, cookStub(s));
+    assert.equal(r.verification.status, "matched", JSON.stringify(r.verification));
+    const rep = r.recook as { recooked: Array<{ part: string }>; skipped: Array<{ part: string; reason: string }> };
+    assert.deepEqual(rep.recooked.map((x) => x.part), ["Sequence 9031 Cue 1 Part 0"]);
+    assert.equal(rep.skipped.length, 1);
+    assert.equal(rep.skipped[0].part, "Sequence 9032 Cue 2 Part 0");
+    assert.match(rep.skipped[0].reason, /none of its recipe lines calls it/);
+    assert.ok(!s.h.fake.requests.some((q) => q.op === "cueContents" && /^Sequence 9033/.test(String(q.args.ref))), "Sequence 9033 is not in the scope");
+    assert.ok(!s.cmds.some((c) => /Sequence 903[23]/.test(c)));
+  } finally {
+    await s.h.close();
+  }
+});
+
+test("recook: an edit that did not read back as asked cooks no cue (listed as skipped); an incomplete scan says so", async () => {
+  const s = await editSetup(DIM_COUL);
+  try {
+    s.st.ignoreAssignPreset = true;
+    s.cues.push({ seq: 9031, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }] });
+    s.cues.push({ seq: 9031, cue: 2, parts: [], fail: "cue read failed" });
+    const r = await editPhaserRecipe(s.h.ctx, { ...SET_LINE2, recook: true }, cookStub(s));
+    assert.equal(r.verification.status, "mismatched");
+    const rep = r.recook as { complete: boolean; recooked: unknown[]; skipped: Array<{ part: string; reason: string }> };
+    assert.deepEqual(rep.recooked, []);
+    assert.match(rep.skipped[0].reason, /did not read back as asked/);
+    assert.equal(rep.complete, false);
+    assert.match((r.warnings ?? []).join(" "), /search for the cues calling Preset 21\.9005 is incomplete/);
+    assert.ok(!s.cmds.some((c) => /^Cook Sequence/.test(c)));
+  } finally {
+    await s.h.close();
+  }
+});
+
+test("recook through the tool: preview lists the parts it would cook (nothing sent); create refuses recook", async () => {
+  const s = await editSetup(DIM_COUL);
+  try {
+    s.cues.push({ seq: 9031, cue: 1, parts: [{ part: 0, calls: true, rows: s.cookedFromPreset() }] });
+    const { result, isError } = await s.h.callJson("gma3_edit_phaser_recipe", { ...SET_LINE2, recook: { sequences: [9031] }, preview: true });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.deepEqual(result.recook.wouldRecook, ["Sequence 9031 Cue 1 Part 0"]);
+    assert.match(result.plan.at(-1), /re-cook \(merge_low_priority\) each calling cue part in Sequence\(s\) 9031: Sequence 9031 Cue 1 Part 0/);
+    assert.deepEqual(s.cmds, []);
+    const c = await s.h.callJson("gma3_edit_phaser_recipe", { ...ARGS, preset: "1.9010", recook: true });
+    assert.equal(c.isError, true);
+    assert.match(c.text, /recook is for set, add_line and remove_line/);
+    const bad = await s.h.callJson("gma3_edit_phaser_recipe", { ...SET_LINE2, recook: { mode: "overwrite" } });
+    assert.equal(bad.isError, true);
+  } finally {
+    await s.h.close();
+  }
+});
+
+test("cookedDiff: per fixture and attribute against the preset; a value the preset no longer outputs; a line's own Speed X", () => {
+  const P = { addr: "14.14.1.5.21.9075" };
+  const ref = { valid: true, addr: P.addr };
+  const step = (n: number, width: number, trans: number) => ({ step: n, width, trans, accel: -100, decel: -100, integrated: { valid: true, addr: `p${n}` } });
+  const pre = [{ fixture: "251", attribute: "Dimmer", cooked: true, stepCount: 2, speed: 0.1, phase: 0, measure: 100, steps: [step(1, 160, 100), step(2, 40, 100)] }];
+  const cue = (w: number, speed = 0.1, extra: Record<string, unknown> = {}) => [{ ...pre[0], speed, absPreset: ref, steps: [step(1, w, 100), step(2, 200 - w, 100)], ...extra }];
+  assert.deepEqual(cookedDiff(cue(160), pre, P, { label: "c" }), { compared: 1, problems: [] });
+  assert.match(cookedDiff(cue(100), pre, P, { label: "c" }).problems.join(" "), /c: 1 cooked value\(s\) differ from the preset in width step 1 \(first: fixture 251 Dimmer reads 100, the preset 160\)/);
+  assert.match(cookedDiff(cue(160, 0.2), pre, P, { label: "c" }).problems.join(" "), /in speed .* reads 12 BPM, the preset 6 BPM/);
+  assert.deepEqual(cookedDiff(cue(160, 0.2), pre, P, { label: "c", ignoreSpeed: true }).problems, []);
+  assert.match(cookedDiff(cue(160, 0.1, { attribute: "Tilt" }), pre, P, { label: "c" }).problems.join(" "), /no longer outputs/);
+  assert.equal(cookedDiff([{ ...cue(100)[0], absPreset: { valid: true, addr: "other" } }], pre, P, { label: "c" }).compared, 0, "a value from another preset is not compared");
+});
+
+test("parseRecook: true, {sequences, mode}; other modes, empty lists and unknown keys are refused", () => {
+  const p = (raw: unknown) => {
+    const v = new Validator();
+    const r = parseRecook(v, raw);
+    return { r, errors: v.errors };
+  };
+  assert.deepEqual(p(true).r, { mode: "merge_low_priority" });
+  assert.equal(p(false).r, undefined);
+  assert.deepEqual(p({ sequences: [9031, 9031], mode: "merge" }).r, { mode: "merge", sequences: [9031] });
+  for (const bad of [{ mode: "overwrite" }, { sequences: [] }, { sequence: [1] }, "yes"]) assert.ok(p(bad).errors.length, JSON.stringify(bad));
 });

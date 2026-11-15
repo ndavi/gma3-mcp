@@ -74,6 +74,8 @@ export interface PartRead {
   command: Row;
   mib: Row;
   ownDataPresent: boolean | null;
+  /** OwnNonCookedDataPresent: the part holds values not cooked from its recipes (the pot reads orange). */
+  ownNonCookedDataPresent: boolean | null;
   recipes: Row[];
   /** The part's stored rows; [] for a part whose OwnDataPresent is No (not read). */
   rows: PresetRow[];
@@ -129,6 +131,7 @@ export async function readCue(bridge: Gma3Bridge, sequence: number, cue: string,
       command: asRow(p.command),
       mib: asRow(p.mib),
       ownDataPresent: typeof p.ownDataPresent === "boolean" ? p.ownDataPresent : null,
+      ownNonCookedDataPresent: typeof p.ownNonCookedDataPresent === "boolean" ? p.ownNonCookedDataPresent : null,
       recipes: asList(p.recipes).map(asRow),
       rows: [],
     };
@@ -267,12 +270,12 @@ function refsOf(r: PresetRow): Array<[string, ObjectRefInfo]> {
   return out;
 }
 
-interface TargetPreset {
+export interface TargetPreset {
   addr?: string;
   addrNative?: string;
 }
 
-function sameObject(r: { valid?: boolean; addr?: unknown; addrNative?: unknown } | null | undefined, t: TargetPreset): boolean {
+export function sameObject(r: { valid?: boolean; addr?: unknown; addrNative?: unknown } | null | undefined, t: TargetPreset): boolean {
   if (!r || r.valid === false) return false;
   if (t.addrNative && typeof r.addrNative === "string") return r.addrNative === t.addrNative;
   return !!t.addr && typeof r.addr === "string" && r.addr === t.addr;
@@ -348,7 +351,28 @@ const USAGE_LIMITATIONS = [
   "executors are those of every page of the data pool whose assigned object is the sequence",
 ];
 
-export async function presetUsage(ctx: ToolContext, raw: PresetUsageArgs): Promise<ToolResult> {
+/** One cue part that references the preset, for a caller that acts on the usages (no max_results cap). */
+export interface PresetUsageHit {
+  sequence: number;
+  cue: string;
+  part: number;
+  /** Indices of the part's recipe lines whose preset is this one. */
+  recipeLines: number[];
+  /** Stored values (cooked or not) that reference the preset. */
+  channels: number;
+  via: string[];
+}
+
+/** What a scan found, for a caller in this server: every hit, and whether the scan read everything in scope. */
+export interface PresetUsageSink {
+  hits: PresetUsageHit[];
+  complete?: boolean;
+  reasons?: string[];
+  consoleReferenceCount?: number | null;
+}
+
+/** gma3_preset_usage; `sink` (optional) also receives every usage as structured rows, uncapped. */
+export async function presetUsage(ctx: ToolContext, raw: PresetUsageArgs, sink?: PresetUsageSink): Promise<ToolResult> {
   const tool = "gma3_preset_usage";
   const v = new Validator();
   const target = raw.preset === undefined || raw.preset === null || raw.preset === "" ? undefined : v.check(() => parsePresetRef("preset", raw.preset));
@@ -468,6 +492,7 @@ export async function presetUsage(ctx: ToolContext, raw: PresetUsageArgs): Promi
           if (channels || recipes.length) {
             usageTotal++;
             usedSeqs.set(seq.no, seq);
+            if (sink && p.part !== null) sink.hits.push({ sequence: seq.no, cue: c.cue, part: p.part, recipeLines: recipes.filter((ix): ix is number => typeof ix === "number"), channels, via: [...via] });
             if (usages.length < maxResults) {
               usages.push({
                 sequence: seq.no,
@@ -567,6 +592,7 @@ export async function presetUsage(ctx: ToolContext, raw: PresetUsageArgs): Promi
     unread: unread.length ? unread.slice(0, 20) : undefined,
   };
   for (const k of Object.keys(result)) if (result[k] === undefined) delete result[k];
+  if (sink) Object.assign(sink, { complete, reasons: [...reasons], consoleReferenceCount: preset ? (preset.consoleReferenceCount as number | null) : null });
   const anyRead = cuesScanned > 0 || seqList.answered;
   return { content: [{ type: "text", text: renderLines(result, ["usages", "dangling", "executors", "unread"]) }], ...(anyRead ? {} : { isError: true }) };
 }

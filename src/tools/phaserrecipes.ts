@@ -66,6 +66,7 @@ import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { presetId, type PresetRead } from "./presets.js";
 import { matricksValue } from "./groups.js";
 import { readGroup, readLines, type GroupInfo } from "./recipes.js";
+import { RECOOK_MODES, parseRecook, recookCallers, type RecookDeps, type RecookReport } from "./phaserrecook.js";
 import { asRead, buildResult, commandStep, notRequested, stepFromError, validationFailure, type OperationResult, type StepResult, type Verification } from "../results.js";
 import { Validator, finiteNumber, objectName, objectNumber } from "../validate.js";
 
@@ -283,6 +284,7 @@ interface CreateArgs {
   y?: unknown;
   phase_y?: unknown;
   exclusive?: unknown;
+  recook?: unknown;
   preview?: unknown;
 }
 
@@ -954,6 +956,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
   const op = "edit_phaser_recipe";
   const v = new Validator();
   if (raw.action !== "create") v.fail("createPhaserRecipe handles action create (set, add_line and remove_line: editPhaserRecipe)");
+  if (raw.recook !== undefined && raw.recook !== false) v.fail("recook is for set, add_line and remove_line: a new preset has no calling cue yet");
   const target = v.check(() => presetId("preset", raw.preset));
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
   const specs: LineSpec[] = [];
@@ -1473,8 +1476,11 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
 //     with Set ... Property "Curve") survives it, "Reset" restores the shape's.
 //   - `Copy Preset P.N.1 At Preset P.N.k` copies line 1 with its custom curves; `Delete Preset P.N.k` removes a line
 //     and the later lines move up (3 lines, delete line 2: line 3 becomes line 2); its cooked values go at once.
-//   - A cue that calls the preset with a standard line follows the change without being re-cooked (Sequence 9000
-//     Cue 11 on 21.9005: speed, a new family and a removed line all showed in the cue's own values).
+//   - A cue that calls the preset with a standard line is not guaranteed to follow the change: on the THK bench of
+//     2026-11-15 (docs/phaser-recipes.md §3) a cue kept the old width / trans, and once the old speed, until it was
+//     re-cooked; Sequence 9000 Cue 11 on 21.9005 followed a speed, a new family and a removed line, and Sequence 9031
+//     Cue 1 on 21.9075 (2026-11-15) had a new width and trans in its cooked data at once (even after a bare Set
+//     TRANSX). So `recook` re-cooks the calling cue parts and verifies them (phaserrecook.ts); without it the call warns.
 
 interface StepDetail {
   /** Value source 1 (the whole step of a plain shape). */
@@ -1716,11 +1722,12 @@ interface EditArgs extends CreateArgs {
 }
 const EDIT_ACTIONS = ["set", "add_line", "remove_line"] as const;
 
-export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise<OperationResult> {
+export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: RecookDeps): Promise<OperationResult> {
   const op = "edit_phaser_recipe";
   const v = new Validator();
   const action = raw.action as (typeof EDIT_ACTIONS)[number];
   if (!(EDIT_ACTIONS as readonly string[]).includes(String(raw.action))) v.fail(`action must be one of create, ${EDIT_ACTIONS.join(", ")}`);
+  const recook = parseRecook(v, raw.recook);
   const target = v.check(() => presetId("preset", raw.preset));
   const name = v.check(() => objectName("name", raw.name, { optional: true }));
   if (raw.lines !== undefined) v.fail(`lines is for action create; ${action} edits one line`);
@@ -2025,7 +2032,12 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     }
     plan = [...actions.map(actionText), ...(name !== undefined ? [`set ${ref} Name=${name}`] : []), `Cook ${ref} /MergeLowPriority`];
     if (!ok) return fail(`${op} was not performed; nothing was sent: ${steps_.find((s) => s.status !== "succeeded")?.error ?? "a check failed"}`);
-    if (preview) return buildResult({ operation: op, target: tgt, steps: steps_, summary: "Preview only; nothing was sent.", extra: { plan, preview: true, before: before[k - 1] ?? null } });
+    if (preview) {
+      // recook: the calling cue parts the call would re-cook (a read-only scan).
+      const rc = recook ? await recookCallers(ctx, { preset: target, presetRead: null, spec: recook, preview: true }, deps) : undefined;
+      if (rc) plan.push(`then re-cook (${recook!.mode}) each calling cue part in ${rc.report.scope}: ${rc.report.wouldRecook?.join(", ") || "none found"}`);
+      return buildResult({ operation: op, target: tgt, steps: [...steps_, ...(rc?.steps ?? [])], summary: "Preview only; nothing was sent.", ...(rc?.warnings.length ? { warnings: rc.warnings } : {}), extra: { plan, preview: true, before: before[k - 1] ?? null, ...(rc ? { recook: rc.report } : {}) } });
+    }
 
     // ---- Send. A failed command stops the edit (nothing is undone); a failed setting is reported. The preset is cooked and read back either way.
     const notDone: string[] = [];
@@ -2066,14 +2078,17 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
         notDone.push("name");
       }
     }
-    steps_.push(await commandStep(bridge, "cook", `Cook ${ref} /MergeLowPriority`, tm));
+    const cookStep = await commandStep(bridge, "cook", `Cook ${ref} /MergeLowPriority`, tm);
+    steps_.push(cookStep);
 
     // ---- Read back: the edited line as asked, every other line and its cooked values unchanged.
     let verification: Verification = notRequested();
     let after: LineDetail[] | null = null;
+    let presetAfter: PresetRead | null = null;
     try {
       after = (await readLineDetails(bridge, ref, tm)) ?? [];
       const data = await readPreset(bridge, ref, tm);
+      presetAfter = data;
       const s = await readEditState(bridge, tm);
       const rows = data?.rows ?? [];
       const problems: string[] = [];
@@ -2147,9 +2162,25 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs): Promise
     const edited = action !== "remove_line" ? after?.[k - 1] : undefined;
     if (edited?.speedMaster) warnings.push(...masterSpeedWarning(`line ${k}`, edited.speedMaster, edited.speedHz));
     if (want && action === "set" && change.shape !== undefined) warnings.push("a new shape recomputes the curves of steps without a custom curve; a custom curve stays (give curve: reset to go back to the shape's)");
-    const notes = [`cues that call ${ref} with a standard line follow the change without being re-cooked${referencedBy ? ` (${referencedBy} object(s) reference it)` : ""}; a cue line with its own Speed X keeps that speed`];
+    // ---- The calling cues: re-cooked (recook), or a warning that they still hold the old cooked values.
+    let recookReport: RecookReport | undefined;
+    if (recook) {
+      const editOk = cookStep.status === "succeeded" && verification.status === "matched" && !notDone.length;
+      const rc = await recookCallers(ctx, { preset: target, presetRead: presetAfter, spec: recook, ...(editOk ? {} : { skipAll: `not re-cooked: the edit of ${ref} did not ${cookStep.status === "succeeded" ? "read back as asked" : "cook"}` }) }, deps);
+      steps_.push(...rc.steps);
+      warnings.push(...rc.warnings);
+      recookReport = rc.report;
+      const n = rc.report.recooked.length;
+      if (editOk) {
+        const checked = `${verification.checked}; ${n} calling cue part(s) in ${rc.report.scope} re-cooked (${recook.mode}) and read back: their cooked values from ${ref} match the preset's, OwnNonCookedDataPresent No, the cue's other parts unchanged${rc.report.complete ? "" : " (the search for callers was incomplete)"}`;
+        verification = rc.problems.length ? { status: "mismatched", checked, detail: rc.problems.slice(0, 12).join("; ") } : { status: "matched", checked };
+      }
+    } else if (referencedBy !== 0) {
+      warnings.push(`the cues that call ${ref} were NOT re-cooked: they may keep their old cooked values (a bench saw a cue keep the old width, trans or speed until re-cooked): ${referencedBy ? `${referencedBy} object(s) reference ${ref} (the console's count)` : "the console's reference count was not read"}. Pass recook: true (or {sequences: [...]}), or cook each calling cue part with gma3_cook_recipes (gma3_preset_usage finds them)`);
+    }
+    const notes = ["a cue line with its own Speed X (SPEEDFROMX not None) keeps that speed after a re-cook"];
     if (clears.length && want) notes.push(`value sources given no preset now output the shape's own value: ${clears.map(([n, s_]) => `step ${n + 1} ${want!.steps[n].sources[s_].attribute ?? `source ${s_ + 1}`}`).join(", ")}`);
-    return buildResult({ operation: op, target: tgt, steps: steps_, verification, ...(warnings.length ? { warnings } : {}), extra: { plan, notes, before: action === "add_line" ? null : before[k - 1] ?? null, lines: after } });
+    return buildResult({ operation: op, target: tgt, steps: steps_, verification, ...(warnings.length ? { warnings } : {}), extra: { plan, notes, before: action === "add_line" ? null : before[k - 1] ?? null, lines: after, ...(recookReport ? { recook: recookReport } : {}) } });
   };
   return preview ? body() : ctx.mutations.run(body);
 }
@@ -2235,7 +2266,8 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         "add_line appends a copy of line 1 retargeted with the given fields (selection and steps required; shape, MAtricks, speed, phase and measure otherwise line 1's; steps without a curve are reset to the shape's; a source given nothing loses line 1's preset); remove_line deletes line `line` (the later lines move up; never the only line). " +
         "Checked first: the preset and line exist, the line is a PhaserRecipe of 2 steps whose values are told apart by their value sources' presets, each source's presets from one pool and holding its attribute, no other line with the same source presets, the references exist, no dialog, the Edit Recipe mode off. " +
         "Sent: Assign Group / Shape / MAtricks At the line, Assign Preset At each value source, set PRESET \"\" on a cleared source, the curves after the shape, WIDTHX / TRANSX, SPEEDX / PHASEFROMX / PHASETOX / MEASURE, Cook /MergeLowPriority. " +
-        "Read back: the edited line as asked (presets, trans, width per source, curves, measure, cook state), every other line and its cooked values unchanged, the edited line's values cooked at its speed and measure, the old presets' values gone. Cues calling the preset follow it without a re-cook (a cue line's own Speed X still replaces the speed). " +
+        "Read back: the edited line as asked (presets, trans, width per source, curves, measure, cook state), every other line and its cooked values unchanged, the edited line's values cooked at its speed and measure, the old presets' values gone. " +
+        "Cues calling the preset are not guaranteed to follow the edit (a bench saw a cue keep the old width, trans or speed until re-cooked; another saw it follow at once): re-cook them. recook: true (or {sequences: [...], mode}) on set / add_line / remove_line, after a matched edit: finds the cue parts that call the preset (gma3_preset_usage's scan: every sequence, or only those listed; give sequences on a large show), re-cooks each part whose recipe line calls it with gma3_cook_recipes (merge_low_priority by default, or merge; one part at a time, never the whole cue), and reads each back: its cooked values from the preset match the preset's (steps, presets, trans, width, curves, phase, measure, speed master; speed unless the cue line has its own Speed X), OwnNonCookedDataPresent No, the cue's other parts unchanged. recook lists the parts re-cooked and those skipped with the reason (values referencing the preset without a recipe line calling it); not searched: presets that embed it, CueZero, OffCue. Without recook the call warns that the calling cues keep their old values (with the console's reference count; no scan). " +
         "Per line: speed_master n (1-16, a number only; 0 / null clears) links the line to speed master 3.n (SPEEDMASTEROVERRIDE), read back by the master's name (read from the master) and in the cooked values; the master multiplies Speed X, so a line with a master and a Speed X other than 60 is warned about. adaptive_measure / adaptive_width set PLAYBACKADAPTIVEMEASURE / PLAYBACKADAPTIVEWIDTH; a measure switches Adaptive Measure off first (warned when the line had it); a width under Adaptive Width needs adaptive_width: false. Under Adaptive the measure / widths the console derives (a new group, MAtricks or wings) are not compared. " +
         "Per line: transform (none / mirror, PHASERTRANSFORM), invert_style, x / y {wings, blocks, groups} (the line's own columns; null clears) and phase_y, set with the line's settings and read back (Mirror also reads INVERTSTYLE Pan unless invert_style is given, and XInvW / YInvW Yes with the X / Y wings). Mirror applies at the cook: on the mirrored wing the cooked values are hard (100 - x absolute, -x relative) with no step preset; the read-back counts them as the line's own (any member of its group, the attributes of INVERTSTYLE), and requires its step presets on the other wing. Mirror without wings is warned about (it mirrors nothing). Refused with a MAtricks object on the line. " +
         "preview: true runs the checks and returns the plan. Needs bridge 0.52.1.",
@@ -2261,6 +2293,10 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         y: lineShape.y,
         phase_y: lineShape.phase_y,
         exclusive: z.boolean().optional().describe("create: required (true) unless preview: nobody else uses the programmer or the Edit Recipe mode meanwhile. Not used by the edit actions."),
+        recook: z
+          .union([z.boolean(), z.object({ sequences: z.array(z.number().int()).optional(), mode: z.enum(RECOOK_MODES).optional() }).strict()])
+          .optional()
+          .describe("set / add_line / remove_line: after a matched edit, re-cook the cue parts that call the preset (true: every sequence; sequences: only these; mode merge_low_priority (default) or merge) and read them back. preview: lists them."),
         preview: z.boolean().optional(),
       },
     },
