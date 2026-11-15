@@ -5,14 +5,15 @@
  *
  * Measured on onPC 2.5.1 (show "Rescue", 2026-11-15; docs/tools/recipes.md, "What is and is not verified"):
  * - positions follow the group's stored grid: a group stored 252, 251, 253, 254 with x 1, 0, 2, 3 is read 251, 252,
- *   253, 254 (the selection order);
+ *   253, 254 (the selection order); rows (y) do not change it when x is the rank 0 to n - 1;
  * - XWings w, then XBlock b, then XGroup g turn a rank into a position: within a wing (P / w ranks) an even wing counts
  *   up and an odd one down; a block of b neighbours is one position; with XGroup the position is (block mod g);
  * - X k keeps the fixtures whose position is k - 1; X past the last position (XGroup 2 X 3, or 2 blocks and X 4) keeps
  *   none, so the line cooks nothing (no wrap-around).
  * Everything else that might change which fixtures a select keeps is left unpredicted, with the reason: a Y or Z select,
  * XWidth / XShift / XShuffle with a select, inverts and the Mirror transform with a select, Y or Z wings / blocks /
- * groups, wings that do not divide the group, a grid that is not one gap-free row, an inactive object, and a line that
+ * groups, wings that do not divide the group, a grid whose x is not the rank 0 to n - 1 (gaps, shared columns) or with
+ * several Z layers, an inactive object, and a line that
  * has its own columns and a MAtricks object at the same time.
  */
 import type { Gma3Bridge } from "../bridge.js";
@@ -156,9 +157,10 @@ export function selectMembers<M extends GridMember>(members: M[], s: SelectionSe
   if (!Number.isInteger(k) || k < 1) return no(`X ${k} is not a position`);
   const n = members.length;
   if (members.some((m) => typeof m.x !== "number" || typeof m.y !== "number" || typeof m.z !== "number")) return no("the group's grid cells were not read");
-  if (new Set(members.map((m) => m.y)).size > 1 || new Set(members.map((m) => m.z)).size > 1) return no("the group's grid has more than one row; a select on it is not verified");
+  // Rows (y) do not change an X select when x is the rank (Group 9013: x 0-11 on 3 rows keeps what one row keeps).
+  if (new Set(members.map((m) => m.z)).size > 1) return no("the group's grid has more than one Z layer; a select on it is not verified");
   const ordered = [...members].sort((a, b) => a.x! - b.x!);
-  if (ordered.some((m, i) => m.x !== i)) return no("the group's grid has gaps or shared cells; a select on it is not verified");
+  if (ordered.some((m, i) => m.x !== i)) return no("the group's grid x is not the rank 0 to n - 1 (gaps, or fixtures sharing a column); a select on it is not verified");
   let pos = ordered.map((_, i) => i);
   let count = n;
   const w = X.wings ?? 1;

@@ -138,7 +138,8 @@ None). The prediction of `gma3_recipes`, `gma3_cook_recipes`, `gma3_edit_recipe`
 the fixtures the console keeps (`src/tools/matricksselection.ts`), measured on onPC 2.5.1:
 
 - the positions follow the group's stored grid, not its stored order: Group 9001 is stored 252, 251, 253, 254 with
-  x 1, 0, 2, 3, and its selection order is 251, 252, 253, 254;
+  x 1, 0, 2, 3, and its selection order is 251, 252, 253, 254. Rows do not change it when x is the rank: Group 9013
+  (x 0 to 11 on 3 rows) keeps what one row keeps;
 - XWings w, then XBlock b, then XGroup g give each rank a position: in each of the w wings (P / w ranks) an even wing
   counts up and an odd one down; b neighbours make one position; with XGroup the position is (block mod g);
 - X k keeps the fixtures at position k − 1. Past the last position (XGroup 2 with X 3, 2 blocks with X 4) it keeps
@@ -147,8 +148,8 @@ the fixtures the console keeps (`src/tools/matricksselection.ts`), measured on o
 The fixtures it drops are checked after the cook like the attributes a filter keeps out: a cooked value on one of them
 is a mismatch. Not predicted (named in `notPredicted`, so the cook is not a false mismatch): a Y or Z select; Y or Z
 wings, blocks or groups with a select; XWidth, XShift or XShuffle with a select; an invert flag or the Mirror transform
-with a select; XWings that do not divide the group; a grid that is not one gap-free row (x 0 to n − 1, one y and z); an
-inactive MAtricks object; a line with its own select and a MAtricks object (or the object and its own columns, one of
+with a select; XWings that do not divide the group; a grid whose x is not the rank 0 to n − 1 (gaps, or fixtures
+sharing a column as in a 4 × 3 grid) or with several Z layers; an inactive MAtricks object; a line with its own select and a MAtricks object (or the object and its own columns, one of
 them with a select); a generator line with a select; a setting that cannot be read. Without a select, wings, blocks and
 groups only spread timing and phase: every member gets values.
 
@@ -656,18 +657,21 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   back matched; the cooked fixtures, read with `preset.read`:
   - MAtricks 9009 (XGroup 2, X 1) with 1.9010, and the same as the line's own columns: 251, 253;
   - own X 3: 253; own XBlock 2, X 2: 253, 254; own XGroup 2, X 2: 252, 254;
-  - MAtricks 9010 (XWings 2, X 2) on Group 9005: 2 and 11 (the second wing counts down);
+  - MAtricks 9010 (XWings 2, X 2) on Group 9005: 2 and 11 (the second wing counts down); MAtricks 9012 (XWings 2,
+    XGroup 2, X 1): 1, 3, 5, 8, 10, 12 (wings before groups; without them it would be 1, 3, 5, 7, 9, 11);
+  - own XGroup 3, X 1 on Group 9013 (x 0 to 11 on 3 rows): 1, 4, 7, 10, as on one row;
   - MAtricks 9011 (XGroup 2, X 3) and MAtricks 9002 (XBlock 2, X 4) on Group 9001: nothing cooked;
   - the earlier bench cues read again: Sequence 9019 cue 9 (MAtricks 9001, XGroup 3, X 1, Group 9005): 1, 4, 7, 10;
     cues 2 and 10 (XBlock 2, X 4, own columns and MAtricks 9002): 7, 8; preset 21.9049 (XWings 2, XBlock 4, X 2):
-    5, 6, 7, 8.
+    5, 6, 7, 8 (this one keeps the same fixtures with or without the wings, so it does not show their order).
 
-  The cook of Sequence 9033 (these 10 cues) read back `matched`, with the two empty ones named as cooking nothing; the
-  old prediction had read 5 of them `mismatched`. Sequence 9034 cue 1, built by `gma3_store_recipe_cues` with Group
+  The cook of Sequence 9033 (13 cues) read back `matched`, with the two empty ones named as cooking nothing and the
+  4 × 3 grid (cue 13) not predicted; the old prediction had read 5 of the first 10 `mismatched`. Sequence 9034 cue 1, built by `gma3_store_recipe_cues` with Group
   9001, MAtricks 9009 and the phaser preset 21.9072 (Dimmer and Pan), cooked 251 and 253 (`matched`,
   `ownNonCookedDataPresent: false`); played back, the output of 251 and 253 moved (251: Dimmer 7221–58939, Pan
   26440–39096 of 65535 over 4 s) while 252 and 254 stayed at Dimmer 0 and Pan 32768. XWings with a count that is not
-  a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and multi-row grids were not run with a select.
+  a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and grids with shared columns were not run with a select (cue 13, a 4 × 3 grid, cooked 1 and 5 for X 1: not
+  modelled).
 - Verified live for the phase note (same bench and day): Sequence 9033 cues 2, 6, 8, 9 and 10 cooked the phases the note
   gives (251 0° / 253 239.93°; 253 180°; 253 239.93° / 254 359.9°; 253 and 254 180°; 252 and 254 180°), and the cook of
   Sequence 9033 read back `matched` with the phase check on. `gma3_recipes` on the phaser presets 21.9048, 21.9049 and

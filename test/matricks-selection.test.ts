@@ -28,6 +28,11 @@ test("selectMembers: the X select keeps the cooked fixtures of every bench case 
   assert.deepEqual(kept(G9005, { X: "2", XBlock: "4", XWings: "2" }), ["5", "6", "7", "8"]);
   assert.deepEqual(kept(G9005, { X: "2", XBlock: "4" }), ["5", "6", "7", "8"]);
   assert.deepEqual(kept(G9005, { X: "2", XBlock: "2", XGroup: "3" }), ["3", "4", "9", "10"], "(i // 2) % 3 = 1");
+  // Sequence 9033 cue 11: wings apply before groups (without them it would be 1, 3, 5, 7, 9, 11).
+  assert.deepEqual(kept(G9005, { X: "1", XWings: "2", XGroup: "2" }), ["1", "3", "5", "8", "10", "12"]);
+  // Cue 12, Group 9013: x 0-11 on 3 rows (y 0, 1, 2): the rows do not change the select.
+  const g9013 = G9005.map((m) => ({ ...m, y: Math.floor(m.x! / 4) }));
+  assert.deepEqual(kept(g9013, { X: "1", XGroup: "3" }), ["1", "4", "7", "10"]);
 });
 
 test("selectMembers: the kept position and the number of positions", () => {
@@ -57,8 +62,11 @@ test("selectMembers: no select keeps everyone; unverified settings and grids are
   assert.match(why(G9001, { X: "1", PhaserTransform: "Mirror" }), /an invert or the Mirror transform/);
   assert.match(why(G9001, { X: "1", Active: "No" }), /not active/);
   assert.match(why(G9005.slice(0, 7).map((m, i) => ({ ...m, x: i })), { X: "1", XWings: "2" }), /XWings 2 on 7 fixtures \(not a multiple\)/);
-  assert.match(why(G9001.map((m, i) => ({ ...m, y: i % 2 })), { X: "1" }), /more than one row/);
-  assert.match(why(G9001.map((m) => ({ ...m, x: m.x! * 2 })), { X: "1" }), /gaps or shared cells/);
+  assert.match(why(G9001.map((m) => ({ ...m, x: m.x! * 2 })), { X: "1" }), /x is not the rank 0 to n - 1 \(gaps, or fixtures sharing a column\)/);
+  // Group 9010 (4 x 3): x 0-3 on 3 rows, four fixtures per column.
+  const g4x3 = Array.from({ length: 12 }, (_, i) => ({ fixture: String(i + 1), sfIndex: i + 1, x: i % 4, y: Math.floor(i / 4), z: 0 }));
+  assert.match(why(g4x3, { X: "1" }), /fixtures sharing a column/);
+  assert.match(why(G9001.map((m, i) => ({ ...m, z: i % 2 })), { X: "1" }), /more than one Z layer/);
   assert.match(why(G9001.map(({ fixture, sfIndex }) => ({ fixture, sfIndex })), { X: "1" }), /grid cells were not read/);
   assert.match(why(G9001, { X: "abc" }), /could not be read/);
 });
