@@ -41,7 +41,8 @@ Returns the bridge's `osc.read` plus `meaning`:
 - `input.listening`, when input is on: the [socket check](#socket-check) with its `finding` in words and, when a
   receiving port is not held by the console, `fix` (the re-bind call). A conclusive "not listening" makes
   `acceptsCommands` false for the lines on that port, and the `explanation` says the console is not receiving there
-  instead of saying that it runs commands.
+  instead of saying that it runs commands; `reachableFrom` drops that port and `serverSender` says this server's
+  sender cannot reach the console until input is re-bound.
 - `output`: the lines that send and where (`loopback` per destination).
 - `serverSender`: this server's own OSC target (`GMA3_OSC_HOST`, `GMA3_OSC_PORT`, `GMA3_OSC_PREFIX`), and the line
   that runs its commands, or a note that `gma3_command` via OSC and `gma3_start_bridge` cannot reach the console.
@@ -177,4 +178,8 @@ same port unless a firewall stops it.
   - `rebind_input` was not run on a console. It reuses the off / 0.4 s / on steps that the port-change re-bind uses
     live.
   - The bench failure itself was not reproduced, and its cause is unknown.
+  - How soon the socket appears after the "on" of a re-bind was not measured. The check after a re-bind (any
+    re-bind, port changes included) waits 0.4 s once before it calls a port unbound.
+  - Whether the console binds a port for a line with Receive but no Receive Command: the bench line has Receive
+    Command only. Such lines are checked as receiving.
   - Linux was not tried.

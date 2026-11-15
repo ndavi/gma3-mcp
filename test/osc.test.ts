@@ -510,6 +510,11 @@ test("gma3_osc: input on with nothing bound on the command port says so, no long
   assert.match(i.explanation, /holds no socket on UDP 8000 \(line 1\)/);
   assert.match(i.explanation, /gma3_configure_osc \{"rebind_input": true, "exclusive": true\}/);
   assert.doesNotMatch(i.explanation, /the console runs OSC commands/);
+  assert.deepEqual(i.reachableFrom, [], "a port nobody holds is reachable from nowhere");
+  const deafCheck = await fakeChecker(new Map([[8000, [1]]]));
+  const sender = explainOsc(osc.state() as OscState, { host: "127.0.0.1", port: 8000 }, deafCheck).serverSender!;
+  assert.equal(sender.matchingLine, null);
+  assert.match(sender.note, /line 1 is set up for it, but the console holds no socket on port 8000: .*cannot reach the console until input is re-bound/);
 
   osc.bound = [8000];
   const ok = await h.callJson("gma3_osc", {});

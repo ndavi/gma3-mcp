@@ -137,7 +137,10 @@ export function explainOsc(s: OscState, sender?: { host: string; port: number; p
   const deaf = conclusive ? cmd.filter((l) => socket.ports.some((p) => p.port === l.port && p.status !== "listening")) : [];
   const accepts = cmd.length > deaf.length ? true : cmd.length ? false : typeof s.enableInput !== "boolean" || unknownCmd.length ? null : false;
   const finding = socket ? socketFinding(socket) : undefined;
-  const matching = sender ? cmd.find((l) => l.port === sender.port && (l.prefix || "") === (sender.prefix || "")) : undefined;
+  const forSender = (l: OscLine) => !!sender && l.port === sender.port && (l.prefix || "") === (sender.prefix || "");
+  const live = cmd.filter((l) => !deaf.includes(l));
+  const matching = live.find(forSender);
+  const deafMatch = matching ? undefined : deaf.find(forSender);
   const reach = nets.length ? `, so anyone who can reach ${nets.join(", ")}${known ? "" : " (and possibly other networks: the interface scan was incomplete)"} can run commands on this console` : known ? "; this machine has no address outside loopback right now" : "; whether it is reachable from a network is unknown (the interface scan was incomplete)";
   return {
     input: {
@@ -145,7 +148,7 @@ export function explainOsc(s: OscState, sender?: { host: string; port: number; p
       acceptsCommands: accepts,
       commandLines: cmd.map((l) => ({ line: l.index, name: l.name, port: l.port, address: address(l) })),
       ...(unknownCmd.length ? { unreadableLines: unknownCmd.map((l) => l.index) } : {}),
-      reachableFrom: cmd.length || accepts === null ? ["loopback", ...nets, ...(known ? [] : ["unknown: the interface scan was incomplete"])] : [],
+      reachableFrom: live.length || accepts === null ? ["loopback", ...nets, ...(known ? [] : ["unknown: the interface scan was incomplete"])] : [],
       ...(socket ? { listening: { ...socket, finding: finding!.text, ...(finding!.fix ? { fix: finding!.fix } : {}) } } : {}),
       explanation: deaf.length
         ? `${finding!.text}. Until then OSC commands sent to ${deaf.map((l) => `UDP ${l.port} (${address(l)})`).join(", ")} are lost. Fix: ${finding!.fix}`
@@ -171,7 +174,9 @@ export function explainOsc(s: OscState, sender?: { host: string; port: number; p
             matchingLine: matching?.index ?? null,
             note: matching
               ? `gma3_command via osc and gma3_start_bridge reach the console through line ${matching.index}`
-              : `no line runs commands sent to port ${sender.port}${sender.prefix ? ` with prefix ${sender.prefix}` : ""}: gma3_command via osc and gma3_start_bridge cannot reach the console`,
+              : deafMatch
+                ? `line ${deafMatch.index} is set up for it, but the console holds no socket on port ${deafMatch.port}: gma3_command via osc and gma3_start_bridge cannot reach the console until input is re-bound (${finding!.fix})`
+                : `no line runs commands sent to port ${sender.port}${sender.prefix ? ` with prefix ${sender.prefix}` : ""}: gma3_command via osc and gma3_start_bridge cannot reach the console`,
           },
         }
       : {}),
