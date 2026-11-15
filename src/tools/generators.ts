@@ -14,8 +14,9 @@
  *     children are GeneratorConfigurations (`N.1`) and RandomChannels (`N.2`); a channel is `Generator N.2.k`
  *     (class RandomChannel).
  *   - `Store Generator N /NoConfirmation` (programmer empty) creates it with one channel: Dimmer, Speed 60, Ratio 50,
- *     Attack 100, Decay 100, variances 0. `Store Generator N.2.k /NoConfirmation` adds channel k with the same
- *     defaults. Only k = count + 1 is used (a gap is not verified).
+ *     Attack 100, Decay 100, variances 0. `Store Generator N.2.k /NoConfirmation` adds channel k with
+ *     Attack / Decay 100 and variances 0 (read; its attribute, speed and ratio were always written before any read).
+ *     Only k = count + 1 is used (a gap is not verified).
  *   - `Assign Attribute "<Attr>" At Generator N.2.k` sets the channel's attribute (a `set` is refused; an unknown
  *     attribute answers "Illegal object").
  *   - `Set Generator N.2.k Property "<Prop>" "<v>"` sets one setting of one channel: Speed (cycles per minute), Ratio
@@ -23,7 +24,8 @@
  *     SpeedMaster. "abc" answers "Illegal value"; Ratio "150" answers OK and stores 100 (out-of-range values are
  *     refused here).
  *   - SpeedMaster is 0-based: "0" links master 3.1, "1" master 3.2; "None" clears. It reads back as the master's name
- *     ("" when cleared). The link takes effect at the next Goto of the cue that plays the line (bench).
+ *     ("" when cleared). The link takes effect at the next Goto of the cue that plays the line, and the master
+ *     multiplies the speed (THK bench; at 60 BPM, scale One, a 7.5 cycles per minute channel ran about 8 s here).
  *   - Read with asText false, ATTRIBUTE is the attribute's name and SPEED is in cycles per minute (15); as text,
  *     ATTRIBUTE is a handle number and SPEED is in Hz ("0.250000"). The percent fields read truncated with asText false
  *     (RATIO 19 for 20, 33 for 33.3) and exact as text ("20.00"): both reads are made.
@@ -421,7 +423,7 @@ export async function storeGenerator(ctx: ToolContext, raw: StoreGeneratorArgs):
       }
     }
     if (main.outcome !== "succeeded" && action === "create" && steps.some((s) => s.name === "store_generator" && s.status === "succeeded")) warnings.push(`${ref} was created and is kept (nothing is undone)`);
-    if (specs.some((s) => typeof s.speedMaster === "number")) warnings.push("a channel's speed master link takes effect at the next Goto of the cue that plays it; the master multiplies the channel's speed");
+    if (specs.some((s) => typeof s.speedMaster === "number")) warnings.push("a channel's speed master link takes effect at the next Goto of the cue that plays it, and the master multiplies the channel's speed (THK migration bench)");
     return buildResult({ operation: op, target, steps, verification, warnings, extra: { ...extra, ...(after ? { generator: { no: after.no, name: after.name, class: after.class, channels: after.channels } } : {}) } });
   };
   return raw.preview === true ? body() : ctx.mutations.run(body);

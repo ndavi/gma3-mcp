@@ -288,7 +288,8 @@ low_variance?, high_variance?, phase_variance?, speed_master?}], preview?}`.
    (`create`, or a new channel), the programmer must be **known to be empty** (`programmer`, a complete scan): the
    tool refuses otherwise and never clears it.
 2. `create`: `Store Generator N /NoConfirmation` (one channel: Dimmer, Speed 60, Ratio 50, Attack 100, Decay 100,
-   variances 0); each further channel `Store Generator N.2.k /NoConfirmation` (same defaults). Then per channel
+   variances 0); each further channel `Store Generator N.2.k /NoConfirmation` (read on a new channel: Attack and
+   Decay 100, variances 0; its attribute, speed and ratio were always written before any read). Then per channel
    `Assign Attribute`, then one `Set Generator N.2.k Property "<P>" "<v>"` per setting given (the console takes one
    property per command). Then the name (`set`).
 3. Read back: the channel count, each written attribute and setting (the percent fields as text: raw they read
@@ -296,8 +297,8 @@ low_variance?, high_variance?, phase_variance?, speed_master?}], preview?}`.
    name. The result has every channel field (`generator.channels`, the unwritten ones under `other`).
 
 Nothing is undone after a failure: a generator created before a failed step is kept, and the warnings say so. The
-speed master link takes effect at the next Goto of the cue that plays it (THK migration bench) and the master
-multiplies the channel's speed.
+speed master link takes effect at the next Goto of the cue that plays it, and the master multiplies the channel's
+speed (both from the THK migration bench; not re-measured here).
 
 ## `gma3_edit_phaser_recipe`
 
@@ -757,17 +758,22 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   - `gma3_edit_recipe add` on the empty preset 21.9077 (`Store Preset 21.9077 /NoConfirmation`): Group 9001 +
     generator 9004, matched, auto-cooked 8 values (Dimmer and Pan, 6500, on the 4 fixtures). `gma3_recipes` predicted
     8 pairs (`generatorAttributes` Dimmer, Pan, no problem); `gma3_cook_recipes` of the preset matched. On 21.9076,
-    `set generator` 9003 over values (warned), `null`, then 9003 again: each matched;
+    `set generator` 9003 over values (warned), `null`, 9003 again, then `set values` 1.9010 over the generator
+    (warned, the generator cleared): each matched; the new `gma3_recipes` on the bench presets 21.9040 (generator
+    9001, Dimmer: 4 pairs) and 21.9041 (a values line and a generator line, ColorRGB_G / _B: 16 pairs) found no
+    problem;
   - Sequence 9032 Cue 1 (`Store Sequence 9032 Cue 1 /NoConfirmation`) = Group 9001 + 21.9077 (`gma3_edit_recipe`),
     cooked merge low priority: matched, `ownNonCookedDataPresent: false`, 8 cooked values;
-  - output after `Go+ Sequence 9032` (16-bit, every 200 ms for 16 s): the 4 Dimmers jumped between random levels
-    (3200 to 65484), about every 4 s (15 cycles per minute), each fixture at its own time (phase variance 360). Pan
-    (variances 0, attack / decay 100, master 3.2) ramped up and down with a period of about 8.2 s (7.5 cycles per
-    minute: 8 s), 251 and 253 out of phase. Sequence 9032 was switched off;
+  - output after `Go+ Sequence 9032` (16-bit; asked every 200 ms, an effective resolution of about 650 ms over 16 s):
+    the 4 Dimmers jumped between random levels (3200 to 65484), about every 4 s (15 cycles per minute), each fixture
+    at its own time (phase variance 360). Pan (variances 0, attack / decay 100, linked to master 3.2, which stood at
+    60 BPM, scale One; resolution about 530 ms over 12 s) ramped up and down with a period of about 8.2 s (7.5 cycles
+    per minute: 8 s), 251 and 253 out of phase. At 60 BPM the master multiplies by 1, so this neither confirms nor
+    contradicts the bench note that the master multiplies the speed. Sequence 9032 was switched off;
   - not run on a console: a generator on a cue line (refused by the tool), several generators on one preset, a
     generator line with a filter or MAtricks, a generator whose settings change while a cue plays it (whether the cue
-    follows without a re-cook), the speed master multiplying the speed (the bench notes say it does), channels
-    beyond 2, generator types other than Random.
+    follows without a re-cook), the speed master multiplying the speed at another BPM than 60 (the bench notes say it does),
+    `edit` appending a channel (fake bridge only), channels beyond 2, generator types other than Random.
 - Not run on a console for filters: the "keeps out" mismatch (fake bridge only: the console always applied the filter);
   a filter on a line in a preset; a filter on a colour preset where the rest of the activation group might cook too
   (the check would report it as kept out); filters with several rules, a layer off, inverted rules or APPLYTOFIXTURES
