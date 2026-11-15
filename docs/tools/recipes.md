@@ -130,8 +130,18 @@ and attributes only. `cookedChanges` compares the target's cooked values before 
 `added`, `removed`, and `changed` in content (value, relative, steps and their layers, phaser layers, and the preset
 each value comes from, which a cooked value references). `autoCooked` is true when the coverage or a cooked value
 changed, so a line moved to another preset with the same attributes (1.9010 to 21.9072: Dimmer then comes from the
-phaser preset) counts as re-cooked although its coverage is the same. Unit-tested on the fake console; not run on a
-console (the bridge was down on 2026-11-15 when this was written).
+phaser preset) counts as re-cooked although its coverage is the same. Verified live (onPC 2.5.1, show "Rescue",
+2026-11-15, Sequence 9038 Cue 1, Group 9001 = Daytona 251-254, the code run in-process):
+- `add` Group 9001 + 1.9010: `cookedChanges` `added: 4`, `autoCooked: true`;
+- `set` to 1.9011 (Dimmer 0, same fixtures and attribute, so the coverage is the same before and after): `changed: 4`,
+  `autoCooked: true`;
+- `set` to 1.9013 (also Dimmer 100, from a second preset, so only the source changes; the raw cooked rows read
+  `absPreset` 9013 instead of 9010): `changed: 4`, `autoCooked: true`;
+- `set` back to 1.9010: the same.
+
+The cooked rows of a cue part carry `absPreset`, as the fake console models them, and the cue read
+`ownNonCookedDataPresent: false`. Not run on a console: a change in steps, phaser layers or relative alone, and a
+preset target.
 
 `values` is the plain string `"4.2"`. A number is refused with that form in the error: as JSON numbers `4.20` and `4.2` are
 the same, as presets they are preset 20 and preset 2. A string with quotes inside it (`"\"4.2\""`) is refused the same way.
@@ -910,7 +920,7 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     calling such a preset stops a relative phaser on its attributes (Pan + Tilt relative 0 preset 2.9040, 1st series,
     and 2nd series in Sequence 9022: Cue 3 = Group 9001 + 2.9030 + 2.9040), where neither the base preset, another
     absolute preset nor a RELEASE does. `gma3_store_preset` now counts a relative of 0 as a relative layer, compares
-    it in the read-back, and `gma3_preset` lists `relative: 0` (unit-tested; not run on a console, see
+    it in the read-back, and `gma3_preset` lists `relative: 0` (verified live on 2.9045, Pan + Tilt relative 0, see
     [presets](presets.md#what-is-and-is-not-verified));
   - a new relative phaser takes over an attribute's relative layer: Sequence 9025 Cue 1 = Group 9001 + 2.9032 (base)
     and Group 9001 + 21.9054 (relative Pan + Tilt phaser A); Cue 2 = Group 9001 + 2.9044 (Pan relative 0) and Group

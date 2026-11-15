@@ -183,19 +183,29 @@ is a separate change.
   - an embedded preset following its source's update while a copy keeps the old values;
   - a forced conversion from `Selective/Global` to `Global`;
   - the store preferences unchanged after every store.
+- Verified live for a relative of 0 (onPC 2.5.1, show "Rescue", 2026-11-15, Group 9001 = Daytona 251-254, the code
+  run in-process). A relative of 0 (a "relative only" preset such as Pan at relative 0, the THK migration's RELEASE
+  PHASER presets; bench preset 2.9044) is a relative layer in the `layers` check, the read-back and `gma3_preset`
+  (above). The signal is the console's: a layer a value lacks has no key.
+  - Raw `preset.read` of 1.9010 (single-step Dimmer 100): no `relative` key, `hasAbsolute: true`,
+    `hasRelative: false`. The flags of a single-step absolute row are therefore read on a console too; the check
+    still decides on the value. 2.9044 reads `relative: 0`, no value, `hasRelative: true`, `hasAbsolute: false`.
+  - Raw programmer reads (`GetProgPhaser`): after `At 50` and after `At Preset 1.9010`, no `relative` key
+    (`At Preset` adds `absPreset`). After `Attribute "Pan" At Relative 0`: `relative: 0`, no `value` key, and a step
+    with `relative: 0` and no `absolute`. That command also activates Tilt at relative 0 (Pan and Tilt are one
+    activation group), so `attributes: [Pan]` is refused ("not requested: … Tilt"), as the tool says. 2.9044 was
+    stored after `Off Attribute "Tilt"`.
+  - An ordinary default-layers store (1.9013 after `At 100`, selective): `matched`.
+  - A relative-only store (2.9045, `layers: [relative]`, `attributes: [Pan, Tilt]`): `matched`, with the relative
+    compared. The raw read has 8 rows, each `relative: 0`, `hasRelative: true`, `hasAbsolute: false`, and
+    `gma3_preset` lists `relative: 0`. With the default layers, the same programmer is refused in preview ("layers
+    that were not requested (relative)").
 - Not covered:
   - relative values are compared by value; multi-step phaser data step by step with bridge 0.23.0 (see
     [phasers](phasers.md));
     relative embedding is verified by the unit tests, not on the console (the live test embeds absolute values);
-  - a relative value of 0 (a "relative only" preset such as Pan at relative 0, the THK migration's RELEASE PHASER
-    presets; bench preset 2.9044, 2026-11-15) is a relative layer in the `layers` check, the read-back and
-    `gma3_preset` (above). The signal is the console's, from earlier reads: a layer a value lacks has no key
-    (`preset.read` on 2.9044: `relative: 0`, no value, `hasRelative: true`, `hasAbsolute: false`; `GetProgPhaser` has no
-    `relative` key on `At 50` / `At 20`, the two raw reads of kb-16; the multi-step rows read on the bench have
-    `hasRelative: false` and no relative). Not run on a console with this code (the bridge was down on 2026-11-15):
-    a store of a relative-only preset, a programmer read after `At Relative 0` and after `At Preset`, a read of a
-    single-step absolute preset such as 1.9010 (expected: no `relative` key), and an ordinary default-layers store
-    (expected: still `matched`). Unit-tested on the fake console and in the Lua bridge test;
+  - a mismatch on a relative of 0 (a console that stores another layer or value next to it) and `existing: merge`
+    over a preset holding the other layer: unit tests only (fake console, Lua bridge test);
   - MAgic presets and recipe content are not modelled;
   - a pool's own input filter (a filter or world assigned to the pool) is not predicted; only the read-back catches it.
 - The embedded preset's update is asynchronous; a read in the same frame as the source's change shows the old values.
