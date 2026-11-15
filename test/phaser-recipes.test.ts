@@ -1680,6 +1680,7 @@ test("recook: a part whose values reference the preset without a recipe line cal
     assert.match(rep.skipped[0].reason, /none of its recipe lines calls it/);
     assert.ok(!s.h.fake.requests.some((q) => q.op === "cueContents" && /^Sequence 9033/.test(String(q.args.ref))), "Sequence 9033 is not in the scope");
     assert.ok(!s.cmds.some((c) => /Sequence 903[23]/.test(c)));
+    assert.match((r.warnings ?? []).join(" "), /only Sequence\(s\) 9031, 9032 were searched .* a cue in another sequence was not re-cooked/);
   } finally {
     await s.h.close();
   }

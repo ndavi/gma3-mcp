@@ -2171,6 +2171,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
       warnings.push(...rc.warnings);
       recookReport = rc.report;
       const n = rc.report.recooked.length;
+      if (recook.sequences) warnings.push(`only Sequence(s) ${recook.sequences.join(", ")} were searched for cues calling ${ref}: a cue in another sequence was not re-cooked${referencedBy ? ` (${referencedBy} object(s) reference ${ref}, the console's count before the edit)` : ""}`);
       if (editOk) {
         const checked = `${verification.checked}; ${n} calling cue part(s) in ${rc.report.scope} re-cooked (${recook.mode}) and read back: their cooked values from ${ref} match the preset's, OwnNonCookedDataPresent No, the cue's other parts unchanged${rc.report.complete ? "" : " (the search for callers was incomplete)"}`;
         verification = rc.problems.length ? { status: "mismatched", checked, detail: rc.problems.slice(0, 12).join("; ") } : { status: "matched", checked };

@@ -509,7 +509,8 @@ the rule is to re-cook the calling cues after every change of a phaser preset.
 - Only after the preset's own edit cooked and read back matched; otherwise the callers are listed under `skipped`
   with the reason, and nothing is cooked.
 - Callers: `gma3_preset_usage`'s scan (`presetUsage` with a sink, executors not scanned), over `sequences` or every
-  sequence, within 1000 cues and 120 s. An incomplete scan is reported (`recook.complete: false`, the reasons, a
+  sequence, within 1000 cues and 120 s; with `sequences` a warning says that cues in other sequences were not
+  searched (with the reference count). An incomplete scan is reported (`recook.complete: false`, the reasons, a
   warning). Not searched: presets that embed the preset, CueZero, OffCue. Give `sequences` on a large show.
 - Each cue part with a recipe line calling the preset is cooked with `gma3_cook_recipes` (its own inspection,
   refusal of a merge over uncooked values, coverage read-back), **one part at a time**, never the whole cue: a
