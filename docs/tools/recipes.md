@@ -65,7 +65,7 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
 | Capability | Supported |
 | --- | --- |
 | Standard lines: group selection, preset values, MAtricks reference, Enabled, Name, SelectionMode | read, add, set, move, remove; coverage predicted and verified |
-| Per-line MAtricks columns (XWings, XBlock, XGroup, XWidth, XShift, XShuffle, X, FadeFromX / FadeToX, DelayFromX / DelayToX, PhaseFromX / PhaseToX, SpeedFromX / SpeedToX, and the Y and Z ones) | written by `gma3_store_recipe_cues` and read back there; **not verified on a console** (see below); not edited by `gma3_edit_recipe`. A line whose X, Y or Z column is set (also inherited, `<2>`) gives values to only part of its group: it is read (`axisSelect`) and its coverage is not predicted by `gma3_recipes` and `gma3_cook_recipes` |
+| Per-line MAtricks columns (XWings, XBlock, XGroup, XWidth, XShift, XShuffle, X, FadeFromX / FadeToX, DelayFromX / DelayToX, PhaseFromX / PhaseToX, SpeedFromX / SpeedToX, and the Y and Z ones) | written by `gma3_store_recipe_cues` and read back there; not edited by `gma3_edit_recipe`. A line whose X column is set gives values to only part of its group: the coverage is predicted on the fixtures that select keeps ([below](#matricks-select-on-a-line)), from the line's own columns or from its MAtricks object, and left not predicted (named) where the rule is not verified |
 | A line's filter (`filter`: a Filter pool number) | written by `gma3_edit_recipe` (add, set; `null` clears) and `gma3_store_recipe_cues`, read back by number; coverage predicted on the filter's attributes for the filter shape described [below](#filters-on-a-line), otherwise not predicted (named) |
 | A preset line's generator (`generator`: a Generator pool number, in place of the values) | written by `gma3_edit_recipe` (add, set; `null` clears) on preset lines only, read back by number; coverage predicted on the generator's channel attributes ([below](#generators-on-a-preset-line)); not written by `gma3_store_recipe_cues` |
 | Standard lines with a world, SelectionFromValue | read and kept; not edited; coverage not predicted (named in the result; a merge treats what they reach as possibly replaced) |
@@ -83,8 +83,11 @@ extends to cue parts (see [the bridge protocol](../reference.md#cue-part-data-pl
     `generatorAttributes` (one per channel), `enabled`, `selectionMode`;
   - the console's last cooking state (`failedCookedPart`, `emptyLastCooking`);
   - `problems`: missing selection, missing or empty group, missing or empty preset, disabled;
-  - `axisSelect` when its X / Y / Z column selects part of the group ("X 1");
-  - `notPredicted` where coverage is not modelled (phaser lines, a filter of another shape, an axis selection);
+  - `axisSelect` when its own X / Y / Z column is set ("X 1");
+  - `selected` (the fixtures the MAtricks select keeps, in selection order) and `matricksSelect` (the select and where
+    it comes from: `X 1, XGroup 2 (MAtricks 9009 "...")`), when an X select keeps part of the group;
+  - `notPredicted` where coverage is not modelled (phaser lines, a filter of another shape, a MAtricks select outside
+    the verified rules);
 - `coverage`: per fixture the attributes the target holds `cooked` (from recipes) and `uncooked` (stored directly);
 - `expectedPairs`, the number of fixture/attribute pairs the lines should cook;
 - `dependencyNotes`.
@@ -124,6 +127,28 @@ A failed `Assign` can leave an empty line behind on 2.5.1; the line count catche
 
 `values` is the plain string `"4.2"`. A number is refused with that form in the error: as JSON numbers `4.20` and `4.2` are
 the same, as presets they are preset 20 and preset 2. A string with quotes inside it (`"\"4.2\""`) is refused the same way.
+
+### MAtricks select on a line
+
+A standard line's X select (`X k`, with `XWings`, `XBlock`, `XGroup`) gives values to part of its group. The select
+comes from the line's own columns or, when the line has one, from its MAtricks object (the line's own `X` then reads
+None). The prediction of `gma3_recipes`, `gma3_cook_recipes`, `gma3_edit_recipe` and `gma3_store_recipe_cues` keeps
+the fixtures the console keeps (`src/tools/matricksselection.ts`), measured on onPC 2.5.1:
+
+- the positions follow the group's stored grid, not its stored order: Group 9001 is stored 252, 251, 253, 254 with
+  x 1, 0, 2, 3, and its selection order is 251, 252, 253, 254;
+- XWings w, then XBlock b, then XGroup g give each rank a position: in each of the w wings (P / w ranks) an even wing
+  counts up and an odd one down; b neighbours make one position; with XGroup the position is (block mod g);
+- X k keeps the fixtures at position k − 1. Past the last position (XGroup 2 with X 3, 2 blocks with X 4) it keeps
+  none: no wrap-around, the line cooks nothing (a `problem`).
+
+The fixtures it drops are checked after the cook like the attributes a filter keeps out: a cooked value on one of them
+is a mismatch. Not predicted (named in `notPredicted`, so the cook is not a false mismatch): a Y or Z select; Y or Z
+wings, blocks or groups with a select; XWidth, XShift or XShuffle with a select; an invert flag or the Mirror transform
+with a select; XWings that do not divide the group; a grid that is not one gap-free row (x 0 to n − 1, one y and z); an
+inactive MAtricks object; a line with its own select and a MAtricks object (or the object and its own columns, one of
+them with a select); a generator line with a select; a setting that cannot be read. Without a select, wings, blocks and
+groups only spread timing and phase: every member gets values.
 
 ## `gma3_store_recipe_cues`
 
@@ -600,12 +625,27 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
   - lines moved and removed;
   - an empty group and a deleted preset reported;
   - a preset recipe added and cooked.
-- Not verified on a console (`gma3_store_recipe_cues`, #101; no live run for this change): writing the per-line
-  MAtricks columns with `set` and reading them back in the display role. The #101 build set `FadeFromX`, `FadeToX`,
-  `XBlock`, `X`, `XWings` and `XGroup` on new lines from Lua and checked only the line count; the probe record lists
-  "the full MAtricks property set" on a line, and MAtricks objects accept these properties and values (SB-02). How a
-  column reads while a MAtricks reference supplies it (`<2>`, inherited) and whether `None` clears an override are
-  not known. Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not.
+- Verified live for the MAtricks select (onPC 2.5.1.1, show "Rescue", 2026-11-15, Group 9001 of 4 Daytona stored
+  252, 251, 253, 254 with x 1, 0, 2, 3, and Group 9005 of 12 dimmers stored 2–12, 1 with x 1–11, 0; cooked
+  `/MergeLowPriority`; the code run directly against the bridge). `gma3_store_recipe_cues` wrote the per-line columns
+  (`x: {groups: 2, select: 1}`, `{blocks: 2, select: 2}`, `{select: 3, phase: ...}`) and MAtricks references, each read
+  back matched; the cooked fixtures, read with `preset.read`:
+  - MAtricks 9009 (XGroup 2, X 1) with 1.9010, and the same as the line's own columns: 251, 253;
+  - own X 3: 253; own XBlock 2, X 2: 253, 254; own XGroup 2, X 2: 252, 254;
+  - MAtricks 9010 (XWings 2, X 2) on Group 9005: 2 and 11 (the second wing counts down);
+  - MAtricks 9011 (XGroup 2, X 3) and MAtricks 9002 (XBlock 2, X 4) on Group 9001: nothing cooked;
+  - the earlier bench cues read again: Sequence 9019 cue 9 (MAtricks 9001, XGroup 3, X 1, Group 9005): 1, 4, 7, 10;
+    cues 2 and 10 (XBlock 2, X 4, own columns and MAtricks 9002): 7, 8; preset 21.9049 (XWings 2, XBlock 4, X 2):
+    5, 6, 7, 8.
+
+  The cook of Sequence 9033 (these 10 cues) read back `matched`, with the two empty ones named as cooking nothing; the
+  old prediction had read 5 of them `mismatched`. Sequence 9034 cue 1, built by `gma3_store_recipe_cues` with Group
+  9001, MAtricks 9009 and the phaser preset 21.9072 (Dimmer and Pan), cooked 251 and 253 (`matched`,
+  `ownNonCookedDataPresent: false`); played back, the output of 251 and 253 moved (251: Dimmer 7221–58939, Pan
+  26440–39096 of 65535 over 4 s) while 252 and 254 stayed at Dimmer 0 and Pan 32768. XWings with a count that is not
+  a multiple, Width / Shift / Shuffle, inverts, Y and Z selects and multi-row grids were not run with a select.
+- Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not. How a column reads in the
+  display role while a MAtricks reference supplies it (`<2>`) is not known (the typed read gives None).
 - Not covered:
   - the background cook's exact timing (observed: not yet on an immediate read, done after 3 s);
   - phaser recipe lines other than `gma3_edit_phaser_recipe`'s (more than 2 steps, a cue part as the target, a value

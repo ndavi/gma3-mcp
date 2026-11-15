@@ -53,6 +53,7 @@ import { cueRef, readObjects } from "./common.js";
 import { axisSettingsShape, matricksValue, matricksWanted } from "./groups.js";
 import { readFilter, type FilterInfo } from "./filters.js";
 import { generatorAttributes, readGenerator, type GeneratorInfo } from "./generators.js";
+import { describeSelection, effectiveSettings, hasSelectionData, parseSelectionSettings, readMatricksSettings, selectMembers, selectionProps, type MatricksObjectInfo, type SelectionSettings } from "./matricksselection.js";
 import { MAX_BATCH_ITEMS, batchOptionShape, duplicates, hasUncertainStep, itemOk, runBatch } from "../batch.js";
 import { HeldLock } from "../mutations.js";
 import {
@@ -150,10 +151,12 @@ export interface Line {
   selectionFromValue?: boolean | null;
   /** The line's own X / Y / Z column when it is set ("X 1"): only part of the group gets values (#101). */
   axisSelect?: string;
+  /** The line's own MAtricks columns that select or spread (matricksselection.ts); absent when none is set. */
+  columns?: SelectionSettings;
   status: { failedCookedPart?: string; emptyLastCooking?: boolean | null };
 }
 
-const LINE_FIELDS = ["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "Generator", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", "X", "Y", "Z"];
+const LINE_FIELDS = [...new Set(["Name", "Enabled", "Selection", "Values", "MAtricks", "Filter", "Generator", "SelectionMode", "SelectionFromValue", "FailedCookedPart", "EmptyLastCooking", ...selectionProps()])];
 
 /**
  * The X / Y / Z columns of a line that select part of its group: a number from 1, as a number or text (also "<2>", the
@@ -201,6 +204,8 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
     const mtx = handle(f.MAtricks);
     const flt = handle(f.Filter);
     const gen = handle(f.Generator);
+    const columns = parseSelectionSettings(f, { inheritedIsNone: true });
+    const hasColumns = columns.unparsed.length > 0 || hasSelectionData(columns);
     lines.push({
       line: typeof it.index === "number" ? it.index : i + 1,
       class: String(it.class),
@@ -215,6 +220,7 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
       selectionMode: typeof f.SelectionMode === "string" ? f.SelectionMode : undefined,
       selectionFromValue: bool(f.SelectionFromValue),
       ...(axisSelection(f) ? { axisSelect: axisSelection(f) } : {}),
+      ...(hasColumns ? { columns } : {}),
       status: { failedCookedPart: typeof f.FailedCookedPart === "string" ? f.FailedCookedPart : undefined, emptyLastCooking: bool(f.EmptyLastCooking) },
     });
   });
@@ -223,7 +229,8 @@ export async function readLines(bridge: Gma3Bridge, t: Target, timeout: number):
 
 export interface GroupInfo {
   exists: boolean;
-  members: Array<{ fixture: string; sfIndex: number }>;
+  /** In the group's stored order, with the selection-grid cell of each (x, y, z) when the read gives it. */
+  members: Array<{ fixture: string; sfIndex: number; x?: number; y?: number; z?: number }>;
   unreadable: number;
   truncated?: boolean;
 }
@@ -234,9 +241,10 @@ export async function readGroup(bridge: Gma3Bridge, n: number, t: number, cache:
   if (hit) return hit;
   let info: GroupInfo;
   try {
-    const g = (await bridge.request("group.read", { ref: `Group ${n}` }, t)) as { truncated?: boolean; items: Array<{ fixture?: string | null; sfIndex?: number; unreadable?: boolean }> };
+    const g = (await bridge.request("group.read", { ref: `Group ${n}` }, t)) as { truncated?: boolean; items: Array<{ fixture?: string | null; sfIndex?: number; unreadable?: boolean; x?: number; y?: number; z?: number }> };
     const known = g.items.filter((x) => !x.unreadable && typeof x.sfIndex === "number");
-    info = { exists: true, members: known.map((x) => ({ fixture: x.fixture ?? `#${x.sfIndex}`, sfIndex: x.sfIndex! })), unreadable: g.items.length - known.length, truncated: g.truncated === true };
+    const cell = (x: { x?: number; y?: number; z?: number }) => (typeof x.x === "number" && typeof x.y === "number" && typeof x.z === "number" ? { x: x.x, y: x.y, z: x.z } : {});
+    info = { exists: true, members: known.map((x) => ({ fixture: x.fixture ?? `#${x.sfIndex}`, sfIndex: x.sfIndex!, ...cell(x) })), unreadable: g.items.length - known.length, truncated: g.truncated === true };
   } catch (err) {
     if (!notFound(err)) throw err;
     info = { exists: false, members: [], unreadable: 0 };
@@ -273,6 +281,10 @@ export interface LineReport extends Line {
   /** Why the coverage of this line is not predicted (phaser recipe, filter, MAtricks...). */
   notPredicted?: string;
   members?: string[];
+  /** The members the line's MAtricks select keeps (X with XWings / XBlock / XGroup), in selection order. */
+  selected?: string[];
+  /** The select that keeps them and where it comes from ("X 1, XGroup 2 (MAtricks 9009)"). */
+  matricksSelect?: string;
   /** The attributes the line's filter passes (when the filter was read and is modelled). */
   filterAttributes?: string[];
   /** The attributes the line's generator cooks (one per channel), when it was read. */
@@ -298,7 +310,7 @@ interface Expected {
  * row). A line with a filter gives only the preset's attributes the filter passes (the others are `excluded`), when
  * the filter has the modelled shape (readFilter); otherwise it is not predicted. Phaser recipe lines are not predicted.
  */
-export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map(), generators: Map<number, GeneratorInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
+export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number, groups: Map<number, GroupInfo>, presetCache: Map<string, PresetRead | null>, filters: Map<number, FilterInfo> = new Map(), generators: Map<number, GeneratorInfo> = new Map(), matricks: Map<number, MatricksObjectInfo> = new Map()): Promise<{ reports: LineReport[]; expected: Expected; dependencyNotes: string[] }> {
   const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set() };
   const dependencyNotes: string[] = [];
   const reports: LineReport[] = [];
@@ -329,8 +341,23 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       if (g.unreadable || g.truncated) { expected.unknownReach = true; expected.unpredicted++; rep.notPredicted = `Group ${l.selection.group} was not read completely; its reach is unknown`; }
     }
     if (l.class !== "StandardRecipe") { unpredictable(`${l.class} lines are listed and kept, not modelled by this release`, g); continue; }
-    // The X / Y / Z column gives values to only part of the group (one element, one block): which part is not modelled.
-    if (l.axisSelect) { unpredictable(`the line's MAtricks selects part of its group (${l.axisSelect}); coverage not predicted`, g); continue; }
+    // An X select (the line's own columns or its MAtricks object) gives values to part of the group (matricksselection.ts).
+    let kept: Set<number> | null = null;
+    if (g?.exists && g.members.length && (l.columns || l.matricks)) {
+      const obj = l.matricks?.no !== undefined ? { no: l.matricks.no, info: await readMatricksSettings(bridge, l.matricks.no, t, matricks) } : null;
+      if (l.matricks && l.matricks.no === undefined) { unpredictable("the line's MAtricks object could not be identified; coverage not predicted", g); continue; }
+      const eff = effectiveSettings(l.columns, obj);
+      if ("why" in eff) { unpredictable(`${eff.why}; coverage not predicted`, g); continue; }
+      const sel = eff.settings ? selectMembers(g.members, eff.settings) : ({ kind: "all" } as const);
+      if (sel.kind === "unpredicted") { unpredictable(`the line's MAtricks selects part of its group (${eff.source}): ${sel.why}; coverage not predicted`, g); continue; }
+      if (sel.kind === "subset") {
+        if (l.generator) { unpredictable(`a generator line with a MAtricks select (${describeSelection(eff.settings!)}, ${eff.source}) is not verified; coverage not predicted`, g); continue; }
+        kept = new Set(sel.kept.map((m) => m.sfIndex));
+        rep.selected = sel.kept.map((m) => m.fixture);
+        rep.matricksSelect = `${describeSelection(eff.settings!)} (${eff.source})`;
+        if (!sel.kept.length) rep.problems.push(`the MAtricks select (${rep.matricksSelect}) keeps none of the ${g.members.length} fixtures of Group ${l.selection?.group}: the line cooks nothing`);
+      }
+    }
     // A generator takes the place of the values: the line cooks a token value on every member that has a channel's attribute.
     if (l.generator) {
       const gi = await readGenerator(bridge, l.generator.no, t, generators);
@@ -382,7 +409,6 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
     if (p.truncated) { unpredictable(`the values preset ${rep.values.preset ?? ""} was not read completely; coverage not predicted`, g); continue; }
     if (p.rows.length === 0) rep.problems.push(`the values preset ${rep.values.preset ?? ""} is empty`);
     if ((p.dependencies ?? []).length) dependencyNotes.push(`line ${l.line}: Preset ${rep.values.preset} embeds other presets; their own recipes are not re-cooked here`);
-    if (l.matricks) rep.notPredicted = undefined; // MAtricks spreads values and timing; the fixtures and attributes covered do not change
     const types = p.types ?? {};
     const hasGlobal = p.rows.some((r) => r.mode === "global");
     let passed = 0;
@@ -407,11 +433,12 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
         if (!fa || !listComplete({ ...fa, items: fa.attributes })) uncertainMember(m, `the attributes of ${m.fixture} could not be read${fa ? " completely" : ""}, so universal values were not predicted for it`);
       }
       for (const a of attrs) {
-        if (pass && !pass.has(a)) expected.excluded!.add(`${m.sfIndex}|${a}`);
+        // A member the MAtricks select drops gets nothing from this line; a filter keeps the attributes it does not pass out.
+        if ((kept && !kept.has(m.sfIndex)) || (pass && !pass.has(a))) expected.excluded!.add(`${m.sfIndex}|${a}`);
         else { expected.pairs.add(`${m.sfIndex}|${a}`); passed++; }
       }
     }
-    if (pass && passed === 0 && p.rows.length) rep.problems.push(`the filter (${l.filter}: ${[...pass].join(", ") || "no attributes"}) passes none of the attributes of Preset ${rep.values.preset ?? ""}: the line cooks nothing`);
+    if (pass && passed === 0 && p.rows.length && (!kept || kept.size)) rep.problems.push(`the filter (${l.filter}: ${[...pass].join(", ") || "no attributes"}) passes none of the attributes of Preset ${rep.values.preset ?? ""}: the line cooks nothing`);
   }
   return { reports, expected, dependencyNotes };
 }
@@ -444,7 +471,7 @@ export function verifyCoverage(input: { rows: Array<PresetRow & { cooked?: boole
     // A filter keeps the rest of its line's preset out: cooked there (and no other line explains it), the filter did not apply.
     const ex = input.expected.excluded;
     const keptOut = ex && !input.expected.unknownReach ? cooked.filter((r) => ex.has(key(r)) && !input.expected.pairs.has(key(r)) && !(typeof r.sfIndex === "number" && input.expected.uncertain.has(r.sfIndex))) : [];
-    if (keptOut.length) out.push(`cooked values a line's filter keeps out: ${keptOut.slice(0, 8).map((r) => `${r.fixture} ${r.attribute}`).join(", ")}${keptOut.length > 8 ? ` and ${keptOut.length - 8} more` : ""}`);
+    if (keptOut.length) out.push(`cooked values a line's filter or MAtricks select keeps out: ${keptOut.slice(0, 8).map((r) => `${r.fixture} ${r.attribute}`).join(", ")}${keptOut.length > 8 ? ` and ${keptOut.length - 8} more` : ""}`);
   }
   // Uncooked data: kept by merge_low_priority and remove; merge may replace it only where the recipe writes; overwrite deletes it.
   const uncookedBefore = input.before.filter((r) => !r.cooked);
@@ -814,6 +841,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     const presets = new Map<string, PresetRead | null>();
     const filters = new Map<number, FilterInfo>();
     const generators = new Map<number, GeneratorInfo>();
+    const matricks = new Map<number, MatricksObjectInfo>();
     type Plan = { target: Target; lines: LineReport[]; expected: Expected; before: PresetRead | null; conflicts: string[]; losses: string[]; notes: string[] };
     const plans: Plan[] = [];
     let truncated = false;
@@ -840,7 +868,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
                 continue;
               }
               if (!lines.length) continue;
-              const an = await analyzeLines(bridge, lines, t, groups, presets, filters, generators);
+              const an = await analyzeLines(bridge, lines, t, groups, presets, filters, generators, matricks);
               let before: PresetRead | null;
               try {
                 before = await readData(bridge, targetRef(tg), t);
@@ -868,7 +896,7 @@ export async function cookRecipes(ctx: ToolContext, raw: CookArgs): Promise<Oper
     ]);
     const describePlan = (p: Plan) => ({
       target: label(p.target),
-      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), ...(l.generator ? { generator: `Generator ${l.generator.no}`, ...(l.generatorAttributes ? { generatorAttributes: l.generatorAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
+      lines: p.lines.map((l) => ({ line: l.line, class: l.class, enabled: l.enabled, selection: l.selection ? `Group ${l.selection.group}` : null, members: l.members, ...(l.selected ? { selected: l.selected, matricksSelect: l.matricksSelect } : {}), values: l.values?.preset ? `Preset ${l.values.preset}` : l.values?.name ?? null, matricks: l.matricks?.no ?? null, ...(l.filter ? { filter: l.filterNo !== undefined ? `Filter ${l.filterNo} ${l.filter}` : l.filter, ...(l.filterAttributes ? { filterAttributes: l.filterAttributes } : {}) } : {}), ...(l.generator ? { generator: `Generator ${l.generator.no}`, ...(l.generatorAttributes ? { generatorAttributes: l.generatorAttributes } : {}) } : {}), problems: l.problems, ...(l.notPredicted ? { notPredicted: l.notPredicted } : {}) })),
       coverageBefore: p.before ? coverageOf(p.before.rows) : null,
       expectedCooked: p.expected.pairs.size,
       ...(mode === "merge" && p.conflicts.length ? { replacedUncooked: p.conflicts } : {}),
@@ -1375,7 +1403,7 @@ export const registerRecipeTools: RegisterTools = (server, ctx) => {
       title: "Read the recipe lines of a preset or cue part",
       description:
         "Read-only. target: {preset: \"N.M\"} or {sequence, cue, part?} (part 0 by default). Returns every recipe line (standard and phaser) with its selection (group and its members), values (preset), MAtricks, filter, Enabled, SelectionMode, the console's last cooking state, and problems (missing or empty group, missing preset, disabled), " +
-        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); a generator line (generator in place of the values) on the generator's channel attributes (generatorAttributes) the members have; lines whose coverage is not predicted (phaser recipes, other filters) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
+        "plus the target's coverage: per fixture which attributes are cooked (from recipes) and which are stored directly. A line with a filter is predicted on the filter's attributes (filterAttributes) when the filter has the modelled shape (attribute mask, one attribute or Used In Object rule with APPLYTOFIXTURES No, every layer on); a generator line (generator in place of the values) on the generator's channel attributes (generatorAttributes) the members have; a line's MAtricks X select (its own columns or its MAtricks object, with XWings / XBlock / XGroup) on the fixtures it keeps (selected), in the group's grid order; lines whose coverage is not predicted (phaser recipes, other filters, other MAtricks selects) are flagged; presets that embed others are noted. Needs bridge 0.24.0.",
       inputSchema: { target: targetSchema.describe("Preset or cue part.") },
     },
     async (args) => {

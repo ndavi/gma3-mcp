@@ -86,9 +86,13 @@ interface FRow { fixture: string; sfIndex: number; attribute: string; value: num
 interface FTarget { lines: FLine[]; rows: FRow[] }
 
 class Console {
-  groups = new Map<number, Array<{ fixture: string; sfIndex: number }>>([[908, [{ fixture: "401", sfIndex: 63 }, { fixture: "402", sfIndex: 64 }]], [909, []]]);
+  groups = new Map<number, Array<{ fixture: string; sfIndex: number; x?: number; y?: number; z?: number }>>([[908, [{ fixture: "401", sfIndex: 63 }, { fixture: "402", sfIndex: 64 }]], [909, []]]);
   presets = new Map<string, { addr: string; attrs: string[]; value: number }>([["4.4", { addr: "14.14.1.5.4.4", attrs: ["ColorRGB_R"], value: 100 }], ["1.11", { addr: "14.14.1.5.1.11", attrs: ["Dimmer"], value: 100 }], ["21.5", { addr: "14.14.1.5.21.5", attrs: ["Dimmer", "ColorRGB_R"], value: 100 }]]);
   matricks = new Set([12]);
+  /** MAtricks objects with properties (display text, as the objects op reads them). */
+  matricksObjects = new Map<number, Record<string, string>>();
+  /** A console whose cook ignores the lines' MAtricks select. */
+  ignoreSelect = false;
   /** Filter 7: Dimmer only (made from a preset, APPLYTOFIXTURES No). */
   filters = new Map<number, FFilter>([[7, { name: "F DIM", attrs: ["Dimmer"] }]]);
   /** A console whose cook ignores the lines' filters. */
@@ -151,10 +155,14 @@ class Console {
       if (!l.enabled || l.group === null || !l.preset || l.cls !== "StandardRecipe") continue;
       const p = this.presetOf(l.preset)?.[1];
       if (!p) continue;
-      // #101: the line's X column with XBlock gives values to the n-th block of the group only.
-      const x = Number(l.props?.X);
-      const block = Number(l.props?.XBlock) || 1;
-      const members = (this.groups.get(l.group) ?? []).filter((_, i) => !(x >= 1) || Math.floor(i / block) === x - 1);
+      // #101: the X column (the line's own or its MAtricks object's) with XBlock / XGroup keeps the fixtures whose
+      // position (i // XBlock) % XGroup is X - 1, i the rank in the group's grid order (as measured on 2.5.1).
+      const props = { ...(l.matricks !== null ? this.matricksObjects.get(l.matricks) : undefined), ...l.props };
+      const x = this.ignoreSelect ? NaN : Number(props.X);
+      const block = Number(props.XBlock) || 1;
+      const groups = Number(props.XGroup) || 0;
+      const grid = [...(this.groups.get(l.group) ?? [])].map((m, i) => ({ m, at: m.x ?? i })).sort((a, b) => a.at - b.at).map((e) => e.m);
+      const members = grid.filter((_, i) => !(x >= 1) || (groups ? Math.floor(i / block) % groups : Math.floor(i / block)) === x - 1);
       const f = l.filterNo !== undefined && !this.ignoreFilter ? this.filters.get(l.filterNo) : undefined;
       for (const m of members) for (const a of p.attrs) if (!f || f.attrs.includes(a)) out.push({ fixture: m.fixture, sfIndex: m.sfIndex, attribute: a, value: p.value, cooked: true });
     }
@@ -223,6 +231,8 @@ class Console {
             Filter: l.filter ? { name: l.filter, class: "Filter", ...(l.filterNo !== undefined ? { index: l.filterNo } : {}) } : "",
             Generator: l.generator !== undefined ? { name: this.generators.get(l.generator)?.name ?? "?", class: "Random", index: l.generator } : "", SelectionMode: l.mode, SelectionFromValue: false, FailedCookedPart: "None", EmptyLastCooking: false,
             X: l.props?.X ?? "None", Y: l.props?.Y ?? "None", Z: l.props?.Z ?? "None",
+            // The other MAtricks columns as the typed read gives them: a number, or "None".
+            ...Object.fromEntries(Object.entries(l.props ?? {}).filter(([k]) => !["X", "Y", "Z"].includes(k)).map(([k, v]) => [k, /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : v])),
           },
         })),
       };
@@ -272,6 +282,8 @@ class Console {
       if (c) return { items: [{ name: c.name, fields: { Name: c.name, Note: this.noteRead ? this.noteRead(c.note) : c.note } }] };
       if (/^Sequence /.test(String(args.ref))) return { items: [] };
       const n = Number(String(args.ref).replace("MAtricks ", ""));
+      const mo = this.matricksObjects.get(n);
+      if (mo) return { items: [{ name: `M${n}`, fields: { Name: `M${n}`, ...mo } }] };
       if (!this.matricks.has(n)) throw new Error(`no object found for '${args.ref}'`);
       return { items: [{ name: `M${n}` }] };
     });
@@ -881,7 +893,7 @@ test("values: a number or a quoted string is refused with the plain string form 
   assert.ok(!/plain string|input validation failed/.test(str.text), str.text);
 });
 
-test("a line whose X column selects one block is not predicted, so the cook is not a false mismatch; an ordinary line still is", async () => {
+test("a line whose X column selects one block of a group read without its grid is not predicted, so the cook is not a false mismatch; an ordinary line still is", async () => {
   con.groups.set(912, [401, 402, 403, 404].map((f, i) => ({ fixture: String(f), sfIndex: 63 + i })));
   con.cue(9060, 1);
   con.cue(9060, 2);
@@ -890,11 +902,11 @@ test("a line whose X column selects one block is not predicted, so the cook is n
   assert.equal(result.verification.status, "matched");
   assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched", "matched"]);
   assert.deepEqual(con.part(9060, 1).rows.map((r) => r.fixture), ["401", "402"], "the console cooked the first block only");
-  assert.ok(result.warnings.some((w: string) => /Cue 1 Part 0 line 1: the line's MAtricks selects part of its group \(X 1\); coverage not predicted/.test(w)), JSON.stringify(result.warnings));
+  assert.ok(result.warnings.some((w: string) => /Cue 1 Part 0 line 1: the line's MAtricks selects part of its group \(the line's own MAtricks columns\): the group's grid cells were not read \(X 1, XBlock 2\); coverage not predicted/.test(w)), JSON.stringify(result.warnings));
   // gma3_recipes and gma3_cook_recipes flag it the same way; the ordinary line is predicted and verified.
   const read1 = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 1 } });
   assert.equal(read1.result.lines[0].axisSelect, "X 1");
-  assert.match(read1.result.lines[0].notPredicted, /selects part of its group \(X 1\); coverage not predicted/);
+  assert.match(read1.result.lines[0].notPredicted, /selects part of its group .*\(X 1, XBlock 2\); coverage not predicted/);
   assert.equal(read1.result.expectedPairs, 0);
   assert.equal(read1.result.unpredictedLines, 1);
   const read2 = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 2 } });
@@ -910,6 +922,61 @@ test("a line whose X column selects one block is not predicted, so the cook is n
   const c2 = await h.callJson("gma3_cook_recipes", { target: { sequence: 9060, cue: 2 }, mode: "merge_low_priority" });
   assert.equal(c2.result.verification.status, "mismatched");
   assert.match(c2.result.verification.detail, /expected cooked values missing/);
+});
+
+// The bench groups of onPC 2.5.1 ("Rescue", 2026-11-15): Group 9001 is stored 252, 251, 253, 254 with grid x 1, 0, 2, 3.
+const G9001 = [{ fixture: "252", sfIndex: 524, x: 1, y: 0, z: 0 }, { fixture: "251", sfIndex: 525, x: 0, y: 0, z: 0 }, { fixture: "253", sfIndex: 526, x: 2, y: 0, z: 0 }, { fixture: "254", sfIndex: 530, x: 3, y: 0, z: 0 }];
+
+test("a MAtricks object's X select is predicted on the group's grid order: the cook matches, and a cook that ignores the select is caught", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.presets.set("1.9010", { addr: "14.14.1.5.1.9010", attrs: ["Dimmer"], value: 100 });
+  con.matricksObjects.set(9009, { X: "1", XGroup: "2", XBlock: "None", XWings: "None", Active: "Yes", RelativePhase: "Yes", PhaserTransform: "None" });
+  con.cue(9060, 1);
+  const { result, isError } = await store({ mode: "append", cook: "merge_low_priority", cues: [{ cue: 1, lines: [line(9001, "1.9010", { matricks: 9009 })] }] });
+  assert.equal(isError, false, JSON.stringify(result.verification));
+  assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched"]);
+  assert.deepEqual(con.part(9060, 1).rows.map((r) => r.fixture).sort(), ["251", "253"], "the fake console kept grid positions 0 and 2");
+  const read = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 1 } });
+  assert.deepEqual(read.result.lines[0].selected, ["251", "253"]);
+  assert.equal(read.result.lines[0].matricksSelect, 'X 1, XGroup 2 (MAtricks 9009 "M9009")');
+  assert.equal(read.result.lines[0].notPredicted, undefined);
+  assert.equal(read.result.expectedPairs, 2);
+  // The stored order (252 first) is not the selection order: a select on it would keep 252 and 253.
+  assert.ok(!read.result.lines[0].selected.includes("252"));
+  // A console that cooks the whole group: the dropped fixtures' values are reported.
+  con.ignoreSelect = true;
+  const c = await h.callJson("gma3_cook_recipes", { target: { sequence: 9060, cue: 1 }, mode: "merge_low_priority" });
+  assert.equal(c.result.verification.status, "mismatched");
+  assert.match(c.result.verification.detail, /cooked values a line's filter or MAtricks select keeps out: 252 Dimmer, 254 Dimmer/);
+  assert.deepEqual(c.result.affected[0].lines[0].selected, ["251", "253"]);
+});
+
+test("the line's own columns select on the grid too; a select past the last position cooks nothing and says so", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.cue(9060, 1);
+  con.cue(9060, 2);
+  const { result } = await store({ mode: "append", cook: "merge_low_priority", cues: [{ cue: 1, lines: [line(9001, "4.4", { x: { blocks: 2, select: 2 } })] }, { cue: 2, lines: [line(9001, "4.4", { x: { groups: 2, select: 3 } })] }] });
+  assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched", "matched"], JSON.stringify(result.cook));
+  assert.deepEqual(con.part(9060, 1).rows.map((r) => r.fixture).sort(), ["253", "254"]);
+  assert.deepEqual(con.part(9060, 2).rows, []);
+  assert.ok(result.warnings.some((w: string) => /Cue 2 Part 0 line 1: the MAtricks select \(X 3, XGroup 2 \(the line's own MAtricks columns\)\) keeps none of the 4 fixtures of Group 9001: the line cooks nothing/.test(w)), JSON.stringify(result.warnings));
+});
+
+test("a line with its own select and a MAtricks object, or an unverified setting, is not predicted", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.matricksObjects.set(9010, { X: "None", XWings: "2" });
+  con.matricksObjects.set(9011, { X: "2", XShift: "1" });
+  const t = con.part(9060, 1);
+  t.lines.push({ cls: "StandardRecipe", group: 9001, preset: "14.14.1.5.4.4", matricks: 9010, enabled: true, name: "", mode: "Strict", props: { X: "1" } });
+  t.lines.push({ cls: "StandardRecipe", group: 9001, preset: "14.14.1.5.4.4", matricks: 9011, enabled: true, name: "", mode: "Strict" });
+  // An own phase range and an object that only spreads (wings): every member gets values.
+  t.lines.push({ cls: "StandardRecipe", group: 9001, preset: "14.14.1.5.1.11", matricks: 9010, enabled: true, name: "", mode: "Strict", props: { PhaseFromX: "0", PhaseToX: "90" } });
+  const read = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 1 } });
+  assert.match(read.result.lines[0].notPredicted, /the line has its own MAtricks columns \(X 1\) and MAtricks 9010 \(XWings 2\); how they combine is not verified; coverage not predicted/);
+  assert.match(read.result.lines[1].notPredicted, /XWidth, XShift or XShuffle with a select is not verified \(X 2, XShift 1\)/);
+  assert.equal(read.result.lines[2].notPredicted, undefined);
+  assert.equal(read.result.lines[2].selected, undefined);
+  assert.equal(read.result.expectedPairs, 4);
 });
 
 test("axisSelection: a set X / Y / Z column, None and 0 select nothing, an inherited one counts", () => {
@@ -985,7 +1052,7 @@ test("the cook predicts a filtered line on the filter's attributes and flags an 
   con.ignoreFilter = true;
   const bad = await cook({ mode: "merge_low_priority" });
   assert.equal(bad.result.verification.status, "mismatched");
-  assert.match(bad.result.verification.detail, /cooked values a line's filter keeps out: 401 ColorRGB_R, 402 ColorRGB_R/);
+  assert.match(bad.result.verification.detail, /cooked values a line's filter or MAtricks select keeps out: 401 ColorRGB_R, 402 ColorRGB_R/);
 });
 
 test("an attribute kept out by one line's filter but given by another line is not flagged", async () => {
