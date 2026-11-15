@@ -173,7 +173,9 @@ The phases are not predicted (the note says why) with a Y or Z range, more group
 a preset that has phases of its own under a range on the line (how they add up is not verified). A phaser line (in a
 preset or a cue) with a select and a phase range gets the same note in `gma3_recipes` and `gma3_cook_recipes`, with the
 shared phase; its coverage is not predicted, so that phase is not checked after a cook. A line whose select is itself
-not predicted gets no note.
+not predicted (a 4 × 3 grid, Width...) still gets the note, without the fixtures or their phases. A predicted phase is
+not checked where another line of the part also writes that fixture and attribute (the last one wins), or where a line
+that is not predicted may reach it (a `dependencyNotes` entry says so).
 
 ## `gma3_store_recipe_cues`
 
@@ -684,7 +686,8 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     21.9072: the Dimmer of 253 and 254 moved together, opposite to 251 and 252 (minimum at 1.6 s against maximum, over
     4 s), i.e. both at 180°.
 
-  Not run: a Y or Z phase range with a select, wings with a phase range on a cue line, a preset with phases of its own
+  Sequence 9033 cue 13 (Group 9010, a 4 × 3 grid, own X 1, the phaser preset 21.9061) got the note without fixtures or
+  phases, its select not predicted. Not run: a Y or Z phase range with a select, wings with a phase range on a cue line, a preset with phases of its own
   under a range on the line.
 - Cue names on Part 0 and `set` on lines are verified (SU-06, SB-05); the cue's `Note` is not. How a column reads in the
   display role while a MAtricks reference supplies it (`<2>`) is not known (the typed read gives None).

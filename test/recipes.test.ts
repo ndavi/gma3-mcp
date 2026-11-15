@@ -1034,6 +1034,26 @@ test("a select with the line's own phase range on a phaser: spread over the whol
   assert.match(c.result.verification.detail, /253 Dimmer 0° \(180° predicted\), 253 Pan 0° \(180° predicted\)/);
 });
 
+test("a predicted phase is not checked where another line writes the same pair; a select that is not predicted still gets the phase note", async () => {
+  con.groups.set(9001, G9001.map((m) => ({ ...m })));
+  con.presets.set("21.9032", { addr: "14.14.1.5.21.9032", attrs: ["Dimmer"], value: 100, phaser: phaser([0, 120, 240, 359.9]) });
+  con.matricksObjects.set(9009, { X: "1", XGroup: "2" });
+  con.cue(9060, 1);
+  // Line 2 writes Dimmer on every member with its own phases: on 251 / 253 the last line wins, so line 1's phases do not hold.
+  con.cookPhase.set(525, 90);
+  const { result } = await store({ mode: "append", cook: "merge_low_priority", cues: [{ cue: 1, lines: [line(9001, "21.9032", { matricks: 9009 }), line(9001, "1.11")] }] });
+  assert.deepEqual(result.cook.map((c: { verification: string }) => c.verification), ["matched"], JSON.stringify(result.cook));
+  assert.ok(result.warnings.some((w: string) => /the predicted phase of 2 fixture attribute\(s\) is not checked after the cook: another line also writes them/.test(w)), JSON.stringify(result.warnings));
+  // A 4 x 3 grid (fixtures share a column): the select is not predicted, the note still says what the console does.
+  con.groups.set(9010, Array.from({ length: 12 }, (_, i) => ({ fixture: String(501 + i), sfIndex: 101 + i, x: i % 4, y: Math.floor(i / 4), z: 0 })));
+  con.presets.set("21.9061", { addr: "14.14.1.5.21.9061", attrs: ["Dimmer"], value: 100, phaser: Array.from({ length: 7 }, (_, i) => ({ fixture: String(501 + i), sfIndex: 101 + i, phase: (i % 3) * 60 })) });
+  const t = con.part(9060, 2);
+  t.lines.push({ cls: "StandardRecipe", group: 9010, preset: "14.14.1.5.21.9061", matricks: null, enabled: true, name: "", mode: "Strict", props: { X: "1" } });
+  const read = await h.callJson("gma3_recipes", { target: { sequence: 9060, cue: 2 } });
+  assert.match(read.result.lines[0].notPredicted, /fixtures sharing a column/);
+  assert.match(read.result.lines[0].phaseNote, /keeps part of Group 9010, and it does not narrow the phase spread: Preset 21\.9061 spreads its phase over its own line's group, and the kept fixtures keep the phases they have there; the kept fixtures and their phases were not predicted \(the group's grid x is not the rank/);
+});
+
 test("a phaser line with a MAtricks select and a phase range gets the phase note (21.9048 on the bench: one block at 179.95)", async () => {
   // Group 9005 of 12, stored 2..12 then 1 (x 0); MAtricks 9004: XBlock 4, X 2; the line's phase 0 to 359.9.
   con.groups.set(9005, [...Array.from({ length: 11 }, (_, i) => ({ fixture: String(i + 2), sfIndex: i + 2, x: i + 1, y: 0, z: 0 })), { fixture: "1", sfIndex: 1, x: 0, y: 0, z: 0 }]);

@@ -318,6 +318,9 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
   const expected: Expected = { pairs: new Set(), touched: new Set(), unpredicted: 0, uncertain: new Set(), unknownReach: false, excluded: new Set(), phases: new Map() };
   const dependencyNotes: string[] = [];
   const reports: LineReport[] = [];
+  /** How many lines cook each pair: where two do, the last one wins and a predicted phase is not checked. */
+  const pairLines = new Map<string, number>();
+  const addPair = (k: string) => { expected.pairs.add(k); pairLines.set(k, (pairLines.get(k) ?? 0) + 1); };
   for (const l of lines) {
     const rep: LineReport = { ...l, problems: [] };
     reports.push(rep);
@@ -361,7 +364,14 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       const eff = effectiveSettings(l.columns, obj);
       if ("why" in eff) { unpredictable(`${eff.why}; coverage not predicted`, g); continue; }
       const sel = eff.settings ? selectMembers(g.members, eff.settings) : ({ kind: "all" } as const);
-      if (sel.kind === "unpredicted") { unpredictable(`the line's MAtricks selects part of its group (${eff.source}): ${sel.why}; coverage not predicted`, g); continue; }
+      if (sel.kind === "unpredicted") {
+        unpredictable(`the line's MAtricks selects part of its group (${eff.source}): ${sel.why}; coverage not predicted`, g);
+        // The select still does not narrow a phase spread: said, without the fixtures or their phases.
+        const p = l.values && !l.generator ? await readValuesPreset(bridge, l.values, g, t, presetCache).catch(() => null) : null;
+        const note = p && eff.settings ? unpredictedPhaseNote(l, g, p, eff.settings, `${describeSelection(eff.settings)} (${eff.source})`, sel.why) : undefined;
+        if (note) rep.phaseNote = note;
+        continue;
+      }
       if (sel.kind === "subset") {
         if (l.generator) { unpredictable(`a generator line with a MAtricks select (${describeSelection(eff.settings!)}, ${eff.source}) is not verified; coverage not predicted`, g); continue; }
         kept = new Set(sel.kept.map((m) => m.sfIndex));
@@ -393,7 +403,7 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
           dependencyNotes.push(`line ${l.line}: ${why}`);
         }
         const has = new Set((fa?.attributes ?? []).map((a) => String(a.attribute)));
-        for (const a of ga.attributes) if (has.has(a)) { expected.pairs.add(`${m.sfIndex}|${a}`); gave++; }
+        for (const a of ga.attributes) if (has.has(a)) { addPair(`${m.sfIndex}|${a}`); gave++; }
       }
       if (!gave && !rep.notPredicted) rep.problems.push(`no fixture of Group ${l.selection?.group} has an attribute of Generator ${l.generator.no} (${ga.attributes.join(", ")}): the line cooks nothing`);
       continue;
@@ -410,13 +420,7 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       rep.filterAttributes = f.attributes;
     }
     if (!g || !g.exists || !g.members.length) continue;
-    // The fixture types come with the read, for this group's members: the cache key includes them.
-    const key = `${l.values.addr ?? l.values.name ?? "?"}|${g.members.map((m) => m.sfIndex).sort((a, b) => a - b).join(",")}`;
-    let p = presetCache.get(key);
-    if (p === undefined) {
-      p = l.values.addr ? await readData(bridge, l.values.addr, t, g.members.map((m) => m.sfIndex)) : null;
-      presetCache.set(key, p);
-    }
+    const p = await readValuesPreset(bridge, l.values, g, t, presetCache);
     if (!p) { rep.problems.push(`the values preset ${l.values.name ?? ""} could not be read`); continue; }
     rep.values = { ...l.values, preset: p.pool?.no !== undefined && p.no !== undefined ? `${p.pool.no}.${p.no}` : undefined };
     if (p.truncated) { unpredictable(`the values preset ${rep.values.preset ?? ""} was not read completely; coverage not predicted`, g); continue; }
@@ -448,7 +452,7 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       for (const a of attrs) {
         // A member the MAtricks select drops gets nothing from this line; a filter keeps the attributes it does not pass out.
         if ((kept && !kept.has(m.sfIndex)) || (pass && !pass.has(a))) expected.excluded!.add(`${m.sfIndex}|${a}`);
-        else { expected.pairs.add(`${m.sfIndex}|${a}`); passed++; }
+        else { addPair(`${m.sfIndex}|${a}`); passed++; }
       }
     }
     if (pass && passed === 0 && p.rows.length && (!kept || kept.size)) rep.problems.push(`the filter (${l.filter}: ${[...pass].join(", ") || "no attributes"}) passes none of the attributes of Preset ${rep.values.preset ?? ""}: the line cooks nothing`);
@@ -458,7 +462,22 @@ export async function analyzeLines(bridge: Gma3Bridge, lines: Line[], t: number,
       if (note) rep.phaseNote = note;
     }
   }
+  // A predicted phase holds only where its line alone writes the pair: another line (predicted or not) may win it.
+  const dropped = [...expected.phases!.keys()].filter((k) => expected.unknownReach || (pairLines.get(k) ?? 0) > 1 || expected.uncertain.has(Number(k.split("|")[0])));
+  for (const k of dropped) expected.phases!.delete(k);
+  if (dropped.length) dependencyNotes.push(`the predicted phase of ${dropped.length} fixture attribute(s) is not checked after the cook: another line also writes them, or a line that is not predicted may (${dropped.slice(0, 4).join(", ")}${dropped.length > 4 ? ", ..." : ""}; subfixture|attribute)`);
   return { reports, expected, dependencyNotes };
+}
+
+/** A line's values preset with the fixture types of the group's members, cached per call (the key includes them). */
+async function readValuesPreset(bridge: Gma3Bridge, values: NonNullable<Line["values"]>, g: GroupInfo, t: number, cache: Map<string, PresetRead | null>): Promise<PresetRead | null> {
+  const key = `${values.addr ?? values.name ?? "?"}|${g.members.map((m) => m.sfIndex).sort((a, b) => a - b).join(",")}`;
+  let p = cache.get(key);
+  if (p === undefined) {
+    p = values.addr ? await readData(bridge, values.addr, t, g.members.map((m) => m.sfIndex)) : null;
+    cache.set(key, p);
+  }
+  return p;
 }
 
 const isPhaserRow = (r: PresetRow) => (r.stepCount ?? 1) > 1 || (r.steps?.length ?? 0) > 1;
@@ -494,6 +513,18 @@ function phaseSelectNote(rep: LineReport, g: GroupInfo, p: PresetRead, sel: Extr
   const per = new Map<string, Set<string>>();
   for (const r of keptRows) per.set(r.fixture, (per.get(r.fixture) ?? new Set()).add(fmtPhase(r.phase ?? 0)));
   return `${head} Preset ${rep.values?.preset ?? ""} spreads its phase over its own line's group, and the kept fixtures keep the phases they have there: ${[...per].map(([f, ph]) => `${f} ${[...ph].join(" / ")}`).join(", ")}`;
+}
+
+/** The phase note of a standard line whose select is not predicted, when its values are a phaser with a phase spread. */
+function unpredictedPhaseNote(l: Line, g: GroupInfo, p: PresetRead, settings: SelectionSettings, at: string, why: string): string | undefined {
+  const members = new Set(g.members.map((m) => m.sfIndex));
+  const rows = p.rows.filter((r) => isPhaserRow(r) && typeof r.sfIndex === "number" && members.has(r.sfIndex));
+  if (!p.rows.some(isPhaserRow)) return undefined;
+  const range = phaseRangeOf(settings) !== null || hasOtherPhaseRange(settings);
+  const spread = new Set(rows.map((r) => Math.round((r.phase ?? 0) * 100))).size > 1;
+  if (!range && !spread) return undefined;
+  const preset = p.pool?.no !== undefined && p.no !== undefined ? `Preset ${p.pool.no}.${p.no}` : "the phaser preset";
+  return `the MAtricks select (${at}) keeps part of Group ${l.selection?.group}, and it does not narrow the phase spread: ${range ? "the line's phase range is spread over the whole group's grid in selection order, the kept fixtures get the phases of their positions, and the fixtures of one block or group share one" : `${preset} spreads its phase over its own line's group, and the kept fixtures keep the phases they have there`}; the kept fixtures and their phases were not predicted (${why})`;
 }
 
 /**
@@ -552,7 +583,7 @@ export function verifyCoverage(input: { rows: Array<PresetRow & { cooked?: boole
     const keptOut = ex && !input.expected.unknownReach ? cooked.filter((r) => ex.has(key(r)) && !input.expected.pairs.has(key(r)) && !(typeof r.sfIndex === "number" && input.expected.uncertain.has(r.sfIndex))) : [];
     // Where a select meets a phase spread, the cooked phase of each kept fixture is the predicted one.
     const ph = input.expected.phases;
-    const offPhase = ph?.size ? cooked.filter((r) => ph.has(key(r)) && !samePhase(r.phase ?? 0, ph.get(key(r))!)) : [];
+    const offPhase = ph?.size && !input.expected.unknownReach ? cooked.filter((r) => ph.has(key(r)) && !(typeof r.sfIndex === "number" && input.expected.uncertain.has(r.sfIndex)) && !samePhase(r.phase ?? 0, ph.get(key(r))!)) : [];
     if (offPhase.length) out.push(`cooked phases other than predicted: ${offPhase.slice(0, 8).map((r) => `${r.fixture} ${r.attribute} ${fmtPhase(r.phase ?? 0)} (${fmtPhase(ph!.get(key(r))!)} predicted)`).join(", ")}${offPhase.length > 8 ? ` and ${offPhase.length - 8} more` : ""}`);
     if (keptOut.length) out.push(`cooked values a line's filter or MAtricks select keeps out: ${keptOut.slice(0, 8).map((r) => `${r.fixture} ${r.attribute}`).join(", ")}${keptOut.length > 8 ? ` and ${keptOut.length - 8} more` : ""}`);
   }
