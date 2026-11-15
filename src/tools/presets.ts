@@ -202,12 +202,16 @@ function boolOpt(v: Validator, field: string, value: unknown): boolean | undefin
 // Analysis (pure, unit-tested)
 // ---------------------------------------------------------------------------
 
-/** The data layers a programmer row carries. */
+/**
+ * The data layers a programmer row carries. A layer the channel does not hold is absent from GetProgPhaser's step
+ * (no `absolute` / `relative` key; kb-16 raw read, 2.5.1), so a relative of 0 is a relative layer: it is what a
+ * "relative only" preset stores to stop a relative phaser (2.9044, `At Relative 0`).
+ */
 export function rowLayers(r: ProgrammerRow): Layer[] {
   const out: Layer[] = [];
   if ((r.stepCount ?? 1) > 1) out.push("phaser");
   else if (r.value !== null && r.value !== undefined) out.push("absolute");
-  if (r.relative !== null && r.relative !== undefined && r.relative !== 0) out.push("relative");
+  if (typeof r.relative === "number") out.push("relative");
   if (r.phaser?.fade !== null && r.phaser?.fade !== undefined) out.push("fade");
   if (r.phaser?.delay !== null && r.phaser?.delay !== undefined) out.push("delay");
   return out;
@@ -341,7 +345,7 @@ export function verifyStored(input: {
       }
     }
     used.add(match);
-    const diffs = compareRow(r, match, input.embed);
+    const diffs = compareRow(r, match, input.embed, input.merge);
     if (diffs.length) out.push(`${label(r)}: ${diffs.join(", ")}`);
   }
   if (!input.merge) {
@@ -404,13 +408,31 @@ function compareSteps(r: ProgrammerRow, s: PresetRow, embed: boolean): string[] 
   return d;
 }
 
-function compareRow(r: ProgrammerRow, s: PresetRow, embed: boolean): string[] {
+/**
+ * Whether a stored single-step row holds the absolute / relative layer: its value is present (a number, 0 included).
+ * A layer the row lacks has no key at all (2.9044: relative 0, no value; hasRelative true, hasAbsolute false). The
+ * value, not the dict_flags, decides: the flags of a single-step absolute row were not read on a console.
+ */
+export const storedHasAbsolute = (s: PresetRow) => typeof s.value === "number";
+export const storedHasRelative = (s: PresetRow) => typeof s.relative === "number";
+
+function compareRow(r: ProgrammerRow, s: PresetRow, embed: boolean, merge = false): string[] {
   const d: string[] = [];
+  const single = (r.stepCount ?? 1) <= 1 && (s.stepCount ?? 1) <= 1;
   if ((r.stepCount ?? 1) > 1) {
     if ((s.stepCount ?? 1) !== r.stepCount) d.push(`${r.stepCount} steps expected, ${s.stepCount ?? 1} stored`);
     else d.push(...compareSteps(r, s, embed));
-  } else if (r.value !== null && r.value !== undefined && !near(r.value, s.value)) d.push(`value ${r.value} expected, ${s.value ?? "none"} stored`);
-  if (r.relative && !near(r.relative, s.relative)) d.push(`relative ${r.relative} expected, ${s.relative ?? "none"} stored`);
+  } else if (r.value !== null && r.value !== undefined) {
+    if (!near(r.value, s.value)) d.push(`value ${r.value} expected, ${s.value ?? "none"} stored`);
+  } else if (single && !merge && storedHasAbsolute(s)) {
+    // A relative-only value must not come back with an absolute layer (a merge may keep one stored before).
+    d.push(`an absolute value (${s.value ?? "?"}) stored although the programmer value had none`);
+  }
+  if (typeof r.relative === "number") {
+    if (!storedHasRelative(s) || !near(r.relative, s.relative)) d.push(`relative ${r.relative} expected, ${s.relative ?? "none"} stored`);
+  } else if (single && !merge && storedHasRelative(s)) {
+    d.push(`a relative value (${s.relative ?? "?"}) stored although the programmer value had none`);
+  }
   if (r.phaser?.fade !== null && r.phaser?.fade !== undefined && !near(r.phaser.fade, s.fade)) d.push(`fade ${r.phaser.fade} expected, ${s.fade ?? "none"} stored`);
   if (r.phaser?.delay !== null && r.phaser?.delay !== undefined && !near(r.phaser.delay, s.delay)) d.push(`delay ${r.phaser.delay} expected, ${s.delay ?? "none"} stored`);
   // Absolute and relative values reference their source separately (abs_preset / rel_preset); both are checked.
@@ -521,7 +543,8 @@ function presentRows(rows: PresetRow[]) {
     mode: r.mode ?? null,
     ...(r.value !== undefined && r.value !== null ? { value: r.value } : {}),
     ...(r.steps ? { steps: r.steps.map((st) => ({ ...st, integrated: st.integrated ? (st.integrated.valid ? depLabel(st.integrated) : "invalid reference") : undefined })) } : {}),
-    ...(r.relative ? { relative: r.relative } : {}),
+    // 0 included: a relative of 0 is a stored layer (a "relative only" preset), not an absent one.
+    ...(typeof r.relative === "number" ? { relative: r.relative } : {}),
     ...(r.fade !== undefined && r.fade !== null ? { fade: r.fade } : {}),
     ...(r.delay !== undefined && r.delay !== null ? { delay: r.delay } : {}),
     // Phaser layers in user units (the console reads speed in Hz, measure x100, the speed master 0-based).
@@ -977,7 +1000,7 @@ export const registerPresetTools: RegisterTools = (server, ctx) => {
       description:
         "Store the current programmer content into Preset <pool>.<number>. Prepare the programmer first (gma3_select, gma3_set_attribute/color/position, At Preset ... for embedding); this tool only stores. " +
         "Explicit rules: mode selective | global | universal (never the pool default: a default store resolves a mode conflict silently and can keep one fixture's values), or force global | universal for a forced conversion of an existing preset (removes its selective, or selective and global, data; needs existing: \"merge\"). " +
-        "existing: refuse (default) | merge | overwrite. fixtures: the scope; every active programmer value must belong to these fixtures (a fixture includes its cells) and each must have one; attributes (optional): exact attribute filter (an activation group, e.g. all ColorRGB_*, is activated as a whole); layers (default [absolute]; also relative, fade, delay, phaser) must cover every value's layers. " +
+        "existing: refuse (default) | merge | overwrite. fixtures: the scope; every active programmer value must belong to these fixtures (a fixture includes its cells) and each must have one; attributes (optional): exact attribute filter (an activation group, e.g. all ColorRGB_*, is activated as a whole); layers (default [absolute]; also relative, fade, delay, phaser) must cover every value's layers (a relative of 0 is a relative layer). " +
         "Anything else in the programmer is refused, because the console stores every active value regardless of the selection. Also refused: universal mode with values that differ between fixtures, embed without a preset reference in the programmer, attributes a feature-group pool's input filter would drop (store into an All pool 21-25 or pass input_filter: false), a locked preset, and a name another preset of the same pool already has (the console keeps names unique within a pool and would store it as \"<name>#2\"; the pool's names are read once per pool and call, compared case-insensitively, the holder is named, and storing a preset again under its own name is no collision): on_name_taken: refuse (default) | allow_suffix (store anyway; a \"<name>#<n>\" read-back is expected, with a warning, not a mismatch). " +
         "embed (default false) stores references to the presets active in the programmer; matricks (default false) the selection MAtricks; keep_activation (default false); input_filter overrides the operator default for this store only. The command always carries /Programmer /Active, the mode, /Merge or /Overwrite, /Embed, /MAtricks, /KeepActivation and /NoConfirmation, so the operator's store preferences decide nothing and are not changed (read before and after); Look cannot be overridden per store, so the tool refuses while the operator's StoreLook preference is on. " +
         "Requires exclusive: true (not for preview). verify (default true) reads the stored rows back and checks each programmer value by mode, value, layers and reference, unexpected content, the preset's mode, dependencies (recursively; incomplete inspection is reported) and that the store preferences are unchanged. Needs bridge 0.22.0. " +

@@ -909,9 +909,9 @@ Without `recook`, the call warns that the calling cues were not re-cooked, with 
     programmer. It holds 4 rows, Pan on 251-254, each `hasAbsolute: false`, `hasRelative: true`, `relative: 0`. A line
     calling such a preset stops a relative phaser on its attributes (Pan + Tilt relative 0 preset 2.9040, 1st series,
     and 2nd series in Sequence 9022: Cue 3 = Group 9001 + 2.9030 + 2.9040), where neither the base preset, another
-    absolute preset nor a RELEASE does. Not verified by the tools: `gma3_store_preset` treats a relative of 0 as no
-    relative layer in its checks and its read-back does not compare it (from the code, not run), and `gma3_preset`
-    shows those rows without a value (seen on 2.9044) ([presets](presets.md#what-is-and-is-not-verified));
+    absolute preset nor a RELEASE does. `gma3_store_preset` now counts a relative of 0 as a relative layer, compares
+    it in the read-back, and `gma3_preset` lists `relative: 0` (unit-tested; not run on a console, see
+    [presets](presets.md#what-is-and-is-not-verified));
   - a new relative phaser takes over an attribute's relative layer: Sequence 9025 Cue 1 = Group 9001 + 2.9032 (base)
     and Group 9001 + 21.9054 (relative Pan + Tilt phaser A); Cue 2 = Group 9001 + 2.9044 (Pan relative 0) and Group
     9001 + 21.9060 (relative Tilt phaser B). In Cue 2 the bench saw Pan held on the base and Tilt follow B alone

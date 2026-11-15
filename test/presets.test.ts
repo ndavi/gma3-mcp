@@ -102,8 +102,14 @@ class Console {
     return this;
   }
 
+  /** A console that stores an absolute layer next to a relative-only value (a fault the read-back must report). */
+  storeAbsoluteToo = false;
+
+  /** As preset.read gives a stored row on 2.5.1: a layer the value lacks is absent (2.9044: hasAbsolute false, hasRelative true, relative 0). */
   private row(f: Fx, r: ProgrammerRow, mode: string, embed: boolean): PresetRow {
-    return { fixture: f.id, attribute: String(r.attribute), sfIndex: f.sf, fixtureType: f.type, mode, value: r.value, fade: r.phaser?.fade ?? null, delay: r.phaser?.delay ?? null, stepCount: 1, absPreset: embed && r.absPreset ? { valid: true, addrNative: r.absPreset.addrNative, addr: "src", pool: 4, no: 1, name: r.absPreset.name } : null, hasAbsolute: true };
+    const abs = typeof r.value === "number" ? r.value : this.storeAbsoluteToo ? 50 : undefined;
+    const rel = typeof r.relative === "number" ? r.relative : undefined;
+    return { fixture: f.id, attribute: String(r.attribute), sfIndex: f.sf, fixtureType: f.type, mode, ...(abs !== undefined ? { value: abs } : {}), ...(rel !== undefined ? { relative: rel } : {}), fade: r.phaser?.fade ?? null, delay: r.phaser?.delay ?? null, stepCount: 1, absPreset: embed && r.absPreset ? { valid: true, addrNative: r.absPreset.addrNative, addr: "src", pool: 4, no: 1, name: r.absPreset.name } : null, hasAbsolute: abs !== undefined, hasRelative: rel !== undefined };
   }
 
   store(c: string): string {
@@ -268,6 +274,40 @@ test("preset ids, the store command and layers", () => {
   assert.deepEqual(rowLayers(r({})), ["absolute"]);
   assert.deepEqual(rowLayers(r({ phaser: { fade: 2, delay: 1 }, relative: 5 })), ["absolute", "relative", "fade", "delay"]);
   assert.deepEqual(rowLayers(r({ stepCount: 3, value: null })), ["phaser"]);
+  // GetProgPhaser leaves out a layer the channel lacks: a relative of 0 is a relative layer, null / absent is none.
+  assert.deepEqual(rowLayers(r({ value: null, relative: 0 })), ["relative"]);
+  assert.deepEqual(rowLayers(r({ value: undefined, relative: 0 })), ["relative"]);
+  assert.deepEqual(rowLayers(r({ relative: null })), ["absolute"]);
+  assert.deepEqual(rowLayers(r({ relative: undefined })), ["absolute"]);
+  assert.deepEqual(rowLayers(r({ value: 0, relative: 0 })), ["absolute", "relative"]);
+});
+
+test("a relative of 0 is a layer: compared, required in layers, reported when missing or joined by an absolute", () => {
+  const prow = (extra: Partial<ProgrammerRow> = {}): ProgrammerRow => ({ subfixtureIndex: 2, fid: "601", attribute: "Pan", value: null, relative: 0, stepCount: 1, ...extra });
+  // As 2.9044 reads on 2.5.1: hasAbsolute false, hasRelative true, relative 0, no value.
+  const srow = (extra: Partial<PresetRow> = {}): PresetRow => ({ fixture: "601", sfIndex: 2, attribute: "Pan", mode: "selective", hasAbsolute: false, hasRelative: true, relative: 0, stepCount: 1, ...extra });
+  const v = (p: ProgrammerRow, s: PresetRow, merge = false) => verifyStored({ rows: [p], stored: [s], mode: "selective", forced: false, merge, embed: false, types: {} }).join(" | ");
+  assert.equal(v(prow(), srow()), "", "relative 0 stored as relative 0");
+  assert.match(v(prow(), srow({ relative: 5 })), /601 Pan: relative 0 expected, 5 stored/);
+  assert.match(v(prow(), srow({ hasRelative: false, relative: undefined })), /relative 0 expected, none stored/);
+  assert.match(v(prow(), srow({ hasRelative: undefined, relative: null })), /relative 0 expected, none stored/, "no value is no layer");
+  assert.match(v(prow(), srow({ hasRelative: true, relative: undefined })), /relative 0 expected, none stored/, "a flag without a value is not a stored relative");
+  // The console storing an absolute value too is reported (its value present, 0 included).
+  assert.match(v(prow(), srow({ hasAbsolute: true, value: 50 })), /an absolute value \(50\) stored although the programmer value had none/);
+  assert.match(v(prow(), srow({ hasAbsolute: undefined, value: 0 })), /an absolute value \(0\) stored although/);
+  assert.equal(v(prow(), srow({ hasAbsolute: true })), "", "a flag without a value is not reported (single-step flags not read on a console)");
+  assert.equal(v(prow(), srow({ hasAbsolute: true, value: 50 }), true), "", "a merge may keep an absolute stored before");
+  // An absolute-only value must not come back with a relative layer, 0 included.
+  const abs = prow({ value: 40, relative: null });
+  assert.equal(v(abs, srow({ value: 40, hasAbsolute: true, hasRelative: false, relative: undefined })), "");
+  assert.equal(v(abs, srow({ value: 40, hasAbsolute: true, hasRelative: true, relative: undefined })), "", "only a relative value counts");
+  assert.match(v(abs, srow({ value: 40, hasAbsolute: true })), /a relative value \(0\) stored although the programmer value had none/);
+  // layers: a relative of 0 needs layers [relative]; it no longer passes as "no layer".
+  const scope = new Map([[2, "601"]]);
+  const scopeFixtures = new Map([["601", [2]]]);
+  const plan = (layers: Array<"absolute" | "relative">) => analyzeContent({ rows: [prow()], scope, scopeFixtures, layers, mode: "selective", embed: false }).problems.join();
+  assert.match(plan(["absolute"]), /layers that were not requested \(relative\): 601 Pan/);
+  assert.equal(plan(["relative"]), "");
 });
 
 test("content analysis refuses everything that was not requested", () => {
@@ -493,6 +533,27 @@ test("preview reads only and returns the command; an old bridge stops in the rea
 // ---------------------------------------------------------------------------
 // gma3_preset
 // ---------------------------------------------------------------------------
+
+test("a relative-only preset (Pan relative 0): stored with layers [relative], read back and listed with its value", async () => {
+  con.set("601", "Pan", 0, { value: null, relative: 0 });
+  const refused = await store({ preset: "2.9045", fixtures: [601], mode: "selective", attributes: ["Pan"] });
+  assert.equal(refused.isError, true);
+  assert.match(JSON.stringify(refused.result), /layers that were not requested \(relative\)/, "the default layers [absolute] do not cover a relative 0");
+  assert.equal(sent(), 0);
+  const { result, isError } = await store({ preset: "2.9045", fixtures: [601], mode: "selective", attributes: ["Pan"], layers: ["relative"] });
+  assert.equal(isError, false, JSON.stringify(result));
+  assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+  const read = await h.callJson("gma3_preset", { preset: "2.9045" });
+  assert.deepEqual(read.result.rows.map((r: Record<string, unknown>) => [r.fixture, r.attribute, r.relative, "value" in r]), [["601", "Pan", 0, false]]);
+});
+
+test("a relative-only store the console gives an absolute layer too is a mismatch", async () => {
+  con.storeAbsoluteToo = true;
+  con.set("601", "Pan", 0, { value: null, relative: 0 });
+  const { result } = await store({ preset: "2.9046", fixtures: [601], mode: "selective", attributes: ["Pan"], layers: ["relative"] });
+  assert.equal(result.verification.status, "mismatched", JSON.stringify(result.verification));
+  assert.match(result.verification.detail, /601 Pan: an absolute value \(50\) stored although the programmer value had none/);
+});
 
 test("gma3_preset reads content and follows dependencies, reporting invalid and unreadable ones", async () => {
   con.presets.set("23.1", { name: "Look", lock: "", presetMode: "Selective", rows: [{ fixture: "401", sfIndex: 63, attribute: "ColorRGB_R", mode: "selective", value: 100, absPreset: { valid: true, addrNative: "x", pool: 4, no: 1, name: "Src" } }], deps: [{ valid: true, addr: "Preset 4.1", pool: 4, no: 1, name: "Src" }, { valid: false }] });

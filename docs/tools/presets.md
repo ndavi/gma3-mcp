@@ -69,7 +69,7 @@ Parameters:
 | `force` | `global`, `universal`: forced conversion of an existing preset (`/ForceGlobal` or `/ForceUniversal` with `/Merge`), which removes its selective, or selective and global, data | needs `existing: "merge"` |
 | `existing` | `refuse`, `merge`, `overwrite` | `refuse` |
 | `attributes` | exact attribute filter; each must be present | none (any attribute) |
-| `layers` | `absolute`, `relative`, `fade`, `delay`, `phaser` (multi-step) | `["absolute"]` |
+| `layers` | `absolute`, `relative`, `fade`, `delay`, `phaser` (multi-step); a relative of 0 is a relative layer (a "relative only" preset needs `[relative]`) | `["absolute"]` |
 | `embed` | store references to the presets active in the programmer | false (plain values) |
 | `input_filter` | override the input-filter preference for this store | the operator's default |
 | `matricks` | store the selection MAtricks | false |
@@ -110,7 +110,10 @@ Requests, in order:
      - selective: a selective row of the same fixture;
      - global: the fixture's own row, or the global row of its fixture type;
      - universal: the universal row of the attribute;
-     - in every mode the same value (±0.05 %), fade/delay and step count; the absolute and the relative reference are
+     - in every mode the same value (±0.05 %), relative (0 included), fade/delay and step count. A single-step value
+       must not come back with a layer it did not have: an absolute stored next to a relative-only value, or a
+       relative next to an absolute-only one (a value present, 0 included; the `hasAbsolute` / `hasRelative` flags are
+       not used), except with `existing: "merge"`, which may keep a layer stored before. The absolute and the relative reference are
        checked separately: with `embed`, each reference the programmer value had must be stored, valid and to the same
        source, and none it did not have; without `embed`, no reference of either kind. Phaser steps are checked the
        same way per step: a stored step reference must match the programmer step's, and a step that had none must not
@@ -158,7 +161,7 @@ is a separate change.
 - `{ preset: "4.12" }`:
   - **Summary:** `name`, `pool`, `featureGroup`, `presetMode`, `storedData`, `locked`, `hasMAtricks`, `referencedBy`
     (how many objects use the preset).
-  - **Rows:** one per fixture and attribute, with `mode`, `value` (percent) or `steps`, `fade`, `delay`, `relative`,
+  - **Rows:** one per fixture and attribute, with `mode`, `value` (percent) or `steps`, `fade`, `delay`, `relative` (0 included),
     `fixtureType`, and `embeddedFrom` / `relativeFrom` for an embedded absolute / relative value.
   - **Phaser data** (bridge 0.23.0): `steps` with each step's `absolute`/`relative`, `width`, `trans`, `accel`,
     `decel` and the preset it integrates, and the phaser layers `speedBpm`, `phase`, `measure` (beats) and
@@ -185,9 +188,14 @@ is a separate change.
     [phasers](phasers.md));
     relative embedding is verified by the unit tests, not on the console (the live test embeds absolute values);
   - a relative value of 0 (a "relative only" preset such as Pan at relative 0, the THK migration's RELEASE PHASER
-    presets; bench preset 2.9044, 2026-11-15) counts as no relative layer in the `layers` check, and the read-back does not compare it (from the code, not run on
-    a console); `gma3_preset` lists such a row without a value (seen on 2.9044, whose raw read has `hasRelative: true`,
-    `relative: 0`, `hasAbsolute: false`);
+    presets; bench preset 2.9044, 2026-11-15) is a relative layer in the `layers` check, the read-back and
+    `gma3_preset` (above). The signal is the console's, from earlier reads: a layer a value lacks has no key
+    (`preset.read` on 2.9044: `relative: 0`, no value, `hasRelative: true`, `hasAbsolute: false`; `GetProgPhaser` has no
+    `relative` key on `At 50` / `At 20`, the two raw reads of kb-16; the multi-step rows read on the bench have
+    `hasRelative: false` and no relative). Not run on a console with this code (the bridge was down on 2026-11-15):
+    a store of a relative-only preset, a programmer read after `At Relative 0` and after `At Preset`, a read of a
+    single-step absolute preset such as 1.9010 (expected: no `relative` key), and an ordinary default-layers store
+    (expected: still `matched`). Unit-tested on the fake console and in the Lua bridge test;
   - MAgic presets and recipe content are not modelled;
   - a pool's own input filter (a filter or world assigned to the pool) is not predicted; only the read-back catches it.
 - The embedded preset's update is asynchronous; a read in the same frame as the source's change shows the old values.

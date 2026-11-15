@@ -98,10 +98,15 @@ local embedded = H({ name = "Look", class = "Preset", no = 3, parent = allPool, 
 } })
 local unreadable = H({ name = "Bad", class = "Preset", no = 5, parent = allPool, props = {} })
 local part = H({ name = "Part 0", class = "Part", no = 0, props = {} })
-local presetData = { [embedded] = embeddedData, [source] = { by_fixtures = {} }, [part] = { by_fixtures = { ["401"] = { ColorRGB_R = chan(320, 0, 100, { mask_cooked = 511 }), Dimmer = chan(321, 0, 70) } } } }
+-- A "relative only" preset as 2.9044 holds it on 2.5.1 (Pan At Relative 0): the step has a relative and no absolute.
+local positionPool = H({ name = "Position", class = "Presets", no = 2, props = { PresetMode = "Selective", InputFilter = "" } })
+local relOnly = H({ name = "Pan rel 0", class = "Preset", no = 9044, parent = positionPool, addr = "14.14.1.5.2.9044", props = { StoredData = "Selective", PresetMode = "Selective", FeatureGroup = "Position", Lock = "", MaxDepth = 0 } })
+local relOnlyData = { by_fixtures = { ["401"] = { Pan = { { relative = 0, channel_function = 0 }, ui_channel_index = 322, preset_store_mode = 1, selective = true, mask_cooked = 0, dict_flags = { has_absolute = 0, has_relative = 1 } } } } }
+uiToSf[322] = 63
+local presetData = { [relOnly] = relOnlyData, [embedded] = embeddedData, [source] = { by_fixtures = {} }, [part] = { by_fixtures = { ["401"] = { ColorRGB_R = chan(320, 0, 100, { mask_cooked = 511 }), Dimmer = chan(321, 0, 70) } } } }
 GetPresetData = function(h) return presetData[h] end
 local seq = H({ name = "Seq", class = "Sequence", no = 1, props = {} })
-local objects = { ["Preset 23.3"] = embedded, ["Preset 4.902"] = source, ["Preset 23.5"] = unreadable, ["Sequence 9 Cue 1 Part 0"] = part, ["Sequence 1"] = seq, ["Preset 4"] = colorPool, ["Preset 23"] = allPool }
+local objects = { ["Preset 2.9044"] = relOnly, ["Preset 23.3"] = embedded, ["Preset 4.902"] = source, ["Preset 23.5"] = unreadable, ["Sequence 9 Cue 1 Part 0"] = part, ["Sequence 1"] = seq, ["Preset 4"] = colorPool, ["Preset 23"] = allPool }
 ObjectList = function(ref) local h = objects[ref]; return h and { h } or nil end
 
 local prefs = H({ name = "StorePreferences", class = "StorePreferences", props = { StoreMode = "Ask", StoreSource = "Programmer", ChannelFilter = "Active", StoreLook = "No", PresetMode = "Default", PresetInputFilter = "Yes", StoreEmbedded = "No", StoreMAtricks = "Yes", KeepActivation = "No" } })
@@ -152,6 +157,11 @@ local cell = row("501.2", "ColorRGB_R")
 check("preset.read: a cell's fixture type comes from its fixture; multi-step rows list steps", cell and cell.fixtureType == "5 Wall Washer" and cell.mode == "universal" and cell.value == nil and #cell.steps == 2 and cell.steps[2].absolute == 90 and cell.hasRelative == true, J(cell))
 check("preset.read: phaser steps carry their layers and integrated preset; the row its phaser layers", cell and cell.steps[1].trans == 0 and cell.steps[1].width == 50 and cell.steps[2].accel == -100 and cell.steps[2].decel == 20 and cell.steps[2].accelType == 2 and cell.steps[2].integrated and cell.steps[2].integrated.no == 902 and cell.steps[1].integrated == nil and cell.speed == 2.0 and cell.phase == 90 and cell.measure == 400 and cell.speedMaster == 1, J(cell))
 check("preset.read: dependencies with validity and checksum, a deleted source invalid", #res.dependencies == 2 and res.dependencies[1].valid == true and res.dependencies[1].addr == "14.14.1.5.4.902" and res.dependencies[1].contentCrc ~= nil and res.dependencies[2].valid == false and res.dependenciesReadable == true, J(res.dependencies))
+
+r = request("preset.read", { ref = "Preset 2.9044" })
+local rel = r.ok and r.result.rows and r.result.rows[1] or {}
+check("preset.read: a relative-only row has hasRelative, relative 0 and no value (the client tells 0 from no layer)", r.ok and #r.result.rows == 1 and rel.attribute == "Pan" and rel.hasRelative == true and rel.hasAbsolute == false and rel.relative == 0 and rel.value == nil, J(r.result))
+check("preset.read: an absolute-only row has no relative", r401 and r401.relative == nil and r401.hasRelative == false, J(r401))
 
 r = request("preset.read", { ref = "Preset 23.3", typesFor = { 63, 12, 99 } })
 check("preset.read: typesFor gives the fixture type of any subfixture, the same way rows do", r.ok and r.result.types["63"] == "6 Mega Hex Par" and r.result.types["12"] == "5 Wall Washer" and r.result.types["99"] == nil, J(r.result.types))
