@@ -653,7 +653,17 @@ interface Sig {
   pair: string;
   /** The line is mirrored (PHASERTRANSFORM Mirror, as read): its values on the mirrored wing, see mirrorMatch. */
   mirror?: MirrorScope;
+  /** The line's selection: its Group and MAtricks (null: none). Two lines with the same step presets are a duplicate only on the same selection. */
+  selection?: Selection;
+  /** The group's members ("sf:<index>" and "fx:<fixture>"), set only on a twin (see scopeTwins): its values are the cooked values on these fixtures. */
+  members?: Set<string>;
 }
+/** A phaser line's selection: the group it acts on and its MAtricks (null: none). */
+interface Selection {
+  group: number | null;
+  matricks: number | null;
+}
+const selectionText = (x: Selection | undefined) => (x ? `Group ${x.group ?? "?"}${x.matricks !== null ? `, MAtricks ${x.matricks}` : ", no MAtricks"}` : "the same selection");
 /**
  * Where a Mirror line's mirrored values may be (live 2026-11-15, Rescue 21.9055 / 21.9073, group 9001 = 251-254, XWings
  * 2): on the second wing the cooked values are hard values without the step preset, absolute 100 - x and relative -x
@@ -670,15 +680,23 @@ interface MirrorScope {
 /** A source whose values can be told apart: a step from a preset or from hard values. */
 const hasPreset = (g: Sig) => g.pair.split("/").some((p) => p !== "-" && p !== "?");
 const usable = (g: Sig) => !g.pair.includes("?") && (hasPreset(g) || g.attribute !== null);
-function sigsOf(line: number, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout, hard?: HardGrid): Sig[] {
-  return (layout[0] ?? []).map((x, s) => ({ line, source: s, attribute: x.attribute, pair: presets.map((st, n) => (!st[s] && isHard(hard?.[n]?.[s]) ? hardKey(hard![n][s]!) : pkey(st[s]))).join("/") }));
+function sigsOf(line: number, presets: Array<Array<PresetRef | null | undefined>>, layout: Layout, hard?: HardGrid, selection?: Selection): Sig[] {
+  return (layout[0] ?? []).map((x, s) => ({ line, source: s, attribute: x.attribute, pair: presets.map((st, n) => (!st[s] && isHard(hard?.[n]?.[s]) ? hardKey(hard![n][s]!) : pkey(st[s]))).join("/"), ...(selection ? { selection } : {}) }));
 }
 /**
  * Two lines' sources that cannot be told apart: the same step presets on the same attribute. A source without any
  * preset (the shape's value, e.g. Pan relative 0 on two Flyout lines) is not one: its values are only checked where
  * a single line can have made them.
  */
-const clash = (a: Sig, b: Sig) => usable(a) && usable(b) && hasPreset(a) && hasPreset(b) && a.pair === b.pair && (a.attribute === null || b.attribute === null || eqi(a.attribute, b.attribute));
+const sameSteps = (a: Sig, b: Sig) => usable(a) && usable(b) && hasPreset(a) && hasPreset(b) && a.pair === b.pair && (a.attribute === null || b.attribute === null || eqi(a.attribute, b.attribute));
+/** The same group and the same MAtricks (a selection that is not known counts as the same: the strict reading). */
+const sameSelection = (a: Sig, b: Sig) => !a.selection || !b.selection || (a.selection.group === b.selection.group && a.selection.matricks === b.selection.matricks);
+/**
+ * Two lines that cannot be told apart: the same steps on the same selection. The same steps on another group (or
+ * MAtricks) are twins, not a duplicate: their cooked values are told apart by the group's fixtures (scopeTwins).
+ */
+const clash = (a: Sig, b: Sig) => sameSteps(a, b) && sameSelection(a, b);
+const twins = (a: Sig, b: Sig) => sameSteps(a, b) && !sameSelection(a, b);
 const sigText = (g: Sig) => g.pair.split("/").map((p) => (p === "-" ? "the shape's value" : isHardKey(p) ? hardText(p) : `Preset ${p}`)).join(" / ");
 const hardText = (k: string) => k.replace(/^a(-?[\d.]+)/, "absolute $1 ").replace(/r(-?[\d.]+)$/, "relative $1").trim();
 
@@ -696,6 +714,7 @@ const rowPairOf = (r: Row) => (r.stepCount === 2 ? [0, 1].map((i) => rowStepKey(
 const stepMatches = (want: string, got: string) => (want === "-" ? !isPresetKey(got) : want === got);
 const straightMatch = (r: Row, g: Sig) => {
   if (!usable(g) || (g.attribute !== null && !eqi(g.attribute, r.attribute))) return false;
+  if (g.members && !memberOf(r, g.members)) return false;
   const got = rowPairOf(r).split("/");
   const want = g.pair.split("/");
   return got.length === want.length && want.every((w, i) => stepMatches(w, got[i]));
@@ -730,6 +749,41 @@ async function withMirror(bridge: Gma3Bridge, t: number, sigs: Sig[], line: { gr
   const attributes = line.invertStyle !== undefined && Object.hasOwn(MIRRORED_ATTRIBUTES, line.invertStyle) ? MIRRORED_ATTRIBUTES[line.invertStyle] : null;
   return sigs.map((x) => ({ ...x, mirror: { members, attributes, pair: x.pair.split("/").map(mirrorKey).join("/") } }));
 }
+/**
+ * The sigs of lines that have twins (the same steps on another group or MAtricks) get their group's members: a cooked
+ * value then belongs to the line whose group holds its fixture. Twins on the very same fixtures (the same group with
+ * another MAtricks, or groups that overlap) stay ambiguous: returned as the pairs of lines that cannot be told apart
+ * (their values are checked as a whole, not per line). Sigs are updated in place; `all` holds every line's sigs once.
+ */
+async function scopeTwins(bridge: Gma3Bridge, t: number, all: Sig[], groups: Map<number, GroupInfo>): Promise<string[]> {
+  const ambiguous = new Set<string>();
+  const members = new Map<Sig, Set<string> | null>();
+  const membersOf = async (g: Sig) => {
+    if (!members.has(g)) {
+      const n = g.selection?.group;
+      const info = typeof n === "number" ? await readGroup(bridge, n, t, groups) : undefined;
+      members.set(g, info?.exists && !info.truncated && !info.unreadable ? new Set(info.members.flatMap((m) => [`sf:${m.sfIndex}`, `fx:${m.fixture}`])) : null);
+    }
+    return members.get(g)!;
+  };
+  for (const g of all) {
+    const others = all.filter((h) => h.line !== g.line && twins(g, h));
+    if (!others.length) continue;
+    const mine = await membersOf(g);
+    if (!mine) {
+      ambiguous.add(`lines ${[g.line, ...others.map((h) => h.line)].sort((a, b) => a - b).join(" and ")}`);
+      continue;
+    }
+    g.members = mine;
+    for (const h of others) {
+      const theirs = await membersOf(h);
+      if (!theirs || [...mine].some((x) => theirs.has(x))) ambiguous.add(`lines ${[g.line, h.line].sort((a, b) => a - b).join(" and ")}`);
+    }
+  }
+  return [...ambiguous];
+}
+const ambiguousNote = (pairs: string[]) => `${pairs.join("; ")}: the same step presets on selections that share fixtures (the same group with another MAtricks, or overlapping groups): their cooked values cannot be told apart per line, so speed, curves, trans and width of those values are not compared per line`;
+
 const rowKey = (r: Row) => `${r.fixture}|${r.attribute}|${rowPairOf(r)}|${r.speed}|${r.measure}|${r.cooked}|${(r.steps ?? []).map((s) => `${s.accel},${s.decel},${s.trans},${s.width}`).join(";")}`;
 const counts = (rows: Row[]) => rows.reduce((m, r) => m.set(rowKey(r), (m.get(rowKey(r)) ?? 0) + 1), new Map<string, number>());
 const near = (a: number | undefined, b: number | undefined, tol: number) => b === undefined || (a !== undefined && Math.abs(a - b) < tol);
@@ -976,8 +1030,17 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
   if (target) {
     for (const l of specs) if (stepPresets(l).some((s) => s.pool === target.pool && s.number === target.number)) v.fail("a step preset cannot be the target preset itself");
   }
-  const pairs = specs.map(pair).filter((p): p is string => p !== null);
-  if (new Set(pairs).size !== pairs.length) v.fail("two lines have the same 2 step presets: their output could not be told apart in the read-back");
+  // The same 2 steps on the same selection (Group and MAtricks; lines 2+ keep line 1's MAtricks) are a duplicate; on another group or MAtricks they are two lines of one effect (e.g. split by family).
+  const selectionOf = (i: number): Selection => ({ group: specs[i].selection, matricks: specs[i].matricks ?? specs[0].matricks ?? null });
+  const seen = new Map<string, number>();
+  specs.forEach((l, i) => {
+    const p = pair(l);
+    if (p === null) return;
+    const key = `${p}|${selectionOf(i).group}|${selectionOf(i).matricks}`;
+    const first = seen.get(key);
+    if (first !== undefined) v.fail(`lines ${first + 1} and ${i + 1} have the same 2 step presets (${p}) on the same selection (${selectionText(selectionOf(i))}): two identical lines would cook the same values twice; give one of them another group or MAtricks, or drop it`);
+    else seen.set(key, i);
+  });
   if (specs[0]?.matricks !== undefined && specs.some((l) => l.matricks === undefined)) v.fail("lines[0] has a MAtricks and another line has none: the other lines are copies of line 1 and keep its MAtricks; give every line one, or put a line without MAtricks first");
   // Preferred, not required: one family per line (a cue reads more clearly). All-pool step presets may mix families.
   const advice = specs.flatMap((l, i) => (stepPresets(l).some((s) => s.pool >= 21 && s.pool <= 25) ? [`line ${i + 1} takes its steps from an All pool (${stepPresets(l).find((s) => s.pool >= 21 && s.pool <= 25)!.pool}): its presets may mix families; one family per line (Dimmer, Colour, Position... each its own line) is preferred`] : []));
@@ -1134,10 +1197,10 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
             );
         });
         if (problems.length) return [...new Set(problems)].join("; ");
-        const sigs = resolved.flatMap((r, i) => sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)));
+        const sigs = resolved.flatMap((r, i) => sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r), selectionOf(i)));
         for (const [a, g] of sigs.entries()) {
           const other = sigs.slice(a + 1).find((h) => h.line !== g.line && clash(g, h));
-          if (other) return `lines ${g.line} and ${other.line} have the same 2 step ${g.pair.split("/").some(isHardKey) ? "values" : "presets"} (${sigText(g)}${g.attribute ? ` on ${g.attribute}` : ""}): their output could not be told apart in the read-back`;
+          if (other) return `lines ${g.line} and ${other.line} have the same 2 step ${g.pair.split("/").some(isHardKey) ? "values" : "presets"} (${sigText(g)}${g.attribute ? ` on ${g.attribute}` : ""}) on the same selection (${selectionText(g.selection)}): two identical lines would cook the same values twice`;
         }
         sourcesChecked = true;
         return null;
@@ -1381,7 +1444,10 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       // on a Mirror line (as read) to its mirrored values on the line's group.
       const groups = new Map<number, GroupInfo>();
       const sigs: Sig[][] = [];
-      for (const [i, r] of resolved.entries()) sigs.push(await withMirror(bridge, tm, sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r)), details[i] && { ...details[i], group: specs[i].selection }, groups));
+      for (const [i, r] of resolved.entries()) sigs.push(await withMirror(bridge, tm, sigsOf(i + 1, presetsOf(r), effLayouts[i], hardOf(r), selectionOf(i)), details[i] && { ...details[i], group: specs[i].selection }, groups));
+      // Lines with the same steps on other groups: each one's values are those on its group's fixtures.
+      const ambiguous = await scopeTwins(bridge, tm, sigs.flat(), groups);
+      if (ambiguous.length) createdWarnings.push(ambiguousNote(ambiguous));
       const stray = rows.filter((r) => !sigs.some((gs) => gs.some((g) => rowMatches(r, g))));
       if (stray.length) problems.push(`${stray.length} value(s) do not have 2 steps from one line's step presets (first: fixture ${stray[0].fixture} ${stray[0].attribute}, steps ${rowPairOf(stray[0])})`);
       const multi = layouts.some((l) => l.some((st) => st.length > 1));
@@ -1403,10 +1469,12 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
         const others = sigs.filter((_, j) => j !== i).flat();
         const sourceOf = (r: Row) => ownerSig(r, sigs[i], others);
         // A value of a source without a preset that another line could have made too is not this line's to check.
-        const mine = rows.filter((r) => sourceOf(r) !== undefined && (hasPreset(sourceOf(r)!) || !sigs.some((gs, j) => j !== i && gs.some((g) => rowMatches(r, g)))));
+        const claimed = rows.filter((r) => sourceOf(r) !== undefined && (hasPreset(sourceOf(r)!) || !sigs.some((gs, j) => j !== i && gs.some((g) => rowMatches(r, g)))));
         // Evidence that the line cooked: its own step presets or hard values (a mirrored value is not).
         for (const g of sigs[i].filter(hasPreset))
-          if (!mine.some((r) => rowMatches(r, g, true))) problems.push(`no cooked value comes from line ${k}${multi ? ` ${g.attribute ?? `source ${g.source + 1}`}` : ""} (${sigText(g)})`);
+          if (!claimed.some((r) => rowMatches(r, g, true))) problems.push(`no cooked value comes from line ${k}${multi ? ` ${g.attribute ?? `source ${g.source + 1}`}` : ""} (${sigText(g)})`);
+        // A value that a twin on the same fixtures could have made too is not this line's to compare.
+        const mine = claimed.filter((r) => !others.some((h) => hasPreset(h) && straightMatch(r, h)));
         if (!mine.length) continue;
         // The cooked speed is in Hz (60 BPM = 1 Hz), the measure x100. The phase is spread per fixture by the MAtricks: only its set reply is compared.
         if (l.speed !== undefined) {
@@ -1984,13 +2052,16 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
         const layout = layoutOf(want);
         const problems = sourceProblems(`line ${k}`, presetsIn(want), layout, target, presetRows, hardIn(want));
         if (problems.length) return problems.join("; ");
-        const mine = sigsOf(k, presetsIn(want), layout, hardIn(want));
+        const mine = sigsOf(k, presetsIn(want), layout, hardIn(want), { group: want.group, matricks: want.matricks });
         for (const l of before) {
           if (l.line === k && action === "set") continue;
           if (l.class !== "PhaserRecipe") continue;
-          const theirs = sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l));
+          const theirs = sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l), { group: l.group, matricks: l.matricks });
           const c = mine.find((g) => theirs.some((h) => clash(g, h)));
-          if (c) return `line ${l.line} already has the step ${c.pair.split("/").some(isHardKey) ? "values" : "presets"} ${c.pair}${c.attribute ? ` on ${c.attribute}` : ""}: two lines with the same 2 step ${c.pair.split("/").some(isHardKey) ? "values" : "presets"} cannot be told apart in the read-back`;
+          if (c) {
+            const kind = c.pair.split("/").some(isHardKey) ? "values" : "presets";
+            return `line ${l.line} already has the step ${kind} ${c.pair}${c.attribute ? ` on ${c.attribute}` : ""} on the same selection (${selectionText(c.selection)}): two identical lines would cook the same values twice (another group or MAtricks is allowed: the same steps on lines of other groups are told apart by their fixtures)`;
+          }
         }
         return null;
       })) &&
@@ -2085,6 +2156,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
     let verification: Verification = notRequested();
     let after: LineDetail[] | null = null;
     let presetAfter: PresetRead | null = null;
+    let ambiguousLines: string[] = [];
     try {
       after = (await readLineDetails(bridge, ref, tm)) ?? [];
       const data = await readPreset(bridge, ref, tm);
@@ -2104,10 +2176,13 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
       // Cooked values: the edited line's value sources have values at its speed; the old presets' are gone; every other value unchanged.
       // A Mirror line (as read, before and after) also owns its mirrored values on its group (see MirrorScope).
       const groups = new Map<number, GroupInfo>();
-      const oldSigs = action === "add_line" ? [] : await withMirror(bridge, tm, sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]), hardIn(before[k - 1])), before[k - 1], groups);
-      const newSigs = want ? await withMirror(bridge, tm, sigsOf(k, presetsIn(want), layoutOf(want), hardIn(want)), after[k - 1] && { ...after[k - 1], group: want.group }, groups) : [];
-      const otherSigs = before.filter((l) => l.line !== k || action === "add_line").flatMap((l) => (l.class === "PhaserRecipe" ? sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l)) : []));
-      const shared = (g: Sig) => otherSigs.some((h) => clash(g, h));
+      const oldSigs = action === "add_line" ? [] : await withMirror(bridge, tm, sigsOf(k, presetsIn(before[k - 1]), layoutOf(before[k - 1]), hardIn(before[k - 1]), { group: before[k - 1].group, matricks: before[k - 1].matricks }), before[k - 1], groups);
+      const newSigs = want ? await withMirror(bridge, tm, sigsOf(k, presetsIn(want), layoutOf(want), hardIn(want), { group: want.group, matricks: want.matricks }), after[k - 1] && { ...after[k - 1], group: want.group }, groups) : [];
+      const otherSigs = before.filter((l) => l.line !== k || action === "add_line").flatMap((l) => (l.class === "PhaserRecipe" ? sigsOf(l.line, presetsIn(l), layoutOf(l), hardIn(l), { group: l.group, matricks: l.matricks }) : []));
+      // A line with twins (the same steps on another group): its values are those on its group's fixtures.
+      ambiguousLines = await scopeTwins(bridge, tm, [...oldSigs, ...newSigs, ...otherSigs], groups);
+      const overlaps = (a: Sig, b: Sig) => !a.members || !b.members || [...a.members].some((x) => b.members!.has(x));
+      const shared = (g: Sig) => otherSigs.some((h) => clash(g, h) || (twins(g, h) && overlaps(g, h)));
       // The line's own values; a mirrored value only when no other line's own values match it.
       const ofLine = (r: Row, sigs: Sig[]) => sigs.some((g) => straightMatch(r, g)) || (sigs.some((g) => mirrorMatch(r, g)) && !otherSigs.some((h) => straightMatch(r, h)));
       // A fixture and attribute the edited line output, before or after, is left out: there one line masks another
@@ -2158,6 +2233,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
       steps_.push(asRead(stepFromError("read_back", err, { op: "children" })));
     }
     const warnings: string[] = [...editNotes];
+    if (ambiguousLines.length) warnings.push(ambiguousNote(ambiguousLines));
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (nothing was undone)`);
     const edited = action !== "remove_line" ? after?.[k - 1] : undefined;
     if (edited?.speedMaster) warnings.push(...masterSpeedWarning(`line ${k}`, edited.speedMaster, edited.speedHz));
@@ -2257,7 +2333,7 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         "A step is {preset} for a shape with one value source per step (Sine...), or {sources: {Attribute: \"P.X\", ...}} for a shape with several (Flyout 19 / Flyout Inverted 20: Dimmer, Tilt, Pan, so one line carries Dimmer + Tilt): each preset goes into the value source filtered on its attribute (or named by number), a source not given keeps the shape's value; a source may be {preset?, trans?, width?}. One preset on a multi-source shape is refused (At Preset would put it into every source). " +
         "Hard values instead of presets: a step (or a value source) {attribute, absolute? | relative?}: the attribute is assigned once per source (Assign Attribute, shared by both steps), a preset on the source is cleared, the values are set from the command line (Set ... Property \"ValueAbsolute\" / \"ValueRelative\"; the layer not given is set to None); relative is percent of the attribute's whole range; a step may give only the attribute (it keeps the shape's value). Without an attribute or a preset a line does not cook (refused). A copy keeps line 1's hard values and nothing takes them back to the shape's: a line 2+ / add_line source must then be given a preset or values. " +
         "A value source's 2 presets come from one preset pool; one family per line is preferred (a warning names a line with presets from an All pool). The target preset may be in any pool: the pool does not filter recipe lines. " +
-        "Checked first, nothing sent otherwise: the slot is free, the groups, shapes, presets and MAtricks exist, each shape has 2 steps and lines 2+ have line 1's value sources, each source's preset holds its attribute, no two lines share a source's step presets, the Edit Recipe mode is off with an empty Part Zero, no dialog is open, the programmer is empty (read completely), RecipeStoreMode is Normal. " +
+        "Checked first, nothing sent otherwise: the slot is free, the groups, shapes, presets and MAtricks exist, each shape has 2 steps and lines 2+ have line 1's value sources, each source's preset holds its attribute, no two lines on the same selection (Group and MAtricks) share a source's step presets (the same steps on lines of other groups are allowed: a preset split by family or group; the read-back tells them apart by their group's fixtures), the Edit Recipe mode is off with an empty Part Zero, no dialog is open, the programmer is empty (read completely), RecipeStoreMode is Normal. " +
         "Line 1: an empty Store of the preset (it clears the pending Edit Recipe target, so \"Update last object?\" does not open), EditRecipe queued without blocking the bridge (if \"Update last object?\" opens anyway it is answered Cancel, never OK, and the call stops), Group / At Shape / Step / At Preset (only for one preset per step) / MAtricks one command at a time with the line checked in Part Zero, Store /Merge, the mode switched off and read back, ClearAll (line 1 runs on stage from At Shape until then). A failure up to here switches the mode off, clears the programmer and deletes the preset this call created. " +
         "Then the name; line 1's value sources (Assign Preset At <line>.1.<step>.<source>); lines 2+ as copies of line 1 (Copy, then Assign of their group, shape, MAtricks and value source presets; a source given nothing loses line 1's preset; what they do not set is line 1's); SPEEDX / PHASEFROMX / PHASETOX / MEASURE per line; curves (Set ... Property \"Curve\") on every source of the step; WIDTHX then TRANSX per source; Cook /MergeLowPriority. " +
         "Read back: the line count, each line's group, MAtricks and cook state, every value cooked and integrating one value source's step presets, each source with a preset has values, each line's speed, measure, curves, trans and width in the cooked steps, nothing uncooked, mode off, programmer and Part Zero empty. " +
@@ -2265,7 +2341,7 @@ export const registerPhaserRecipeTools: RegisterTools = (server, ctx) => {
         "The cue calls the preset with a standard line (gma3_store_recipe_cues); a cue line's Speed X replaces the preset's speed. " +
         "Editing an existing phaser preset, without the programmer or the Edit Recipe mode (no exclusive needed): action set changes line `line` (default 1): selection, shape (same value sources only), matricks, speed_bpm, phase, measure, steps [{preset? | sources?, curve?, trans?, width?}, ...] ({} keeps a step; in sources a source not given is kept, null clears its preset back to the shape's value), name; " +
         "add_line appends a copy of line 1 retargeted with the given fields (selection and steps required; shape, MAtricks, speed, phase and measure otherwise line 1's; steps without a curve are reset to the shape's; a source given nothing loses line 1's preset); remove_line deletes line `line` (the later lines move up; never the only line). " +
-        "Checked first: the preset and line exist, the line is a PhaserRecipe of 2 steps whose values are told apart by their value sources' presets or hard values, each source's presets from one pool and holding its attribute, no other line with the same source presets, the references exist, no dialog, the Edit Recipe mode off. " +
+        "Checked first: the preset and line exist, the line is a PhaserRecipe of 2 steps whose values are told apart by their value sources' presets or hard values, each source's presets from one pool and holding its attribute, no other line on the same selection (Group and MAtricks) with the same source presets (another group or MAtricks is allowed), the references exist, no dialog, the Edit Recipe mode off. " +
         "Sent: Assign Group / Shape / MAtricks At the line, Assign Preset At each value source, set PRESET \"\" on a cleared source, the curves after the shape, WIDTHX / TRANSX, SPEEDX / PHASEFROMX / PHASETOX / MEASURE, Cook /MergeLowPriority. " +
         "Read back: the edited line as asked (presets, trans, width per source, curves, measure, cook state), every other line and its cooked values unchanged, the edited line's values cooked at its speed and measure, the old presets' values gone. " +
         "Cues calling the preset are not guaranteed to follow the edit (a bench saw a cue keep the old width, trans or speed until re-cooked; another saw it follow at once): re-cook them. recook: true (or {sequences: [...], mode}) on set / add_line / remove_line, after a matched edit: finds the cue parts that call the preset (gma3_preset_usage's scan: every sequence, or only those listed; give sequences on a large show), re-cooks each part whose recipe line calls it with gma3_cook_recipes (merge_low_priority by default, or merge; one part at a time, never the whole cue), and reads each back: its cooked values from the preset match the preset's (steps, presets, trans, width, curves, phase, measure, speed master; speed unless the cue line has its own Speed X), OwnNonCookedDataPresent No, the cue's other parts unchanged. recook lists the parts re-cooked and those skipped with the reason (values referencing the preset without a recipe line calling it); not searched: presets that embed it, CueZero, OffCue. Without recook the call warns that the calling cues keep their old values (with the console's reference count; no scan). " +

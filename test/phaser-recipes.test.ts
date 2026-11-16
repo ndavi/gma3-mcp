@@ -451,7 +451,7 @@ async function editSetup(initial: FLine[], o: { modal?: boolean; editing?: boole
   const addr = (cls: string, n: number, pool?: number) => ({ class: cls, index: n, addr: `14.14.1.${cls === "Preset" ? `5.${pool}` : 6}.${n}` });
   h.fake.on("recipe.editState", () => ({ environment: "Normal", editing: o.editing === true, partZeroLines: [], partZero: false, modal: o.modal ? UPDATE : false, lastCommand: "OK" }));
   h.fake.on("objects", (args) => {
-    const known = ["Group 9000", "Group 9001", "Shape 1", "Shape 2", "MAtricks 9000"].includes(String(args.ref));
+    const known = ["Group 9000", "Group 9001", "Shape 1", "Shape 2", "MAtricks 9000", "MAtricks 9001"].includes(String(args.ref));
     return { total: known ? 1 : 0, items: known ? [{ name: "x" }] : [], offset: 0, count: known ? 1 : 0 };
   });
   h.fake.on("children", (args) => {
@@ -962,7 +962,7 @@ test("create, several value sources: refused before anything is sent", async () 
     [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020", Tilt: "4.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9021" } }] }, /not in the show: Preset 4\.9020/],
     [{ ...FLY, steps: [{ sources: { Dimmer: "1.9020" }, preset: "1.9020" }, { sources: { Dimmer: "1.9021" } }] }, /preset .* or sources .*, not both/],
     [{ ...FLY, steps: undefined, selection: undefined, lines: [{ selection: 9002, shape: 19, steps: FLY.steps, matricks: 9000 }, { selection: 9002, shape: 1, steps: [{ preset: "2.9022" }, { preset: "2.9020" }], matricks: 9000 }], shape: undefined, matricks: undefined, speed_bpm: undefined, measure: undefined }, /Shape 1's value sources \(source 1\) are not line 1's \(Shape 19: Dimmer, Tilt, Pan\)/],
-    [{ ...FLY, steps: undefined, selection: undefined, lines: [{ selection: 9002, shape: 19, steps: FLY.steps, matricks: 9000 }, { selection: 9003, shape: 19, steps: [{ sources: { Dimmer: "1.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9020" } }], matricks: 9000 }], shape: undefined, matricks: undefined, speed_bpm: undefined, measure: undefined }, /lines 1 and 2 have the same 2 step presets \(Preset 1\.9020 \/ Preset 1\.9021 on Dimmer\)/],
+    [{ ...FLY, steps: undefined, selection: undefined, lines: [{ selection: 9002, shape: 19, steps: FLY.steps, matricks: 9000 }, { selection: 9002, shape: 19, steps: [{ sources: { Dimmer: "1.9020" } }, { sources: { Dimmer: "1.9021", Tilt: "2.9020" } }], matricks: 9000 }], shape: undefined, matricks: undefined, speed_bpm: undefined, measure: undefined }, /lines 1 and 2 have the same 2 step presets \(Preset 1\.9020 \/ Preset 1\.9021 on Dimmer\)/],
   ] as const) {
     const { h, cmds } = await flySetup();
     try {
@@ -1414,7 +1414,7 @@ test("create, hard values: refused before anything is sent", async () => {
     [{ ...HV, steps: [{ attribute: null, absolute: 10 }, { absolute: 90 }] }, /attribute null clears a source's attribute with action set/],
     [{ ...HV, shape: 19, steps: [{ sources: { Tilt: { attribute: "Pan", relative: 5 } } }, { sources: { Dimmer: "1.9020" } }] }, /value source 2 is filtered on Tilt by its shape: it cannot take attribute Pan/],
     [{ ...HV, steps: undefined, selection: undefined, speed_bpm: undefined, lines: [{ selection: 9002, steps: HV.steps }, { selection: 9003, steps: [{ preset: "1.9020" }, {}] }] }, /preset|step 2 source 1: line 1 gives it hard values/],
-    [{ ...HV, steps: undefined, selection: undefined, speed_bpm: undefined, lines: [{ selection: 9002, steps: HV.steps }, { selection: 9003, steps: HV.steps }] }, /lines 1 and 2 have the same 2 step values \(relative -20\.00 \/ relative 20\.00 on Tilt\)/],
+    [{ ...HV, steps: undefined, selection: undefined, speed_bpm: undefined, lines: [{ selection: 9002, steps: HV.steps }, { selection: 9002, steps: HV.steps }] }, /lines 1 and 2 have the same 2 step values \(relative -20\.00 \/ relative 20\.00 on Tilt\)/],
   ] as const) {
     const { h, cmds } = await flySetup();
     try {
@@ -1748,4 +1748,210 @@ test("parseRecook: true, {sequences, mode}; other modes, empty lists and unknown
   assert.equal(p(false).r, undefined);
   assert.deepEqual(p({ sequences: [9031, 9031], mode: "merge" }).r, { mode: "merge", sequences: [9031] });
   for (const bad of [{ mode: "overwrite" }, { sequences: [] }, { sequence: [1] }, "yes"]) assert.ok(p(bad).errors.length, JSON.stringify(bad));
+});
+
+// ---- The same 2 steps on lines of other selections: a duplicate only on the same Group and MAtricks. The read-back
+// tells the lines apart by their group's fixtures (a line split by family or by group is the normal case).
+const TWIN_FIXTURES: Record<number, string[]> = { 9000: ["1", "2"], 9001: ["3", "4"] };
+
+/** multiSetup whose lines carry their own group: Assign Group retargets a line, its cooked values sit on its group's fixtures. */
+async function twinCreateSetup() {
+  const s = await multiSetup();
+  const { h, cmds, lines } = s;
+  const groupOf = new Map<number, number>();
+  const speeds = new Map<number, number>();
+  const prev = h.fake.handlerFor("cmd")!;
+  h.fake.on("cmd", async (args, req) => {
+    const m = String(args.command).match(/^Assign Group (\d+) At Preset 21\.9000\.(\d+)$/);
+    if (m) {
+      cmds.push(String(args.command));
+      groupOf.set(Number(m[2]), Number(m[1]));
+      return { feedback: "OK" };
+    }
+    return prev(args, req);
+  });
+  const prevSet = h.fake.handlerFor("set")!;
+  h.fake.on("set", async (args, req) => {
+    const m = String(args.ref).match(/^Preset 21\.9000\.(\d+)$/);
+    if (m && args.property === "SPEEDX") speeds.set(Number(m[1]), Number(args.value));
+    return prevSet(args, req);
+  });
+  const g = (line: number) => groupOf.get(line) ?? 9000;
+  h.fake.on("objects", (a) => {
+    const known = ["Group 9000", "Group 9001", "Shape 1", "MAtricks 9000", "MAtricks 9001"].includes(String(a.ref));
+    return { total: known ? 1 : 0, items: known ? [{ name: "x" }] : [], offset: 0, count: known ? 1 : 0 };
+  });
+  h.fake.on("group.read", (a) => ({ ref: a.ref, truncated: false, items: TWIN_FIXTURES[Number(String(a.ref).replace(/^Group /, ""))].map((fixture) => ({ fixture, sfIndex: 500 + Number(fixture) })) }));
+  h.fake.on("children", (a) => shapeChildren(String(a.ref)) ?? { total: lines.length, offset: 0, count: lines.length, items: lines.map((_, i) => ({ class: "PhaserRecipe", index: i + 1, fields: { Selection: { class: "Group", index: g(i + 1) }, MAtricks: { class: "MAtrick", index: 9000 }, FailedCookedPart: "None" } })) });
+  h.fake.on("preset.read", (a) => {
+    const ref = String(a.ref);
+    if (/^Preset (1\.900[01]|4\.900[01])$/.test(ref)) return { ref, rows: [], dependencies: [] };
+    if (ref !== "Preset 21.9000" || !s.c.preset) throw new BridgeReplyError(`no object found for '${ref}'`);
+    const rows = lines.flatMap((st, i) =>
+      TWIN_FIXTURES[g(i + 1)].map((fixture) => ({ fixture, attribute: "Dimmer", cooked: true, stepCount: 2, speed: (speeds.get(i + 1) ?? speeds.get(1) ?? 60) / 60, steps: st.map((p, n) => ({ step: n + 1, integrated: { valid: true, pool: Number(p.split(".")[0]), no: Number(p.split(".")[1]) }, trans: 100, accel: -100, decel: -100 })) })),
+    );
+    return { ref, rows, dependencies: [] };
+  });
+  return s;
+}
+
+const TWINS = {
+  action: "create",
+  preset: "21.9000",
+  name: "TEST PH SPLIT",
+  lines: [
+    { selection: 9000, steps: [{ preset: "1.9001" }, { preset: "1.9000" }], matricks: 9000, speed_bpm: 120 },
+    { selection: 9001, steps: [{ preset: "1.9001" }, { preset: "1.9000" }], matricks: 9000, speed_bpm: 30 },
+  ],
+  exclusive: true,
+};
+
+test("create with lines: the same 2 steps on other groups are accepted, each line's values told apart by its group's fixtures", async () => {
+  const { h, cmds, lines } = await twinCreateSetup();
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", TWINS);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    // Each line has its own speed: only possible if the read-back attributes line 2's values (fixtures 3, 4) to line 2.
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.deepEqual(lines, [["1.9001", "1.9000"], ["1.9001", "1.9000"]]);
+    assert.ok(cmds.includes("Assign Group 9001 At Preset 21.9000.2"));
+    assert.ok(!(result.warnings ?? []).some((w: string) => /cannot be told apart/.test(w)), "disjoint groups are not ambiguous");
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with lines: a twin whose values do not run at its speed is a mismatch (the lines are really told apart)", async () => {
+  const { h, c } = await twinCreateSetup();
+  try {
+    c.speed = "60.00";
+    h.fake.on("set", (args) => ({ value: args.property === "Name" ? String(args.value) : `${Number(args.value).toFixed(2)}` })); // speeds never recorded: every value runs at 60 BPM
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", TWINS);
+    assert.equal(isError, true);
+    assert.match(result.verification.detail, /line 1: 2 value\(s\) do not run at 120 BPM|line 2: 2 value\(s\) do not run at 30 BPM/);
+  } finally {
+    await h.close();
+  }
+});
+
+test("create with lines: the same steps on the same group and MAtricks are refused, naming the selection; another MAtricks on the same group is accepted", async () => {
+  {
+    const { h, cmds } = await twinCreateSetup();
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", { ...TWINS, lines: [TWINS.lines[0], { ...TWINS.lines[1], selection: 9000 }] });
+      assert.equal(isError, true);
+      assert.match(text, /lines 1 and 2 have the same 2 step presets \(1\.9001\/1\.9000\) on the same selection \(Group 9000, MAtricks 9000\)/);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    const { h, cmds } = await twinCreateSetup();
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...TWINS, preview: true, lines: [TWINS.lines[0], { ...TWINS.lines[1], selection: 9000, matricks: 9001 }] });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.preview, true);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+/** editSetup with the groups' fixtures readable (group.read), as 9001 = 251, 252 and 9000 = 101 in its cooked rows. */
+async function twinEditSetup(initial: FLine[]) {
+  const s = await editSetup(initial);
+  s.h.fake.on("group.read", (a) => {
+    const n = Number(String(a.ref).replace(/^Group /, ""));
+    return { ref: a.ref, truncated: false, items: (n === 9001 ? ["251", "252"] : ["101"]).map((fixture) => ({ fixture, sfIndex: 700 + Number(fixture) })) };
+  });
+  return s;
+}
+
+test("set / add_line: the same 2 steps as another line on another group are accepted and read back per line", async () => {
+  const same = [fline(9001, "1.9010", "1.9011", 120), fline(9000, "4.9000", "4.9001", 30)];
+  {
+    // set: line 2 takes line 1's steps (on its own group 9000), at its own speed.
+    const { h, lines, cmds } = await twinEditSetup(same);
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9005", line: 2, steps: [{ preset: "1.9010" }, { preset: "1.9011" }], speed_bpm: 45 });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.deepEqual(lines.map((l) => l.steps.map((x) => x.preset)), [["1.9010", "1.9011"], ["1.9010", "1.9011"]]);
+      assert.equal(lines[0].speedHz, 2, "line 1 untouched");
+      assert.equal(lines[1].speedHz, 0.75);
+      assert.ok(cmds.includes("Assign Preset 1.9010 At Preset 21.9005.2.1.1.1"));
+      assert.ok(!(result.warnings ?? []).some((w: string) => /cannot be told apart/.test(w)));
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    // add_line: a copy of line 1 on group 9000 with the same steps.
+    const { h, lines } = await twinEditSetup([same[0]]);
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "add_line", preset: "21.9005", selection: 9000, steps: [{ preset: "1.9010" }, { preset: "1.9011" }], speed_bpm: 30 });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.equal(lines.length, 2);
+      assert.deepEqual([lines[0].group, lines[1].group], [9001, 9000]);
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    // set an edit on line 1 while line 2 has the same steps on another group: line 2's values stay, line 1's speed is read on its own fixtures.
+    const { h } = await twinEditSetup([fline(9001, "1.9010", "1.9011", 120), fline(9000, "1.9010", "1.9011", 30)]);
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9005", line: 1, speed_bpm: 90 });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    } finally {
+      await h.close();
+    }
+  }
+  {
+    // remove_line of a twin: the other keeps its values.
+    const { h, lines } = await twinEditSetup([fline(9001, "1.9010", "1.9011", 120), fline(9000, "1.9010", "1.9011", 30)]);
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "remove_line", preset: "21.9005", line: 1 });
+      assert.equal(isError, false, JSON.stringify(result, null, 1));
+      assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+      assert.deepEqual(lines.map((l) => l.group), [9000]);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("set / add_line: the same 2 steps on the same group and MAtricks are refused, naming the selection", async () => {
+  const dup = [fline(9001, "1.9010", "1.9011", 120), fline(9000, "4.9000", "4.9001", 30)];
+  for (const args of [
+    { action: "set", preset: "21.9005", line: 2, steps: [{ preset: "1.9010" }, { preset: "1.9011" }], selection: 9001 },
+    { action: "add_line", preset: "21.9005", selection: 9001, steps: [{ preset: "1.9010" }, { preset: "1.9011" }] },
+  ]) {
+    const { h, cmds } = await twinEditSetup(dup);
+    try {
+      const { isError, text } = await h.callJson("gma3_edit_phaser_recipe", args);
+      assert.equal(isError, true);
+      assert.match(text, /line 1 already has the step presets 1\.9010\/1\.9011 on the same selection \(Group 9001, MAtricks 9000\)/);
+      assert.deepEqual(cmds, []);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("set: the same steps on the same group with another MAtricks are accepted; their values (the same fixtures) are warned about, not compared per line", async () => {
+  const { h, lines } = await twinEditSetup([fline(9001, "1.9010", "1.9011", 120), { ...fline(9001, "1.9010", "1.9011", 30), matricks: 9001 }]);
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9005", line: 2, speed_bpm: 45 });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.equal(lines[1].speedHz, 0.75);
+    assert.match(result.warnings.join(" "), /lines 1 and 2: the same step presets on selections that share fixtures/);
+  } finally {
+    await h.close();
+  }
 });

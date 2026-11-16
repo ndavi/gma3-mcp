@@ -540,6 +540,18 @@ keeps line 1's speed, phase and measure unless it sets its own (they are written
 trans and widths are written after the copies, so a copy starts from the shape's. A cue calls the preset with one standard line, and every
 line cooks into it at its own speed. A Speed X on that cue line replaces the speed of every line.
 
+**Same steps on several lines (one effect split by family or group).** Two lines with the same 2 step presets (or hard
+values) are a duplicate only when they act on the **same selection**: the same Group and the same MAtricks (lines 2+ keep
+line 1's MAtricks unless they give one). That is refused, in `create`, `add_line` and `set`, naming the selection:
+two identical lines would cook the same values twice. The same steps on lines of **other groups** (or another MAtricks)
+are allowed. A line is identified by its index (`line`, which `set` and `remove_line` take; the lines after a removed
+one move up), and the read-back identifies a cooked value by its steps **and** its line's selection: when a line has such
+a twin, the cooked values on the fixtures of its group are its own (the group is read once, `group.read`), so its speed,
+curves, trans, width and measure are compared on those values only, and the twin's values count as "other lines
+unchanged". Twins whose selections share fixtures (the same group with another MAtricks, or overlapping groups) cannot be
+told apart by fixture: the call warns, the line's evidence (it cooked) is still checked, but speed, curves, trans and
+width of the shared values are not compared per line.
+
 **Curves.** `curve` is one of `linear`, `ease_in`, `ease_out`, `ease_in_out`, `swing`, `snap`, or `reset` (back to
 the shape's curve). It is sent from the command line,
 `Set Preset P.N.L.1.<step>.<source> Property "Curve" "<Linear|Ease In|Ease Out|Ease In and Out|Swing|Snap|Reset>"`,
@@ -631,8 +643,8 @@ the name, then the Cook. A failed command stops the edit; a failed setting is re
 custom curve stays** (`curve: "reset"` takes it back to the shape's).
 
 Checked first, nothing sent otherwise: the preset and the line exist; each value source's 2 presets come from one
-preset pool, hold the source's attribute and are not the preset itself; no other line has the same 2 step presets
-(or hard values) on the same attribute (a source left to the shape's value on two lines is allowed: its values are only checked where
+preset pool, hold the source's attribute and are not the preset itself; no other line **on the same selection** (Group and
+MAtricks) has the same 2 step presets (or hard values) on the same attribute (a source left to the shape's value on two lines is allowed: its values are only checked where
 one line alone can have made them); group, shape, MAtricks and step presets exist; no dialog is open; the Edit Recipe
 mode is off.
 
