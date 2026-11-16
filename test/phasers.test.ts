@@ -100,7 +100,8 @@ test("physical values convert through the range, relative values through its siz
   const row = (from: number, to: number, rel: number, abs: number): Row => ({ subfixtureIndex: 2, fid: "601", attribute: "Pan", stepCount: 2, physicalFrom: from, physicalTo: to, steps: [{ relative: rel }, { absolute: abs }], phaser: { gridPos: 0 } });
   const s = new Map([[2, "601"]]);
   assert.deepEqual(verifyBuild({ effect: e, rows: [row(-225, 225, 6.667, 40)], scope: s, implied: new Set(), stepPresets: [] }).problems, []);
-  assert.deepEqual(verifyBuild({ effect: e, rows: [row(270, -270, 5.556, 58.333)], scope: s, implied: new Set(), stepPresets: [] }).problems, [], "reversed range: relative stays positive");
+  assert.deepEqual(verifyBuild({ effect: e, rows: [row(270, -270, 5.556, 41.667)], scope: s, implied: new Set(), stepPresets: [] }).problems, [], "reversed range: relative stays positive, absolute is the console percent (ascending physical value)");
+  assert.match(verifyBuild({ effect: e, rows: [row(270, -270, 5.556, 58.333)], scope: s, implied: new Set(), stepPresets: [] }).problems.join(), /absolute 41.6667 % expected, 58.333 read/, "a DMX-ordered percent is not the console's");
   assert.match(verifyBuild({ effect: e, rows: [{ ...row(-225, 225, 6.667, 40), physicalFrom: undefined }], scope: s, implied: new Set(), stepPresets: [] }).problems.join(), /physical range of Pan is unknown/);
 });
 

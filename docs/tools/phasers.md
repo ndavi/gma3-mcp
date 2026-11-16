@@ -141,7 +141,10 @@ a template.
    - Step timing and the phaser layers are checked on **every** attribute of the effect: the explicit ones, those a
      step preset brought, and activation-group siblings.
    - Each step has its value (percent; physical values converted through the attribute's range, relative values
-     through its size) and its timing.
+     through its size) and its timing. The percent follows the ascending physical value, so on an inverted range
+     (`physicalFrom` > `physicalTo`, e.g. Esprite Tilt 131.8 → −131.8) it is 100 − DMX %; relative values stay a share
+     of the range's size. The step read-back shares the programmer value's convention (same API field) but an absolute
+     step on an inverted range has not been measured on a console.
    - Each step preset is referenced by every fixture in its step, and no other preset is referenced there.
    - Speed, measure and speed master match, and every fixture has the expected phase for its grid position and the
      repetition (`0 Thru 360` as one cycle, see above).

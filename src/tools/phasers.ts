@@ -37,6 +37,7 @@ import { operation, type RegisterTools, type ToolContext } from "./context.js";
 import { expandFixtures } from "./groups.js";
 import { prepareStorePreset, presetId, readPoolNames, nameHolder, sameName, ALL_POOLS, ON_NAME_TAKEN, STEP_DEFAULTS, type OnNameTaken, type PoolNames, type ProgrammerRow, type PresetContext, type PresetRead } from "./presets.js";
 import { formatValue } from "./fixtures.js";
+import { physicalToPercent } from "./physicalrange.js";
 import {
   asRead,
   buildResult,
@@ -490,8 +491,9 @@ function expectedPercent(v: number, kind: "absolute" | "relative", unit: Unit, r
   const to = row.physicalTo;
   if (typeof from !== "number" || typeof to !== "number" || to === from) return `the physical range of ${row.attribute} is unknown`;
   // A relative value is a share of the range's size: a fixture with a reversed range (from > to) still reads +30° as
-  // a positive percentage (Thrill Mini Profile Pan, SB-04 probe).
-  return kind === "absolute" ? ((v - from) / (to - from)) * 100 : (v / Math.abs(to - from)) * 100;
+  // a positive percentage (Thrill Mini Profile Pan, SB-04 probe). An absolute value is the console percent, which
+  // follows the ascending physical value, so on a reversed range it is 100 - DMX % (see physicalrange.ts).
+  return kind === "absolute" ? physicalToPercent(v, from, to) : (v / Math.abs(to - from)) * 100;
 }
 
 const near = (a: unknown, b: unknown, tol: number) => typeof a === "number" && typeof b === "number" && Math.abs(a - b) <= tol;

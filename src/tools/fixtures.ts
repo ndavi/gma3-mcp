@@ -50,6 +50,7 @@ import {
 } from "../results.js";
 import { Validator, attributeName, exactlyOne, finiteNumber, fixtureSelection, oneOf, percent } from "../validate.js";
 import { exists, readFields } from "./common.js";
+import { dmxOfPhysical, hasPhysicalSpan, parsePhysicalSets, percentToPhysical, physicalOfDmx, physicalToPercent, type ChannelSetRow } from "./physicalrange.js";
 
 // ---------------------------------------------------------------------------
 // Constants and local helpers
@@ -324,6 +325,7 @@ interface ProgrammerRow {
   fixture?: string | null;
   fid?: string | null;
   subfixtureIndex?: number;
+  uiChannel?: number;
   attribute?: string | null;
   value?: number;
   valueRaw?: number;
@@ -420,7 +422,8 @@ export function expectedPercent(exp: Expectation, row: ProgrammerRow): { percent
     const to = row.physicalTo;
     if (typeof from !== "number" || typeof to !== "number") return { reason: `the physical range of ${exp.attribute} is not available for this fixture` };
     if (to === from) return { reason: `the physical range of ${exp.attribute} is empty (${from}..${to})` };
-    return { percent: ((exp.value - from) / (to - from)) * 100 };
+    // The console percent follows the ascending physical value, so an inverted range (from > to) is 100 - DMX %.
+    return { percent: physicalToPercent(exp.value, from, to) };
   };
   switch (exp.unit) {
     case "percent":
@@ -474,7 +477,29 @@ interface FixtureVerdict {
   rowsChecked: number;
   /** Subfixtures that have the attribute(s) and were therefore judged. */
   cellsJudged: number;
+  /** Physical-unit mismatches against the function range, settled against the channel sets by `settlePhysicalDoubts`. */
+  doubts?: PhysicalDoubt[];
 }
+
+/**
+ * A physical value that did not match through the channel function's PhysicalFrom..To. Some functions carry channel
+ * sets with their own physical ranges (Esprite Gobo2Pos: function 0..360, sets -180..180), which the console uses to
+ * convert; the mismatch is only final once the sets have been looked at (see physicalrange.ts).
+ */
+interface PhysicalDoubt {
+  label: string;
+  cell: string;
+  /** `Fixture <fid>` when the entry is a real fixture the plugin can read, else null (a cell without FID). */
+  ref: string | null;
+  exp: Expectation;
+  row: ProgrammerRow;
+  /** The mismatch text against the function range, used when the channel sets do not change the verdict. */
+  problem: string;
+}
+
+/** Is this comparison done in physical units (sent as physical, or a readout that reads physical)? */
+const isPhysicalComparison = (exp: Expectation, row: ProgrammerRow): boolean =>
+  exp.unit === "physical" || ((exp.unit === "natural" || exp.unit === "readout") && (row.readout ?? "").toLowerCase() === "physical");
 
 const hasAttribute = (entry: ScannedFixture, attribute: string): boolean => (entry.attributes ?? []).some((a) => a.toLowerCase() === attribute.toLowerCase());
 
@@ -526,14 +551,109 @@ function judgeFixture(label: string, key: string, entries: ScannedFixture[], row
           continue;
         }
         if (Math.abs(row.value - want.percent) > VERIFY_TOLERANCE_PERCENT) {
-          const physical = typeof row.physicalFrom === "number" && typeof row.physicalTo === "number" ? ` = ${formatValue(row.physicalFrom + (row.value / 100) * (row.physicalTo - row.physicalFrom))} ${row.physicalUnit ?? ""}`.trimEnd() : "";
-          verdict.problems.push(`${label}${cell}: ${exp.attribute} reads ${formatValue(row.value)} % of range${physical}, expected ${formatValue(want.percent)} % (${formatValue(exp.value)} ${exp.unit})`);
+          const physical = typeof row.physicalFrom === "number" && typeof row.physicalTo === "number" ? ` = ${formatValue(percentToPhysical(row.value, row.physicalFrom, row.physicalTo))} ${row.physicalUnit ?? ""}`.trimEnd() : "";
+          const text = `${label}${cell}: ${exp.attribute} reads ${formatValue(row.value)} % of range${physical}, expected ${formatValue(want.percent)} % (${formatValue(exp.value)} ${exp.unit})`;
+          if (isPhysicalComparison(exp, row)) {
+            // Not final: the channel sets may carry the range the console really applies.
+            (verdict.doubts ??= []).push({ label, cell, ref: e.fid && e.fid !== "None" ? `Fixture ${e.fid}` : null, exp, row, problem: text });
+          } else verdict.problems.push(text);
         }
       }
     }
   }
   verdict.cellsJudged = judged.size;
   return verdict;
+}
+
+interface AttributeSetsRow {
+  uiChannel?: number | null;
+  attribute?: string | null;
+  channelFunction?: string | null;
+  dmxTo?: string | null;
+  channelSets?: ChannelSetRow[] | null;
+}
+
+/** One 8-bit step on the 24-bit scale: the read-back DMX is quantised at least that coarsely (SU-11). */
+const DMX_STEP_24 = 65536;
+
+/**
+ * Settle the physical-unit mismatches found against the channel function range. The console converts a physical value
+ * through the channel set that holds it when the function's sets carry physical ranges (Esprite Gobo2Pos: function
+ * 0..360, sets -180..180, `At Absolute Physical 100` -> DMX 50891), so each doubt reads the attribute's channel sets
+ * (`fixtureAttributes`, once per fixture) and compares the programmer's raw DMX with the DMX the sets give for the
+ * value sent:
+ *  - matches: the value is right, no problem (a warning says the sets, not the function range, were used);
+ *  - differs: a real mismatch, reported in DMX and in the sets' physical value;
+ *  - the value falls in no set: unavailable, the range cannot be established;
+ *  - no set carries a physical range, or the sets or the raw DMX could not be read: the mismatch against the function
+ *    range stands, with the reason.
+ */
+async function settlePhysicalDoubts(bridge: Gma3Bridge, verdicts: FixtureVerdict[], steps: StepResult[], warnings: string[]): Promise<void> {
+  const reads = new Map<string, Promise<AttributeSetsRow[] | string>>();
+  const readSets = (ref: string): Promise<AttributeSetsRow[] | string> => {
+    let p = reads.get(ref);
+    if (!p) {
+      p = (async () => {
+        try {
+          const res = (await bridge.request("fixtureAttributes", { ref, limit: 500, includeChannelSets: true })) as { attributes?: AttributeSetsRow[] };
+          steps.push({ name: "read_channel_sets", kind: "read", status: "succeeded", op: "fixtureAttributes", detail: { ref } });
+          return res.attributes ?? [];
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          steps.push({ name: "read_channel_sets", kind: "read", status: "failed", op: "fixtureAttributes", error: message });
+          return message;
+        }
+      })();
+      reads.set(ref, p);
+    }
+    return p;
+  };
+  const noted = new Set<string>();
+  for (const v of verdicts) {
+    for (const d of v.doubts ?? []) {
+      const where = `${d.label}${d.cell}: ${d.exp.attribute}`;
+      const keep = (why: string) => v.problems.push(`${d.problem} (${why})`);
+      if (d.ref === null) {
+        keep("channel sets not checked: the cell has no FID to read them from");
+        continue;
+      }
+      const attrs = await readSets(d.ref);
+      if (typeof attrs === "string") {
+        keep(`channel sets could not be read: ${attrs}`);
+        continue;
+      }
+      const named = attrs.filter((a) => (a.attribute ?? "").toLowerCase() === d.exp.attribute.toLowerCase());
+      const entry = named.find((a) => a.uiChannel != null && a.uiChannel === d.row.uiChannel) ?? named[0];
+      const sets = parsePhysicalSets(entry?.channelSets, entry?.dmxTo);
+      if (!entry || !hasPhysicalSpan(sets)) {
+        // No channel set carries a physical range: the function range is the only one there is, and it was used.
+        v.problems.push(d.problem);
+        continue;
+      }
+      const raw = d.row.valueRaw;
+      if (typeof raw !== "number") {
+        keep("channel sets carry their own physical ranges but the programmer row has no raw DMX value to compare with");
+        continue;
+      }
+      const want = dmxOfPhysical(d.exp.value, sets);
+      if (!want) {
+        v.unavailable.push(`${where}: ${formatValue(d.exp.value)} ${d.exp.unit} falls in none of the channel sets' physical ranges, so the DMX the console applies cannot be established (the function range ${formatValue(d.row.physicalFrom ?? NaN)}..${formatValue(d.row.physicalTo ?? NaN)} does not hold: its channel sets span ${sets.map((s) => `${s.name || "(unnamed)"} ${formatValue(s.physicalFrom)}..${formatValue(s.physicalTo)}`).join(", ")})`);
+        continue;
+      }
+      const tolerance = Math.max((VERIFY_TOLERANCE_PERCENT / 100) * Math.abs(want.set.dmxTo - want.set.dmxFrom), DMX_STEP_24);
+      if (Math.abs(raw - want.dmx) <= tolerance) {
+        const note = `${d.exp.attribute} physical values are converted through the channel sets (here "${want.set.name || "(unnamed)"}" ${formatValue(want.set.physicalFrom)}..${formatValue(want.set.physicalTo)}), not through the function range ${formatValue(d.row.physicalFrom ?? NaN)}..${formatValue(d.row.physicalTo ?? NaN)}${d.row.channelFunction ? ` of ${d.row.channelFunction}` : ""}`;
+        if (!noted.has(note)) {
+          noted.add(note);
+          warnings.push(note);
+        }
+        continue;
+      }
+      const got = physicalOfDmx(raw, sets);
+      const reading = got ? ` = ${formatValue(got.physical)} in channel set "${got.set.name || "(unnamed)"}"` : "";
+      v.problems.push(`${where} reads DMX ${hex24(raw)}${reading}, expected ${formatValue(d.exp.value)} ${d.exp.unit} (DMX ${hex24(Math.round(want.dmx))} in channel set "${want.set.name || "(unnamed)"}" ${formatValue(want.set.physicalFrom)}..${formatValue(want.set.physicalTo)})`);
+    }
+  }
 }
 
 /**
@@ -628,6 +748,7 @@ export async function verifyProgrammer(bridge: Gma3Bridge, expectations: Expecta
     }
   }
 
+  await settlePhysicalDoubts(bridge, verdicts, steps, warnings);
   const problems = verdicts.flatMap((v) => v.problems);
   unavailableReasons.push(...verdicts.flatMap((v) => v.unavailable));
   const summary: Record<string, unknown> = {

@@ -607,6 +607,88 @@ test("read-back: degrees are converted through each fixture's physical range", a
   assert.match(r.result.verification.detail, /physical range of Pan is not available/);
 });
 
+test("read-back: an inverted physical range reads back the console percent (ascending physical value), not DMX order", async () => {
+  // Robin Esprite Tilt 131.8 -> -131.8: 71.37 deg outputs +71.4 deg, `value` 77.0865 % (DMX 22.91 %).
+  const esprite = (value: number) => row("1", 11, "Tilt", value, { physicalFrom: 131.8, physicalTo: -131.8 });
+  script({ selectionCount: 1, programmer: { scanned: [twoFixtures.scanned[0]], rows: [esprite(77.0865)] } });
+  let r = await h.callJson("gma3_set_attributes", { use_selection: true, values: [{ attribute: "Tilt", value: 71.37, unit: "physical" }] });
+  assert.equal(r.result.verification.status, "matched", r.result.verification.detail);
+  script({ selectionCount: 1, programmer: { scanned: [twoFixtures.scanned[0]], rows: [esprite(16.1229)] } });
+  r = await h.callJson("gma3_set_position", { use_selection: true, tilt: -89.32, unit: "degrees" });
+  assert.equal(r.result.verification.status, "matched", r.result.verification.detail);
+  // LEDBeam 350 Tilt 114 -> -114: 71.37 deg reads 81.32 %.
+  script({ selectionCount: 1, programmer: { scanned: [twoFixtures.scanned[0]], rows: [row("1", 11, "Tilt", 81.32, { physicalFrom: 114, physicalTo: -114 })] } });
+  r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Tilt", value: 71.37, unit: "physical" });
+  assert.equal(r.result.verification.status, "matched", r.result.verification.detail);
+  // The DMX-ordered percent (22.91 %) is a real mismatch, and the physical angle shown is read through the same convention.
+  script({ selectionCount: 1, programmer: { scanned: [twoFixtures.scanned[0]], rows: [esprite(22.9249)] } });
+  r = await h.callJson("gma3_set_attributes", { use_selection: true, values: [{ attribute: "Tilt", value: 71.37, unit: "physical" }] });
+  assert.equal(r.result.verification.status, "mismatched");
+  assert.match(r.result.verification.detail, /Tilt reads 22.9249 % of range = -71.3/);
+  assert.match(r.result.verification.detail, /expected 77.0751 % \(71.37 physical\)/);
+});
+
+/**
+ * Robe Esprite Gobo2Pos (16 bit): the programmer row reads the function "Gobo2 Pos Index" as 0..360, but its channel sets
+ * are "Gobo indexing min" -180..-1, "center" 0 and "Gobo indexing max" 1..180 (GDTF of the ma3 library). Bench 16/11/2026:
+ * `At Absolute Physical 100` -> DMX 50891 (valueRaw 50891 x 256); the percent `value` below (77.65) is derived, DMX 50891
+ * of 65535, not measured. Sets in the 24-bit scale, as the bridge returns them.
+ */
+const goboSets = [
+  { name: "Gobo indexing min", dmxFrom: "000100", dmxTo: "7FFFFF", physicalFrom: -180, physicalTo: -1 },
+  { name: "Gobo indexing center", dmxFrom: "800000", dmxTo: "8000FF", physicalFrom: 0, physicalTo: 0 },
+  { name: "Gobo indexing max", dmxFrom: "800100", dmxTo: "FFFFFF", physicalFrom: 1, physicalTo: 180 },
+];
+function gobo2Pos(dmx16: number, sets: unknown, extra: Partial<FakeRow> = {}) {
+  const st = script(
+    { attributes: ["Dimmer", "Gobo2Pos"], selectionCount: 1, programmer: { scanned: [{ subfixtureIndex: 11, fid: "1", name: "Esprite 1" }], rows: [row("1", 11, "Gobo2Pos", (dmx16 / 65535) * 100, { physicalFrom: 0, physicalTo: 360, readout: "Physical", physicalUnit: "Angle", channelFunction: "Gobo2 Pos Index", valueRaw: dmx16 * 256, ...extra })] } },
+  );
+  h.fake.on("fixtureAttributes", () => {
+    if (sets === "error") throw new Error("no object found");
+    return { name: "Esprite 1", fid: "1", total: 1, count: 1, offset: 0, subfixtureCount: 0, attributes: [{ attribute: "Gobo2Pos", channelFunction: "Gobo2 Pos Index", dmxFrom: "000000", dmxTo: "FFFFFF", physicalFrom: 0, physicalTo: 360, channelSets: sets }], limitations: [] };
+  });
+  return st;
+}
+
+test("read-back: a physical value on a channel function whose sets are centred (-180..180) is judged through the sets, not the 0..360 function range", async () => {
+  gobo2Pos(50891, goboSets);
+  const r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 100, unit: "physical", check_attributes: false });
+  assert.equal(r.result.verification.status, "matched", r.result.verification.detail);
+  assert.ok(r.result.warnings.some((w: string) => /Gobo2Pos physical values are converted through the channel sets .*"Gobo indexing max" 1\.\.180.*not through the function range 0\.\.360 of Gobo2 Pos Index/.test(w)), r.result.warnings.join("|"));
+  assert.equal(h.fake.requests.filter((q) => q.op === "fixtureAttributes").length, 1);
+  // The same on set_attributes and a negative angle (set "min": 100 degrees below zero is DMX 14645).
+  gobo2Pos(14645, goboSets);
+  const r2 = await h.callJson("gma3_set_attributes", { use_selection: true, values: [{ attribute: "Gobo2Pos", value: -100, unit: "physical" }], check_attributes: false });
+  assert.equal(r2.result.verification.status, "matched", r2.result.verification.detail);
+  gobo2Pos(32768, goboSets);
+  const r3 = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 0, unit: "physical", check_attributes: false });
+  assert.equal(r3.result.verification.status, "matched", r3.result.verification.detail);
+});
+
+test("read-back: a wrong DMX on that channel is still a mismatch, reported in DMX and in the sets' physical value", async () => {
+  gobo2Pos(40000, goboSets); // a DMX that is neither 100 degrees through the sets (50891) nor through the function range
+  const r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 100, unit: "physical", check_attributes: false });
+  assert.equal(r.result.verification.status, "mismatched");
+  assert.match(r.result.verification.detail, /Gobo2Pos reads DMX 0x9C4000 = 40\.\d+ in channel set "Gobo indexing max", expected 100 physical \(DMX 0xC6CB\d\d in channel set "Gobo indexing max" 1\.\.180\)/);
+});
+
+test("read-back: a physical value that falls in no channel set is unavailable (not a blocking mismatch); no set range keeps the old mismatch", async () => {
+  gobo2Pos(50891, goboSets);
+  let r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 0.5, unit: "physical", check_attributes: false });
+  assert.equal(r.result.verification.status, "unavailable");
+  assert.match(r.result.verification.detail, /0\.5 physical falls in none of the channel sets/);
+  // No set with a physical span: the function range is the only one, the mismatch against it stands.
+  gobo2Pos(50891, [{ name: "Open", dmxFrom: "000000", dmxTo: "FFFFFF", physicalFrom: 0, physicalTo: 0 }]);
+  r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 100, unit: "physical", check_attributes: false });
+  assert.equal(r.result.verification.status, "mismatched");
+  assert.match(r.result.verification.detail, /Gobo2Pos reads 77\.\d+ % of range = 279\.\d+ Angle, expected 27\.7778 % \(100 physical\)$/);
+  // The channel sets cannot be read: same mismatch, with the reason.
+  gobo2Pos(50891, "error");
+  r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Gobo2Pos", value: 100, unit: "physical", check_attributes: false });
+  assert.equal(r.result.verification.status, "mismatched");
+  assert.match(r.result.verification.detail, /expected 27\.7778 % \(100 physical\) \(channel sets could not be read: no object found\)/);
+});
+
 test("read-back: decimal and readout units are interpreted; an unknown readout is unavailable", async () => {
   script({ selectionCount: 1, programmer: { scanned: [twoFixtures.scanned[0]], rows: [row("1", 11, "Dimmer", 50.196, { valueRaw: 0x808080 })] } });
   let r = await h.callJson("gma3_set_attribute", { use_selection: true, attribute: "Dimmer", value: 128, unit: "decimal8" });

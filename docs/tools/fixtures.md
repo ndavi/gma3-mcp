@@ -145,6 +145,24 @@ programmer for the current selection through the `programmer` bridge op and comp
   function range (`physicalFrom`..`physicalTo` from the same row); `natural` and no unit through the
   attribute's natural readout (`Percent` or `Physical`). When a range or readout is unknown the result is
   `unavailable`, not a guess. A multi-step phaser on the attribute is a mismatch (it is not the static value).
+* **Inverted physical ranges** (`physicalFrom` > `physicalTo`: Robin Esprite Tilt 131.8 → −131.8, LEDBeam 350 Tilt
+  114 → −114, Esprite Zoom 50 → 5): `At Absolute Physical` is exact in physical units, but the console's percent
+  (`At Absolute Percent`, and the `value` the read-back returns) follows the **ascending physical value**, not DMX
+  order: percent = (physical − min) / (max − min) × 100 = 100 − DMX %. The comparison and the physical value shown in a
+  mismatch use that convention (Esprite Tilt +71.37° expects 77.08 %, console onPC 2.5.1 read 77.0865 % with DMX
+  22.91 %). Non-inverted ranges are unchanged. A `percent` value sent to such an attribute is a percent of the
+  ascending range, so 22.92 % is −71.39°, not +71.4°; send `physical` when an angle is meant.
+* **Channel sets with their own physical range** (Robe Esprite `Gobo2Pos`, function "Gobo2 Pos Index": the function
+  says 0..360, its sets say "Gobo indexing min" −180..−1, "center" 0, "Gobo indexing max" 1..180). The console converts a
+  physical value through the channel set that holds it: `At Absolute Physical 100` output DMX 50891 (onPC 2.5.1,
+  16/11/2026), not the 18204 of the function range. A physical value that does not match through the function range is
+  therefore settled against the sets (one `fixtureAttributes` read with `includeChannelSets` per fixture): the row's raw
+  DMX is compared with the DMX the sets give for the value sent (tolerance 0.5 % of the set, at least one 8-bit step).
+  It matches: no problem, and a warning names the set used. It differs: mismatch, in DMX and in the set's physical
+  value. The value falls in no set (e.g. 0.5 between "center" and "max"): `unavailable`. No set carries a physical
+  range, the sets cannot be read, or the row has no raw DMX: the mismatch against the function range stands, with the
+  reason. Not yet confirmed on a console after this change; the phaser step check (`gma3_build_phaser`) still uses the
+  function range.
 * `decimal8/16/24` values are compared exactly, as DMX values: the row's raw 24-bit value (`valueRaw`) is cut to
   its top 8, 16 or 24 bits (SU-11). The row's percent is a share of the attribute's channel-function range, not of
   the whole channel: Decimal8 104 on a colour wheel whose first function covers DMX 0..127 reads 81.89 %, and a
