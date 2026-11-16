@@ -1865,6 +1865,40 @@ test("create with lines: the same steps on the same group and MAtricks are refus
   }
 });
 
+// Same step presets, one source filtered per attribute (22.1203, 2026-11-16): a filtered source cooks only its
+// attribute, so the lines do not overlap; without an attribute (or with an overlapping one) they do.
+test("create with lines: the same step presets on different attributes are accepted; without an attribute, or the same one, they are refused", async () => {
+  const withAttr = (attribute?: string) => ({ selection: 9000, steps: [{ preset: "1.9001", ...(attribute ? { attribute } : {}) }, { preset: "1.9000", ...(attribute ? { attribute } : {}) }], matricks: 9000, speed_bpm: 120 });
+  const run = async (lines: unknown[]) => {
+    const { h, cmds } = await twinCreateSetup();
+    try {
+      const r = await h.callJson("gma3_edit_phaser_recipe", { ...TWINS, preview: true, lines });
+      return { ...r, cmds };
+    } finally {
+      await h.close();
+    }
+  };
+  {
+    const r = await run([withAttr("Dimmer"), withAttr("Tilt")]);
+    assert.doesNotMatch(r.text, /same 2 step presets/, r.text);
+    assert.deepEqual(r.cmds, []);
+  }
+  for (const [lines, re] of [
+    [[withAttr(), withAttr()], /lines 1 and 2 have the same 2 step presets \(1\.9001\/1\.9000\) on the same selection/],
+    [[withAttr(), withAttr("Pan")], /lines 1 and 2 have the same 2 step presets/],
+    [[withAttr("Pan"), withAttr()], /lines 1 and 2 have the same 2 step presets/],
+    [[withAttr("Pan"), withAttr("pan")], /lines 1 and 2 have the same 2 step presets/],
+  ] as const) {
+    const r = await run([...lines]);
+    assert.equal(r.isError, true);
+    assert.match(r.text, re);
+    assert.deepEqual(r.cmds, []);
+  }
+  // Another group stays accepted, with or without attribute.
+  const other = await run([withAttr(), { ...withAttr(), selection: 9001 }]);
+  assert.doesNotMatch(other.text, /same 2 step presets/, other.text);
+});
+
 /** editSetup with the groups' fixtures readable (group.read), as 9001 = 251, 252 and 9000 = 101 in its cooked rows. */
 async function twinEditSetup(initial: FLine[]) {
   const s = await editSetup(initial);

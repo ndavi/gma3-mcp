@@ -1105,16 +1105,24 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
   if (target) {
     for (const l of specs) if (stepPresets(l).some((s) => s.pool === target.pool && s.number === target.number)) v.fail("a step preset cannot be the target preset itself");
   }
-  // The same 2 steps on the same selection (Group and MAtricks; lines 2+ keep line 1's MAtricks) are a duplicate; on another group or MAtricks they are two lines of one effect (e.g. split by family).
+  // The same 2 steps on the same selection (Group and MAtricks; lines 2+ keep line 1's MAtricks) are a duplicate;
+  // on another group or MAtricks they are two lines of one effect (e.g. split by family). Same rule as set / add_line
+  // (clash): a source filtered on an attribute cooks only that attribute, so two lines with the same step presets on
+  // different attributes do not overlap; a source without an attribute covers every attribute of its preset.
   const selectionOf = (i: number): Selection => ({ group: specs[i].selection, matricks: specs[i].matricks ?? specs[0].matricks ?? null });
-  const seen = new Map<string, number>();
+  const attributeOfLine = (l: LineSpec): string | null => l.steps.map((s) => s.attribute).find((a): a is string => typeof a === "string") ?? null;
+  const seen = new Map<string, number[]>();
   specs.forEach((l, i) => {
     const p = pair(l);
     if (p === null) return;
     const key = `${p}|${selectionOf(i).group}|${selectionOf(i).matricks}`;
-    const first = seen.get(key);
-    if (first !== undefined) v.fail(`lines ${first + 1} and ${i + 1} have the same 2 step presets (${p}) on the same selection (${selectionText(selectionOf(i))}): two identical lines would cook the same values twice; give one of them another group or MAtricks, or drop it`);
-    else seen.set(key, i);
+    const a = attributeOfLine(l);
+    const first = (seen.get(key) ?? []).find((j) => {
+      const b = attributeOfLine(specs[j]);
+      return a === null || b === null || eqi(a, b);
+    });
+    if (first !== undefined) v.fail(`lines ${first + 1} and ${i + 1} have the same 2 step presets (${p}) on the same selection (${selectionText(selectionOf(i))}): two identical lines would cook the same values twice; give one of them another group or MAtricks, another attribute, or drop it`);
+    else seen.set(key, [...(seen.get(key) ?? []), i]);
   });
   if (specs[0]?.matricks !== undefined && specs.some((l) => l.matricks === undefined)) v.fail("lines[0] has a MAtricks and another line has none: the other lines are copies of line 1 and keep its MAtricks; give every line one, or put a line without MAtricks first");
   // Preferred, not required: one family per line (a cue reads more clearly). All-pool step presets may mix families.
