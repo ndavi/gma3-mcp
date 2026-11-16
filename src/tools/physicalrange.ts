@@ -13,6 +13,25 @@
 /** Console percent of a physical value. The caller has checked that the range is not empty (`to !== from`). */
 export const physicalToPercent = (physical: number, from: number, to: number): number => ((physical - Math.min(from, to)) / Math.abs(to - from)) * 100;
 
+/** Is the range inverted (From > To: Esprite Tilt 131.8 -> -131.8)? False when either end is not a number. */
+export const isInvertedRange = (from: unknown, to: unknown): boolean => typeof from === "number" && typeof to === "number" && from > to;
+
+/**
+ * Which attributes of a `fixtureAttributes` read have an inverted range, by lower-case name: true (every entry of the name
+ * with a real range is inverted), false (none is), null (the entries disagree: unknown). A name with no entry that carries
+ * a numeric, non-empty range is left out.
+ */
+export function invertedAttributes(rows: Array<{ attribute?: string | null; physicalFrom?: number | null; physicalTo?: number | null }> | null | undefined): Map<string, boolean | null> {
+  const out = new Map<string, boolean | null>();
+  for (const r of rows ?? []) {
+    const name = (r.attribute ?? "").toLowerCase();
+    if (!name || typeof r.physicalFrom !== "number" || typeof r.physicalTo !== "number" || r.physicalFrom === r.physicalTo) continue;
+    const inv = isInvertedRange(r.physicalFrom, r.physicalTo);
+    out.set(name, out.has(name) && out.get(name) !== inv ? null : inv);
+  }
+  return out;
+}
+
 /** Physical value of a console percent (the reverse of `physicalToPercent`). */
 export const percentToPhysical = (percent: number, from: number, to: number): number => Math.min(from, to) + (percent / 100) * Math.abs(to - from);
 

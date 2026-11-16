@@ -2,10 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { startHarness } from "./helpers/tool-harness.js";
 import { BridgeReplyError } from "./helpers/fake-bridge.js";
-import { registerPhaserRecipeTools, editPhaserRecipe, numberMatches, parseSpeedMaster, yesNoOf } from "../src/tools/phaserrecipes.js";
+import { registerPhaserRecipeTools, editPhaserRecipe, foldInvertedRows, numberMatches, parseSpeedMaster, yesNoOf } from "../src/tools/phaserrecipes.js";
 import { cookedDiff, parseRecook, type RecookDeps } from "../src/tools/phaserrecook.js";
 import { presetUsage } from "../src/tools/analysis.js";
 import { Validator } from "../src/validate.js";
+import { invertedAttributes } from "../src/tools/physicalrange.js";
 
 /**
  * gma3_edit_phaser_recipe against a fake console that models the Edit Recipe facts of onPC 2.5.1 (THK migration
@@ -705,7 +706,7 @@ const STYLE_ATTRS: Record<string, string[]> = { Pan: ["Pan"], Tilt: ["Tilt"], "P
 const HOLDS: Record<string, string[]> = { "1.9020": ["Dimmer"], "1.9021": ["Dimmer"], "2.9020": ["Pan", "Tilt", "PanTiltDistance"], "2.9021": ["Pan", "Tilt", "PanTiltDistance"], "2.9022": ["Pan", "Tilt"] };
 const fromShape = (shape: number): MSource[][] => SHAPES[shape].map((st) => st.map((x) => ({ attribute: x.attribute, preset: null, trans: x.trans, width: x.width })));
 
-async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number; ignoreValues?: boolean; ignoreTransform?: boolean } = {}) {
+async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number; ignoreValues?: boolean; ignoreTransform?: boolean; invertTilt?: boolean; range?: Array<{ attribute: string; physicalFrom: number; physicalTo: number }> | "unreadable" } = {}) {
   const h = await startHarness(registerPhaserRecipeTools);
   const P = "Preset 21.9030";
   const c = { editing: false, pz: null as null | MLine, preset: initial.length > 0, lines: structuredClone(initial), pending: false, name: "", values: 0 };
@@ -728,6 +729,11 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
   });
   h.fake.on("programmer", () => ({ environment: "Normal", total: c.values, count: 0, coverage: { complete: true }, rows: [] }));
   h.fake.on("preset.context", () => ({ preferencesReadable: true, preferences: { RecipeStoreMode: "Normal" } }));
+  // The channel functions' physical ranges (read-only; absent op: "unknown op", as an older plugin answers).
+  if (o.range) h.fake.on("fixtureAttributes", (args) => {
+    if (o.range === "unreadable") throw new BridgeReplyError("no fixture found for '" + String(args.ref) + "'");
+    return { fixtureType: "Test Type", total: o.range!.length, attributes: o.range };
+  });
   h.fake.on("objects", (args) => {
     const ref = String(args.ref);
     const sm = ref.match(/^Shape (\d+)\.1$/);
@@ -892,7 +898,7 @@ async function flySetup(initial: MLine[] = [], o: { ignoreSourceAssign?: number;
           const steps = srcs.map((x, n) => ({
             step: n + 1, trans: x.trans, width: widthOf(l, n, s), accel: 0, decel: 0,
             integrated: x.preset && !mir ? { valid: true, pool: Number(x.preset.split(".")[0]), no: Number(x.preset.split(".")[1]) } : null,
-            ...(x.preset ? (mir ? { absolute: f32(60) } : {}) : mir ? { absolute: f32(mirror(x.abs)?.("a")), relative: f32(mirror(x.rel)?.("r")) } : { absolute: f32(x.abs), relative: f32(x.rel) }),
+            ...(x.preset ? (mir ? { absolute: f32(60) } : {}) : mir ? { absolute: f32(mirror(x.abs)?.("a")), relative: f32(mirror(x.rel)?.("r")) } : { absolute: f32(x.abs), relative: f32(typeof x.rel === "number" && o.invertTilt && attribute === "Tilt" ? -x.rel : x.rel) }),
           }));
           // The cooked speed master is 0-based (master 2 reads 1); absent without one.
           out.set(`${fixture}|${attribute}`, { fixture, attribute, cooked: true, stepCount: 2, speed: l.speedHz, measure: measureOf(l) * 100, ...(l.master ? { speedMaster: l.master - 1 } : {}), steps });
@@ -1954,4 +1960,121 @@ test("set: the same steps on the same group with another MAtricks are accepted; 
   } finally {
     await h.close();
   }
+});
+
+// ---- Hard relative values on an inverted physical range (live 2026-11-16, onPC 2.5.1, THK 22.1906 / 22.2705): the console
+// cooks the recipe's ValueRelative on Tilt with the opposite sign (Esprite Tilt 131.8 -> -131.8, LEDBeam 114 -> -114). The read-back
+// expects that sign; what is sent does not change. Absolute values are not touched (no measurement).
+const TILT_INVERTED = [{ attribute: "Tilt", physicalFrom: 131.8, physicalTo: -131.8 }, { attribute: "Pan", physicalFrom: -270, physicalTo: 270 }];
+const TILT_NORMAL = [{ attribute: "Tilt", physicalFrom: -135, physicalTo: 135 }];
+const NOTE = /inverted physical range.*opposite sign/;
+
+test("create, hard relative on an inverted range: the cooked sign is the opposite one and reads back matched, with a note; the commands sent are unchanged", async () => {
+  const plain = await flySetup();
+  let sent: string[];
+  try {
+    await plain.h.callJson("gma3_edit_phaser_recipe", HV);
+    sent = cmdsAfterClear(plain.cmds);
+  } finally {
+    await plain.h.close();
+  }
+  const { h, c, cmds } = await flySetup([], { invertTilt: true, range: TILT_INVERTED });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", HV);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(result.warnings.some((w: string) => NOTE.test(w) && /Tilt/.test(w)), JSON.stringify(result.warnings));
+    assert.deepEqual(cmdsAfterClear(cmds), sent, "what is sent to the console is not changed");
+    assert.deepEqual(c.lines[0].steps.map((st) => st[0].rel), [-20, 20], "the recipe keeps the sign asked");
+    const cooked = (await h.fake.handlerFor("preset.read")!({ ref: "Preset 21.9030" })) as { rows: Array<{ attribute: string; steps: Array<{ relative: number }> }> };
+    assert.deepEqual(cooked.rows[0].steps.map((x) => Math.round(x.relative)), [20, -20], "the console cooked the opposite sign");
+  } finally {
+    await h.close();
+  }
+});
+
+test("create, hard relative: a normal range keeps the plain comparison (matched, no note; an opposite cooked sign is still a mismatch)", async () => {
+  const ok = await flySetup([], { range: TILT_NORMAL });
+  try {
+    const { result, isError } = await ok.h.callJson("gma3_edit_phaser_recipe", HV);
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(!(result.warnings ?? []).some((w: string) => NOTE.test(w)));
+  } finally {
+    await ok.h.close();
+  }
+  const bad = await flySetup([], { invertTilt: true, range: TILT_NORMAL });
+  try {
+    const { result, isError } = await bad.h.callJson("gma3_edit_phaser_recipe", HV);
+    assert.equal(isError, true);
+    assert.equal(result.verification.status, "mismatched");
+    assert.match(result.verification.detail, /no cooked value comes from line 1/);
+  } finally {
+    await bad.h.close();
+  }
+});
+
+test("create, hard relative: an unknown range (no op, unreadable, attribute absent) keeps the plain comparison, and a failed read is warned about", async () => {
+  for (const range of [undefined, "unreadable", [{ attribute: "Pan", physicalFrom: -270, physicalTo: 270 }], [{ attribute: "Tilt", physicalFrom: null, physicalTo: null }]] as const) {
+    const { h } = await flySetup([], { invertTilt: true, ...(range ? { range: range as never } : {}) });
+    try {
+      const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", HV);
+      assert.equal(isError, true, JSON.stringify(range));
+      assert.equal(result.verification.status, "mismatched");
+      assert.ok(!(result.warnings ?? []).some((w: string) => NOTE.test(w)));
+      if (range === undefined || range === "unreadable") assert.ok(result.warnings.some((w: string) => /physical range could not be read/.test(w)), JSON.stringify(result.warnings));
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("create, hard ABSOLUTE on an inverted range: not folded (no measurement), compared as cooked", async () => {
+  const { h } = await flySetup([], { invertTilt: true, range: TILT_INVERTED });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { ...HV, steps: [{ attribute: "Tilt", absolute: 30 }, { absolute: 70 }] });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(!(result.warnings ?? []).some((w: string) => NOTE.test(w)));
+    assert.ok(!h.fake.requests.some((r) => r.op === "fixtureAttributes"), "no range is read when no cooked step is a hard relative");
+  } finally {
+    await h.close();
+  }
+});
+
+test("set, hard relative on an inverted range: the edited line and the other lines read back matched", async () => {
+  const { h, c } = await flySetup([HV_LINE(), PRESET_LINE()], { invertTilt: true, range: TILT_INVERTED });
+  try {
+    const { result, isError } = await h.callJson("gma3_edit_phaser_recipe", { action: "set", preset: "21.9030", steps: [{ relative: -10 }, { relative: 10 }] });
+    assert.equal(isError, false, JSON.stringify(result, null, 1));
+    assert.equal(result.verification.status, "matched", JSON.stringify(result.verification));
+    assert.ok(result.warnings.some((w: string) => NOTE.test(w)), JSON.stringify(result.warnings));
+    assert.deepEqual(c.lines[0].steps.map((st) => st[0].rel), [-10, 10]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("invertedAttributes / foldInvertedRows: inverted, normal, mixed and empty ranges; only hard relative steps change", () => {
+  const m = invertedAttributes([
+    { attribute: "Tilt", physicalFrom: 131.8, physicalTo: -131.8 },
+    { attribute: "Pan", physicalFrom: -270, physicalTo: 270 },
+    { attribute: "Zoom", physicalFrom: 50, physicalTo: 5 },
+    { attribute: "Zoom", physicalFrom: 5, physicalTo: 50 },
+    { attribute: "Focus", physicalFrom: 3, physicalTo: 3 },
+    { attribute: "Iris", physicalFrom: null, physicalTo: null },
+  ]);
+  assert.deepEqual([...m.entries()], [["tilt", true], ["pan", false], ["zoom", null]]);
+  const rows = [
+    { fixture: "101", attribute: "Tilt", cooked: true, stepCount: 2, steps: [{ step: 1, relative: 20 }, { step: 2, relative: -20, absolute: 5 }] },
+    { fixture: "101", attribute: "Pan", cooked: true, stepCount: 2, steps: [{ step: 1, relative: 20 }, { step: 2, relative: -20 }] },
+    { fixture: "101", attribute: "Tilt", cooked: true, stepCount: 2, steps: [{ step: 1, absolute: 30 }, { step: 2, integrated: { valid: true, pool: 2, no: 9020 }, relative: 7 }] },
+  ] as never[];
+  const r = foldInvertedRows(rows, (x) => m.get(x.attribute.toLowerCase()) ?? undefined);
+  assert.equal(r.folded, 1);
+  assert.deepEqual(r.attributes, ["Tilt"]);
+  assert.deepEqual(r.rows[0].steps!.map((x) => [x.relative, x.absolute]), [[-20, undefined], [20, 5]]);
+  assert.deepEqual(r.rows[1], rows[1]);
+  assert.deepEqual(r.rows[2], rows[2], "absolute steps and preset steps are left as they are");
+  assert.deepEqual(rows[0].steps!.map((x: { relative?: number }) => x.relative), [20, -20], "the input is not mutated");
 });

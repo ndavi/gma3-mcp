@@ -69,6 +69,7 @@ import { readGroup, readLines, type GroupInfo } from "./recipes.js";
 import { RECOOK_MODES, parseRecook, recookCallers, type RecookDeps, type RecookReport } from "./phaserrecook.js";
 import { asRead, buildResult, commandStep, notRequested, stepFromError, validationFailure, type OperationResult, type StepResult, type Verification } from "../results.js";
 import { Validator, finiteNumber, objectName, objectNumber } from "../validate.js";
+import { invertedAttributes } from "./physicalrange.js";
 
 const POLL_MS = 150;
 const MODE_WAIT_MS = 3000;
@@ -739,6 +740,80 @@ const mirrorMatch = (r: Row, g: Sig) => {
 };
 /** strict: the step presets or hard values themselves (evidence that the line cooked); otherwise a mirrored value counts too. */
 const rowMatches = (r: Row, g: Sig, strict = false) => straightMatch(r, g) || (!strict && mirrorMatch(r, g));
+/**
+ * Hard relative values on an inverted range (PhysicalFrom > PhysicalTo: Robe Esprite Tilt 131.8 -> -131.8, LEDBeam 350
+ * Tilt 114 -> -114). Live 2026-11-16, onPC 2.5.1: a recipe's ValueRelative on such an attribute cooks with the OPPOSITE
+ * sign (the recipe reads +13.16, the cooked step -13.16; Tilt only measured, Pan on a normal range is unchanged). The
+ * read-back therefore expects the cooked sign the console gives: the cooked relative of a hard step on an inverted
+ * attribute is negated back before it is compared with what was asked. Nothing sent to the console changes. The range is
+ * read from the fixture's channel function (`fixtureAttributes`, once per fixture type); when it cannot be read the row
+ * is compared as it is. An ABSOLUTE hard value is not touched: there is no console measurement for it.
+ */
+export const INVERTED_RELATIVE_NOTE = (n: number, attrs: string[]) =>
+  `${n} cooked hard relative value(s) on ${attrs.join(", ")} sit on an inverted physical range (PhysicalFrom > PhysicalTo): the console cooks a relative value with the opposite sign there (live 2026-11-16), so the read-back expects the sign inverted (recipe +X reads -X). Absolute hard values were not changed (never measured on an inverted range)`;
+
+const hardRelativeStep = (st: { relative?: number | null; integrated?: unknown } | undefined) => typeof st?.relative === "number" && Number.isFinite(st.relative) && !st.integrated;
+
+/** Fold the cooked relative values of the rows whose attribute range is inverted (see above); `inverted` says it per row. */
+export function foldInvertedRows(rows: Row[], inverted: (r: Row) => boolean | undefined): { rows: Row[]; folded: number; attributes: string[] } {
+  let folded = 0;
+  const attributes = new Set<string>();
+  const out = rows.map((r) => {
+    if (!r.steps?.some(hardRelativeStep) || inverted(r) !== true) return r;
+    attributes.add(r.attribute);
+    folded++;
+    return { ...r, steps: r.steps.map((st) => (hardRelativeStep(st) ? { ...st, relative: -(st.relative as number) } : st)) };
+  });
+  return { rows: out, folded, attributes: [...attributes] };
+}
+
+/** Reads the attribute ranges once per fixture type (or fixture) and folds rows with them; keeps the notes for the result. */
+function rangeFolder(bridge: Gma3Bridge, t: number) {
+  const cache = new Map<string, Promise<Map<string, boolean | null> | null>>();
+  const attrs = new Set<string>();
+  let foldedNow = 0;
+  const unread = new Set<string>();
+  const refOf = (fixture: string) => (/^\d+(\.\d+)*$/.test(fixture) ? `Fixture ${fixture}` : /^Fixture \d/.test(fixture) ? fixture : null);
+  const rangesOf = (r: Row) => {
+    const ref = refOf(r.fixture);
+    if (!ref) return Promise.resolve(null);
+    const key = r.fixtureType ?? ref;
+    let p = cache.get(key);
+    if (!p) {
+      p = (async () => {
+        try {
+          const res = (await bridge.request("fixtureAttributes", { ref, limit: 500 }, t)) as { attributes?: Array<{ attribute?: string | null; physicalFrom?: number | null; physicalTo?: number | null }> };
+          return invertedAttributes(res.attributes);
+        } catch (err) {
+          unread.add(`${ref} (${err instanceof Error ? err.message : String(err)})`);
+          return null;
+        }
+      })();
+      cache.set(key, p);
+    }
+    return p;
+  };
+  return {
+    async fold(rows: Row[]): Promise<Row[]> {
+      const flags = new Map<string, boolean | null>();
+      for (const r of rows) {
+        if (!r.steps?.some(hardRelativeStep)) continue;
+        const key = `${r.fixtureType ?? r.fixture}|${r.attribute.toLowerCase()}`;
+        if (!flags.has(key)) flags.set(key, (await rangesOf(r))?.get(r.attribute.toLowerCase()) ?? null);
+      }
+      const res = foldInvertedRows(rows, (r) => flags.get(`${r.fixtureType ?? r.fixture}|${r.attribute.toLowerCase()}`) ?? undefined);
+      // The count is that of the last read folded (the read-back's); the attributes accumulate.
+      foldedNow = res.folded || foldedNow;
+      for (const a of res.attributes) attrs.add(a);
+      return res.rows;
+    },
+    /** Warnings: the inverted-range note (when a row was folded), plus the fixtures whose range could not be read (their relative values are compared as they are). */
+    finish(): string[] {
+      return [...(foldedNow ? [INVERTED_RELATIVE_NOTE(foldedNow, [...attrs])] : []), ...(unread.size ? [`the physical range could not be read for ${[...unread].join("; ")}: their cooked relative values were compared as they are (an inverted Tilt cooks with the opposite sign)`] : [])];
+    },
+  };
+}
+
 /** The sig of `mine` a row belongs to: its own values first; a mirrored value only when no other line's own values match it. */
 const ownerSig = (r: Row, mine: Sig[], others: Sig[]) => mine.find((g) => straightMatch(r, g)) ?? (others.some((h) => straightMatch(r, h)) ? undefined : mine.find((g) => mirrorMatch(r, g)));
 /** The sigs of a line made mirror-aware when the line reads PHASERTRANSFORM Mirror (members read once per group). */
@@ -1427,6 +1502,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     let lines: unknown = null;
     let coverage: unknown = null;
     const createdWarnings: string[] = [];
+    const folder = rangeFolder(bridge, tm);
     try {
       const ls = (await readLines(bridge, { kind: "preset", pool: target.pool, number: target.number }, tm)) ?? [];
       const data = await readPreset(bridge, ref, tm);
@@ -1435,7 +1511,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
       lines = ls;
       const problems: string[] = [];
       if (ls.length !== specs.length) problems.push(`${ref} has ${ls.length} recipe line(s), ${specs.length} expected`);
-      const rows = data?.rows ?? [];
+      const rows = await folder.fold(data?.rows ?? []);
       const uncooked = rows.filter((r) => r.cooked !== true);
       if (!rows.length) problems.push(`${ref} holds no values (nothing cooked)`);
       if (uncooked.length) problems.push(`${ref} holds ${uncooked.length} uncooked value(s): stored directly, not from the recipe`);
@@ -1528,7 +1604,7 @@ export async function createPhaserRecipe(ctx: ToolContext, raw: CreateArgs): Pro
     } catch (err) {
       steps_.push(asRead(stepFromError("read_back", err, { op: "preset.read" })));
     }
-    const warnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...transformNotes, ...createdWarnings, "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
+    const warnings = [...advice, ...adaptiveNotes, ...masterWarnings, ...transformNotes, ...createdWarnings, ...folder.finish(), "Between At Shape and the final ClearAll line 1 ran in the programmer (it was output on stage).", `${ref} stays the pending Edit Recipe target: a manual EditRecipe on another target opens "${UPDATE_DIALOG}" (answer Cancel, never OK).`];
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (the preset and its lines are kept)`);
     return buildResult({ operation: op, target: tgt, steps: steps_, verification, warnings, extra: { plan, lines, linesMade, coverage, ...(notes.length ? { notes } : {}) } });
   };
@@ -1866,6 +1942,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
     let flagsBefore: Flags = {}; // the line's adaptive flags when its settings are written (after a new shape)
     let masterNames = new Map<number, string>();
     const editNotes: string[] = [];
+    const folder = rangeFolder(bridge, tm);
     const lineAt = (n: number) => `${ref}.${n}`;
     const sourceAt = (n: number, step: number, source = 1) => `${ref}.${n}.1.${step}.${source}`;
     const ok =
@@ -1875,7 +1952,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
         const data = await readPreset(bridge, ref, tm);
         if (data?.truncated) return `${ref} was not read completely`;
         before = ls;
-        rowsBefore = data?.rows ?? [];
+        rowsBefore = await folder.fold(data?.rows ?? []);
         referencedBy = data?.referencedBy;
         if (!ls.length) return `${ref} has no recipe line`;
         if (action === "add_line") {
@@ -2160,9 +2237,9 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
     try {
       after = (await readLineDetails(bridge, ref, tm)) ?? [];
       const data = await readPreset(bridge, ref, tm);
-      presetAfter = data;
+      presetAfter = data; // raw: the re-cook compares it with the cues' cooked values
       const s = await readEditState(bridge, tm);
-      const rows = data?.rows ?? [];
+      const rows = await folder.fold(data?.rows ?? []);
       const problems: string[] = [];
       const expected: Array<{ label: string; want: LineExpect }> = before.map((l) => ({ label: `line ${l.line}`, want: expectOf(l) }));
       if (action === "set") expected[k - 1].want = want!;
@@ -2232,7 +2309,7 @@ export async function editPhaserRecipe(ctx: ToolContext, raw: EditArgs, deps?: R
     } catch (err) {
       steps_.push(asRead(stepFromError("read_back", err, { op: "children" })));
     }
-    const warnings: string[] = [...editNotes];
+    const warnings: string[] = [...editNotes, ...folder.finish()];
     if (ambiguousLines.length) warnings.push(ambiguousNote(ambiguousLines));
     if (notDone.length) warnings.push(`not done as asked: ${notDone.join(", ")} (nothing was undone)`);
     const edited = action !== "remove_line" ? after?.[k - 1] : undefined;
@@ -2269,7 +2346,7 @@ const sourceSchema = z.union([
     preset: z.string().nullable().optional().describe('Preset "P.X" (null: the shape\'s own value; set: omit to keep the source\'s).'),
     attribute: z.string().nullable().optional().describe('The source\'s attribute ("Tilt", "Dimmer", "ColorRGB_B"): needed for hard values on a source the shape does not filter; one per source (both steps). set: null clears it (a plain shape\'s source only).'),
     absolute: z.number().optional().describe("Hard absolute value, percent 0-100 (VALUEABSOLUTE), instead of a preset."),
-    relative: z.number().optional().describe("Hard relative value, percent of the attribute's WHOLE range, -100 to 100 (VALUERELATIVE; Tilt 180 degrees: 20 = 36 degrees), instead of a preset."),
+    relative: z.number().optional().describe("Hard relative value, percent of the attribute's WHOLE range, -100 to 100 (VALUERELATIVE; Tilt 180 degrees: 20 = 36 degrees), instead of a preset. On an inverted physical range (PhysicalFrom > PhysicalTo, e.g. Esprite / LEDBeam Tilt) the console cooks it with the opposite sign (live 2026-11-16): the recipe keeps what you send, the read-back expects the opposite cooked sign and says so in a warning."),
     trans: z.number().optional().describe("Trans X of this value source, percent (0-100)."),
     width: z.number().optional().describe("Width X of this value source, percent; with Link Steps the other step's width takes the rest of the source's sum, so give it on one step only."),
   }),
